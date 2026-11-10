@@ -40,7 +40,8 @@ pipeline {
     stages {
         stage('Source Checkout') {
             steps {
-                // Hand any root-owned files in the workspace back to jenkins before checkout.
+                // Remove any leftover host node_modules or dist from previous builds and fix ownership
+                removeRootOwnedPaths(['node_modules', 'dist', 'tsconfig.tsbuildinfo'])
                 fixWorkspacePermissions()
                 retry(3) {
                     checkout scm

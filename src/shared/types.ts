@@ -1,4 +1,4 @@
-export type TransformType = 'north_up' | 'similarity' | 'affine';
+export type TransformType = 'similarity' | 'affine';
 export type TimeMode = 'from_start' | 'real';
 
 export interface GCP {
@@ -53,7 +53,7 @@ export interface ParticipantTrack {
   name: string;
   color: string;
   visible: boolean;
-  sourceFormat: 'gpx' | 'fit' | 'tcx' | 'demo';
+  sourceFormat: 'gpx' | 'fit' | 'tcx';
   startedAtIso: string;
   /** Manual offset in seconds applied during replay */
   offsetSec: number;
@@ -68,14 +68,6 @@ export interface ParticipantTrack {
   points: TrackPoint[];
 }
 
-export interface ControlPoint {
-  id: string;
-  code: string;
-  lon: number;
-  lat: number;
-  radiusM: number;
-}
-
 export interface RaceEvent {
   id: string;
   slug: string;
@@ -85,6 +77,4 @@ export interface RaceEvent {
   timeMode: TimeMode;
   map?: MapOverlay;
   participants: ParticipantTrack[];
-  controlPoints: ControlPoint[];
 }
-

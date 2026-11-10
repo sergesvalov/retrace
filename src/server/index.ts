@@ -1,17 +1,14 @@
+import crypto from 'node:crypto';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import Fastify from 'fastify';
-import cors from '@fastify/cors';
 import multipart from '@fastify/multipart';
-import fastifyStatic from '@fastify/static';
-import { nanoid } from 'nanoid';
 import {
   addPinMapToTrack,
   autoPlaceScreenshotOnBounds,
   lonLatToMercator,
   nudgeMapMatrix,
   pixelToLonLat,
-  snapMapToTrackByTwoPairs,
   solveGeoref,
 } from '../shared/georef.js';
 import {
@@ -26,7 +23,6 @@ import {
   syncAllParticipantsToSpot,
 } from '../shared/trackParser.js';
 import type {
-  ControlPoint,
   GCP,
   MapOverlay,
   ParticipantTrack,
@@ -38,6 +34,27 @@ import type {
 const DATA_DIR = path.resolve(process.cwd(), 'data');
 const EVENTS_DIR = path.join(DATA_DIR, 'events');
 const UPLOADS_DIR = path.join(DATA_DIR, 'uploads');
+
+function makeId(len = 8): string {
+  return crypto
+    .randomBytes(Math.ceil(len / 2))
+    .toString('hex')
+    .slice(0, len);
+}
+
+const MIME_BY_EXT: Record<string, string> = {
+  '.html': 'text/html; charset=utf-8',
+  '.js': 'application/javascript; charset=utf-8',
+  '.css': 'text/css; charset=utf-8',
+  '.json': 'application/json; charset=utf-8',
+  '.svg': 'image/svg+xml',
+  '.png': 'image/png',
+  '.jpg': 'image/jpeg',
+  '.jpeg': 'image/jpeg',
+  '.webp': 'image/webp',
+  '.gif': 'image/gif',
+  '.ico': 'image/x-icon',
+};
 
 async function ensureDirs() {
   await fs.mkdir(EVENTS_DIR, { recursive: true });
@@ -55,7 +72,6 @@ async function loadAllEvents(): Promise<Map<string, RaceEvent>> {
       const evt = JSON.parse(raw) as RaceEvent;
       if (evt.id === 'demo-bitza-2026') continue;
 
-      // Clean up any legacy auto-generated GCPs that may have polluted manual georeferencing
       if (evt.map?.gcps?.some((g) => g.id.startsWith('gcp-auto-'))) {
         const manualGcps = evt.map.gcps.filter(
           (g) => !g.id.startsWith('gcp-auto-')
@@ -104,33 +120,43 @@ async function startServer() {
     bodyLimit: 50 * 1024 * 1024, // 50 MB
   });
 
-  await app.register(cors, { origin: true });
+  app.addHook('onRequest', async (req, reply) => {
+    reply.header('Access-Control-Allow-Origin', '*');
+    reply.header(
+      'Access-Control-Allow-Methods',
+      'GET,POST,PUT,PATCH,DELETE,OPTIONS'
+    );
+    reply.header('Access-Control-Allow-Headers', 'Content-Type');
+    if (req.method === 'OPTIONS') {
+      return reply.code(204).send();
+    }
+  });
+
   await app.register(multipart, {
     limits: {
       fileSize: 40 * 1024 * 1024,
     },
   });
 
-  await app.register(fastifyStatic, {
-    root: UPLOADS_DIR,
-    prefix: '/uploads/',
-    decorateReply: false,
-  });
-
-  // Serve built SPA frontend in production if dist/client exists
-  const clientDistDir = path.resolve(process.cwd(), 'dist', 'client');
-  try {
-    const stat = await fs.stat(clientDistDir);
-    if (stat.isDirectory()) {
-      await app.register(fastifyStatic, {
-        root: clientDistDir,
-        prefix: '/',
-        decorateReply: false,
-      });
+  // Serve uploaded map images from /uploads/:file
+  app.get<{ Params: { file: string } }>(
+    '/uploads/:file',
+    async (req, reply) => {
+      const safeName = path.basename(req.params.file);
+      const filePath = path.join(UPLOADS_DIR, safeName);
+      try {
+        const buf = await fs.readFile(filePath);
+        const ext = path.extname(safeName).toLowerCase();
+        reply.header(
+          'Content-Type',
+          MIME_BY_EXT[ext] ?? 'application/octet-stream'
+        );
+        return reply.send(buf);
+      } catch {
+        return reply.code(404).send({ error: 'File not found' });
+      }
     }
-  } catch {
-    // dist/client not built yet (dev mode)
-  }
+  );
 
   app.get('/api/health', async () => ({ status: 'ok', service: 'retrace' }));
 
@@ -164,11 +190,11 @@ async function startServer() {
     }
   );
 
-  // Create new event (no registration required — instant shareable slug)
+  // Create new event
   app.post<{ Body: { title?: string; description?: string } }>(
     '/api/events',
     async (req) => {
-      const id = nanoid(10);
+      const id = makeId(10);
       const evt: RaceEvent = {
         id,
         slug: id,
@@ -177,7 +203,6 @@ async function startServer() {
         createdAt: new Date().toISOString(),
         timeMode: 'from_start',
         participants: [],
-        controlPoints: [],
       };
       eventsStore.set(evt.id, evt);
       await saveEventToDisk(evt);
@@ -213,17 +238,18 @@ async function startServer() {
       }
 
       const ext = path.extname(data.filename || '.png').toLowerCase() || '.png';
-      const fileId = `${evt.id}-map-${nanoid(6)}${ext}`;
+      const fileId = `${evt.id}-map-${makeId(6)}${ext}`;
       const filePath = path.join(UPLOADS_DIR, fileId);
       const buffer = await data.toBuffer();
       await fs.writeFile(filePath, buffer);
 
-      const widthField = (data.fields?.width as any)?.value;
-      const heightField = (data.fields?.height as any)?.value;
+      const widthField = (data.fields?.width as { value?: string } | undefined)
+        ?.value;
+      const heightField = (data.fields?.height as { value?: string } | undefined)
+        ?.value;
       const width = Number(widthField) || 1200;
       const height = Number(heightField) || 900;
 
-      // Auto-place screenshot onto the bounding box of existing GPS tracks (or default Paphos bounds if no tracks yet)
       const trackBounds = computeTracksBoundingBox(evt.participants) ?? {
         minLon: 32.415,
         maxLon: 32.435,
@@ -235,8 +261,8 @@ async function startServer() {
       const autoPlaced = autoPlaceScreenshotOnBounds(width, height, trackBounds);
 
       const mapOverlay: MapOverlay = {
-        id: nanoid(8),
-        name: data.filename || 'Скрин карты',
+        id: makeId(8),
+        name: data.filename || 'Скан карты',
         imageUrl: `/uploads/${fileId}`,
         width,
         height,
@@ -320,7 +346,7 @@ async function startServer() {
     return { event: evt };
   });
 
-  // Nudge map overlay directly (shift in meters, rotate in deg, scale), add persistent Pin (map -> track), or snap by 2 pairs
+  // Nudge map overlay directly (shift in meters, rotate in deg, scale) or manage pins
   app.post<{
     Params: { id: string };
     Body: {
@@ -334,20 +360,13 @@ async function startServer() {
       };
       undoLastPin?: boolean;
       clearPins?: boolean;
-      twoPointSnap?: {
-        pair1: { mapLonLat: [number, number]; trackLonLat: [number, number] };
-        pair2: { mapLonLat: [number, number]; trackLonLat: [number, number] };
-      };
     };
   }>('/api/events/:id/map-nudge', async (req, reply) => {
     const evt = eventsStore.get(req.params.id);
     if (!evt || !evt.map) {
-      return reply
-        .code(404)
-        .send({ error: 'Сначала загрузите карту' });
+      return reply.code(404).send({ error: 'Сначала загрузите карту' });
     }
 
-    // If map has no matrix yet, initialize it onto the GPS track bounds first
     if (!evt.map.matrix) {
       const bounds = computeTracksBoundingBox(evt.participants) ?? {
         minLon: 32.415,
@@ -396,7 +415,7 @@ async function startServer() {
         evt.map.height,
         req.body.addPin.mapLonLat,
         req.body.addPin.trackLonLat,
-        `pin-${nanoid(6)}`
+        `pin-${makeId(6)}`
       );
       if (pinned) {
         evt.map.gcps = pinned.gcps;
@@ -406,19 +425,6 @@ async function startServer() {
         evt.map.rotationDeg = pinned.rotationDeg;
         evt.map.transformType =
           pinned.gcps.length >= 3 ? 'affine' : 'similarity';
-      }
-    } else if (req.body.twoPointSnap) {
-      const snapped = snapMapToTrackByTwoPairs(
-        evt.map.matrix,
-        evt.map.width,
-        evt.map.height,
-        req.body.twoPointSnap.pair1,
-        req.body.twoPointSnap.pair2
-      );
-      if (snapped) {
-        evt.map.matrix = snapped.matrix;
-        evt.map.cornersLonLat = snapped.cornersLonLat;
-        evt.map.rotationDeg = snapped.rotationDeg;
       }
     } else {
       const res = nudgeMapMatrix(
@@ -479,7 +485,7 @@ async function startServer() {
 
         const baseName = path.basename(filename, ext);
         const participant: ParticipantTrack = normalizeSamplesToTrack({
-          id: nanoid(8),
+          id: makeId(8),
           name: parsedName || baseName,
           color: pickTrackColor(evt.participants.length),
           sourceFormat,
@@ -489,7 +495,6 @@ async function startServer() {
         evt.participants.push(participant);
         syncAllParticipantsToCommonStartSpot(evt.participants);
 
-        // If map was uploaded before any tracks existed and was not manually georeferenced yet, move it onto the tracks!
         if (
           evt.map &&
           (!evt.map.matrix ||
@@ -510,10 +515,12 @@ async function startServer() {
 
         await saveEventToDisk(evt);
         return { event: evt, participant };
-      } catch (err: any) {
-        return reply.code(400).send({
-          error: err?.message || 'Ошибка разбора файла трека (GPX/FIT/TCX)',
-        });
+      } catch (err: unknown) {
+        const message =
+          err instanceof Error
+            ? err.message
+            : 'Ошибка разбора файла трека (GPX/FIT/TCX)';
+        return reply.code(400).send({ error: message });
       }
     }
   );
@@ -664,16 +671,40 @@ async function startServer() {
     }
   );
 
-  // Update ordered Control Points (КП) for split calculation
-  app.put<{
-    Params: { id: string };
-    Body: { controlPoints: ControlPoint[] };
-  }>('/api/events/:id/controls', async (req, reply) => {
-    const evt = eventsStore.get(req.params.id);
-    if (!evt) return reply.code(404).send({ error: 'Событие не найдено' });
-    evt.controlPoints = req.body.controlPoints ?? [];
-    await saveEventToDisk(evt);
-    return { event: evt };
+  // Serve built SPA frontend in production if dist/client exists
+  const clientDistDir = path.resolve(process.cwd(), 'dist', 'client');
+  app.setNotFoundHandler(async (req, reply) => {
+    if (req.url.startsWith('/api/')) {
+      return reply.code(404).send({ error: 'API route not found' });
+    }
+    const cleanUrl = req.url.split('?')[0] || '/';
+    const relPath = cleanUrl === '/' ? 'index.html' : cleanUrl.replace(/^\/+/, '');
+    const resolved = path.resolve(clientDistDir, relPath);
+    if (!resolved.startsWith(clientDistDir)) {
+      return reply.code(403).send({ error: 'Forbidden' });
+    }
+    try {
+      const stat = await fs.stat(resolved);
+      if (stat.isFile()) {
+        const ext = path.extname(resolved).toLowerCase();
+        reply.header(
+          'Content-Type',
+          MIME_BY_EXT[ext] ?? 'application/octet-stream'
+        );
+        return reply.send(await fs.readFile(resolved));
+      }
+    } catch {
+      // Fall back to index.html for SPA routes
+    }
+    try {
+      const indexHtml = await fs.readFile(
+        path.join(clientDistDir, 'index.html')
+      );
+      reply.header('Content-Type', 'text/html; charset=utf-8');
+      return reply.send(indexHtml);
+    } catch {
+      return reply.code(404).send({ error: 'Not found' });
+    }
   });
 
   const port = Number(process.env.PORT) || 3001;
@@ -685,4 +716,3 @@ startServer().catch((err) => {
   console.error(err);
   process.exit(1);
 });
-

@@ -174,7 +174,7 @@ export function normalizeSamplesToTrack(opts: {
   id: string;
   name: string;
   color: string;
-  sourceFormat: 'gpx' | 'fit' | 'tcx' | 'demo';
+  sourceFormat: 'gpx' | 'fit' | 'tcx';
   samples: RawTrackSample[];
 }): ParticipantTrack {
   const { id, name, color, sourceFormat } = opts;

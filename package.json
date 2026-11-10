@@ -4,23 +4,19 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "dev": "concurrently -n API,WEB -c cyan,magenta \"npm run dev:server\" \"npm run dev:web\"",
     "dev:server": "tsx watch src/server/index.ts",
     "dev:web": "vite",
-    "build": "tsc -b && vite build && npx esbuild src/server/index.ts --bundle --platform=node --target=node22 --format=cjs --outfile=dist/server/index.cjs",
+    "build": "tsc --noEmit && vite build && esbuild src/server/index.ts --bundle --platform=node --target=node22 --format=cjs --outfile=dist/server/index.cjs",
     "start": "node dist/server/index.cjs",
     "test": "vitest run",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
-    "@fastify/cors": "^10.0.1",
     "@fastify/multipart": "^9.0.1",
-    "@fastify/static": "^8.0.2",
     "fastify": "^5.1.0",
     "fit-file-parser": "^1.21.0",
     "lucide-react": "^0.468.0",
     "maplibre-gl": "^4.7.1",
-    "nanoid": "^5.0.9",
     "react": "^18.3.1",
     "react-dom": "^18.3.1"
   },
@@ -29,14 +25,13 @@
     "@types/react": "^18.3.18",
     "@types/react-dom": "^18.3.5",
     "@vitejs/plugin-react": "^4.3.4",
-    "concurrently": "^9.1.0",
-    "tailwindcss": "^3.4.17",
-    "postcss": "^8.4.49",
     "autoprefixer": "^10.4.20",
+    "esbuild": "^0.25.0",
+    "postcss": "^8.4.49",
+    "tailwindcss": "^3.4.17",
     "tsx": "^4.19.2",
     "typescript": "^5.7.2",
     "vite": "^6.0.5",
     "vitest": "^2.1.8"
   }
 }
-

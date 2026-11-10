@@ -29,7 +29,6 @@ import {
   ZoomIn,
   ZoomOut,
 } from 'lucide-react';
-import { lonLatToMercator } from '../../shared/georef.js';
 import {
   analyzeLegBetweenSpots,
   formatDuration,
@@ -105,14 +104,7 @@ export const ReplayWorkspace: React.FC<Props> = ({
   // - spot_start: click any point on the map to launch all runners simultaneously from that point
   // - leg_start / leg_end: click 2 points (CP A -> CP B) to analyze route choice + Livelox speed normalization
   const [snapStage, setSnapStage] = useState<
-    | 'idle'
-    | 'spot_start'
-    | 'leg_start'
-    | 'leg_end'
-    | 'pin_map'
-    | 'pin_track'
-    | 'shift_map'
-    | 'shift_track'
+    'idle' | 'spot_start' | 'leg_start' | 'leg_end'
   >('idle');
   const [pickedFeatureLonLat, setPickedFeatureLonLat] = useState<
     [number, number] | null
@@ -139,10 +131,6 @@ export const ReplayWorkspace: React.FC<Props> = ({
   // Keep latest refs for MapLibre event handlers
   const pendingScanPixelRef = useRef(pendingScanPixel);
   pendingScanPixelRef.current = pendingScanPixel;
-  const snapStageRef = useRef(snapStage);
-  snapStageRef.current = snapStage;
-  const pickedFeatureLonLatRef = useRef(pickedFeatureLonLat);
-  pickedFeatureLonLatRef.current = pickedFeatureLonLat;
   const eventRef = useRef(event);
   eventRef.current = event;
 
@@ -973,35 +961,6 @@ export const ReplayWorkspace: React.FC<Props> = ({
         setCustomStartSpot(null);
         setSelectedLeg({ startLonLat: startPt, endLonLat: clicked });
         void syncStartAtSpot(startPt, clicked);
-        return;
-      }
-
-      // Priority 4: Direct 1-map pin or shift
-      if (snapStage === 'pin_map') {
-        setPickedFeatureLonLat(clicked);
-        setSnapStage('pin_track');
-      } else if (snapStage === 'pin_track' && pickedFeatureLonLat) {
-        const mapPt = pickedFeatureLonLat;
-        setSnapStage('idle');
-        setPickedFeatureLonLat(null);
-        void nudgeMap({
-          addPin: {
-            mapLonLat: mapPt,
-            trackLonLat: clicked,
-          },
-        });
-      } else if (snapStage === 'shift_map') {
-        setPickedFeatureLonLat(clicked);
-        setSnapStage('shift_track');
-      } else if (snapStage === 'shift_track' && pickedFeatureLonLat) {
-        const [m0x, m0y] = lonLatToMercator(
-          pickedFeatureLonLat[0],
-          pickedFeatureLonLat[1]
-        );
-        const [m1x, m1y] = lonLatToMercator(clicked[0], clicked[1]);
-        setSnapStage('idle');
-        setPickedFeatureLonLat(null);
-        void nudgeMap({ dEastM: m1x - m0x, dNorthM: m1y - m0y });
       }
     };
 

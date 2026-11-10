@@ -4,19 +4,20 @@ import {
   autoPlaceScreenshotOnBounds,
   computeRubberSheetDisplacement,
   fitAffineTransform,
-  fitNorthUpTransform,
   lonLatToMercator,
   mercatorToLonLat,
   pixelToLonLat,
   solveGeoref,
 } from '../shared/georef.js';
 import {
+  analyzeLegBetweenSpots,
   formatPaceMinKm,
   interpolateTrackAt,
   normalizeSamplesToTrack,
   parseGpxText,
   parseTcxText,
   syncAllParticipantsToCommonStartSpot,
+  syncAllParticipantsToSpot,
 } from '../shared/trackParser.js';
 import type { GCP } from '../shared/types.js';
 
@@ -48,21 +49,16 @@ describe('Georeferencing math (Web Mercator similarity & affine)', () => {
     expect(sol!.cornersLonLat).toHaveLength(4);
   });
 
-  it('fits North-Up Google Maps screenshot with 2 points and auto-places screenshot onto track bounds', () => {
+  it('auto-places map onto track bounds with zero initial rotation', () => {
     const placed = autoPlaceScreenshotOnBounds(1200, 800, {
       minLon: 37.54,
       maxLon: 37.56,
       minLat: 55.595,
       maxLat: 55.605,
     });
-    expect(placed.gcps).toHaveLength(2);
     expect(placed.cornersLonLat).toHaveLength(4);
-
-    const northUpMat = fitNorthUpTransform(placed.gcps);
-    expect(northUpMat).not.toBeNull();
-    // Zero rotation terms
-    expect(northUpMat![1]).toBe(0);
-    expect(northUpMat![3]).toBe(0);
+    expect(placed.matrix[1]).toBe(0);
+    expect(placed.matrix[3]).toBe(0);
   });
 
   it('progressively locks 1, 2, 3, and 4+ pins (Start -> CP2 -> CP5) via addPinMapToTrack and rubber-sheeting', () => {
@@ -120,7 +116,7 @@ describe('Georeferencing math (Web Mercator similarity & affine)', () => {
     expect(step3!.gcps).toHaveLength(3);
     expect(step3!.rmsErrorM).toBeLessThan(0.5);
 
-    // Pin 4 (Local orienteering map distortion) -> rubber-sheet displacement matches exact pixel offset at Pin 4
+    // Pin 4 (Local orienteering map distortion)
     const mapPt4 = pixelToLonLat(step3!.matrix, 500, 500);
     const trackPt4: [number, number] = [33.3515, 34.9495];
     const step4 = addPinMapToTrack(
@@ -145,7 +141,7 @@ describe('Georeferencing math (Web Mercator similarity & affine)', () => {
   });
 });
 
-describe('Track parsing & interpolation (GPX, TCX, normalization)', () => {
+describe('Track parsing, Livelox speed normalization & leg route-choice analysis', () => {
   it('parses GPX with Garmin heart-rate extensions and interpolates runner telemetry', () => {
     const sampleGpx = `<?xml version="1.0" encoding="UTF-8"?>
       <gpx version="1.1" creator="Garmin Connect">
@@ -225,15 +221,14 @@ describe('Track parsing & interpolation (GPX, TCX, normalization)', () => {
     expect(res.samples[1].hr).toBe(150);
   });
 
-  it('synchronizes runners starting from the same spot (trims standing at start)', () => {
+  it('synchronizes runners to start spot or arbitrary map spot and analyzes leg route choices', () => {
     const baseMs = Date.parse('2026-10-18T08:00:00Z');
-    // Runner waits 20s at start (55.6000, 37.5500) before running north
     const samples = [
-      { timeMs: baseMs, lat: 55.6, lon: 37.55 },
-      { timeMs: baseMs + 10000, lat: 55.60001, lon: 37.55001 },
-      { timeMs: baseMs + 20000, lat: 55.60002, lon: 37.55001 },
-      { timeMs: baseMs + 30000, lat: 55.6005, lon: 37.5505 },
-      { timeMs: baseMs + 40000, lat: 55.6012, lon: 37.5512 },
+      { timeMs: baseMs, lat: 55.6, lon: 37.55, ele: 150 },
+      { timeMs: baseMs + 10000, lat: 55.60001, lon: 37.55001, ele: 150 },
+      { timeMs: baseMs + 20000, lat: 55.60002, lon: 37.55001, ele: 150 },
+      { timeMs: baseMs + 30000, lat: 55.6005, lon: 37.5505, ele: 162 },
+      { timeMs: baseMs + 40000, lat: 55.6012, lon: 37.5512, ele: 175 },
     ];
     const t = normalizeSamplesToTrack({
       id: 'runner-wait',
@@ -245,6 +240,16 @@ describe('Track parsing & interpolation (GPX, TCX, normalization)', () => {
     const common = syncAllParticipantsToCommonStartSpot([t]);
     expect(common).not.toBeNull();
     expect(t.trimStartSec).toBeGreaterThanOrEqual(10);
+
+    syncAllParticipantsToSpot([t], 37.5505, 55.6005);
+    expect(t.trimStartSec).toBe(30);
+
+    const leg = analyzeLegBetweenSpots(
+      [t],
+      [37.55, 55.6],
+      [37.5512, 55.6012]
+    );
+    expect(leg.stats).toHaveLength(1);
+    expect(leg.stats[0].eleGainM).toBe(25);
   });
 });
-

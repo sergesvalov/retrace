@@ -4,5 +4,5 @@ data
 .git
 .vscode
 *.log
+*.tsbuildinfo
 .env
-
