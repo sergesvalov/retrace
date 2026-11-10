@@ -16,6 +16,7 @@ import {
 } from 'lucide-react';
 import { solveGeoref } from '../../shared/georef.js';
 import type { GCP, RaceEvent, TransformType } from '../../shared/types.js';
+import { buildRubberSheetedMapUrl } from '../utils/rubberSheet.js';
 
 interface Props {
   event: RaceEvent;
@@ -277,41 +278,51 @@ export const GeorefWorkspace: React.FC<Props> = ({
       markersRef.current.push(marker);
     });
 
-    // 4. Update or add warped raster image overlay on OSM
+    // 4. Update or add warped raster image overlay on OSM (including Rubber-Sheeting for 3+ points)
     const sourceId = 'georef-preview';
     const layerId = 'georef-preview-layer';
     if (mapObj && liveSolution?.cornersLonLat) {
-      const existingSource = map.getSource(sourceId) as
-        | maplibregl.ImageSource
-        | undefined;
-      if (existingSource) {
-        existingSource.updateImage({
-          url: mapObj.imageUrl,
-          coordinates: liveSolution.cornersLonLat,
-        });
-        if (map.getLayer(layerId)) {
-          map.setPaintProperty(
-            layerId,
-            'raster-opacity',
-            effectiveOsmOverlayOpacity
-          );
+      const corners = liveSolution.cornersLonLat;
+      void buildRubberSheetedMapUrl(
+        mapObj.imageUrl,
+        mapObj.width,
+        mapObj.height,
+        gcps,
+        liveSolution.matrix
+      ).then((warpedUrl) => {
+        if (!mapReadyRef.current) return;
+        const existingSource = map.getSource(sourceId) as
+          | maplibregl.ImageSource
+          | undefined;
+        if (existingSource) {
+          existingSource.updateImage({
+            url: warpedUrl,
+            coordinates: corners,
+          });
+          if (map.getLayer(layerId)) {
+            map.setPaintProperty(
+              layerId,
+              'raster-opacity',
+              effectiveOsmOverlayOpacity
+            );
+          }
+        } else {
+          map.addSource(sourceId, {
+            type: 'image',
+            url: warpedUrl,
+            coordinates: corners,
+          });
+          map.addLayer({
+            id: layerId,
+            type: 'raster',
+            source: sourceId,
+            paint: {
+              'raster-opacity': effectiveOsmOverlayOpacity,
+              'raster-fade-duration': 0,
+            },
+          });
         }
-      } else {
-        map.addSource(sourceId, {
-          type: 'image',
-          url: mapObj.imageUrl,
-          coordinates: liveSolution.cornersLonLat,
-        });
-        map.addLayer({
-          id: layerId,
-          type: 'raster',
-          source: sourceId,
-          paint: {
-            'raster-opacity': effectiveOsmOverlayOpacity,
-            'raster-fade-duration': 0,
-          },
-        });
-      }
+      });
     } else {
       if (map.getLayer(layerId)) map.removeLayer(layerId);
       if (map.getSource(sourceId)) map.removeSource(sourceId);

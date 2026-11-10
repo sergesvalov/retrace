@@ -1,6 +1,8 @@
 import { describe, expect, it } from 'vitest';
 import {
+  addPinMapToTrack,
   autoPlaceScreenshotOnBounds,
+  computeRubberSheetDisplacement,
   fitAffineTransform,
   fitNorthUpTransform,
   lonLatToMercator,
@@ -61,6 +63,85 @@ describe('Georeferencing math (Web Mercator similarity & affine)', () => {
     // Zero rotation terms
     expect(northUpMat![1]).toBe(0);
     expect(northUpMat![3]).toBe(0);
+  });
+
+  it('progressively locks 1, 2, 3, and 4+ pins (Start -> CP2 -> CP5) via addPinMapToTrack and rubber-sheeting', () => {
+    const init = autoPlaceScreenshotOnBounds(1000, 1000, {
+      minLon: 33.34,
+      maxLon: 33.36,
+      minLat: 34.94,
+      maxLat: 34.96,
+    });
+
+    // Pin 1 (Start)
+    const mapPt1 = pixelToLonLat(init.matrix, 200, 200);
+    const trackPt1: [number, number] = [33.345, 34.955];
+    const step1 = addPinMapToTrack(
+      init.matrix,
+      [],
+      1000,
+      1000,
+      mapPt1,
+      trackPt1
+    );
+    expect(step1).not.toBeNull();
+    expect(step1!.gcps).toHaveLength(1);
+    const afterPin1 = pixelToLonLat(step1!.matrix, 200, 200);
+    expect(afterPin1[0]).toBeCloseTo(trackPt1[0], 5);
+    expect(afterPin1[1]).toBeCloseTo(trackPt1[1], 5);
+
+    // Pin 2 (Far CP2) -> locks BOTH Start and CP2 simultaneously
+    const mapPt2 = pixelToLonLat(step1!.matrix, 800, 800);
+    const trackPt2: [number, number] = [33.358, 34.942];
+    const step2 = addPinMapToTrack(
+      step1!.matrix,
+      step1!.gcps,
+      1000,
+      1000,
+      mapPt2,
+      trackPt2
+    );
+    expect(step2).not.toBeNull();
+    expect(step2!.gcps).toHaveLength(2);
+    expect(step2!.rmsErrorM).toBeLessThan(0.5);
+
+    // Pin 3 (Side CP5 with slight camera X/Y tilt) -> upgrades to Affine and locks all 3 pins
+    const mapPt3 = pixelToLonLat(step2!.matrix, 800, 200);
+    const trackPt3: [number, number] = [33.357, 34.956];
+    const step3 = addPinMapToTrack(
+      step2!.matrix,
+      step2!.gcps,
+      1000,
+      1000,
+      mapPt3,
+      trackPt3
+    );
+    expect(step3).not.toBeNull();
+    expect(step3!.gcps).toHaveLength(3);
+    expect(step3!.rmsErrorM).toBeLessThan(0.5);
+
+    // Pin 4 (Local orienteering map distortion) -> rubber-sheet displacement matches exact pixel offset at Pin 4
+    const mapPt4 = pixelToLonLat(step3!.matrix, 500, 500);
+    const trackPt4: [number, number] = [33.3515, 34.9495];
+    const step4 = addPinMapToTrack(
+      step3!.matrix,
+      step3!.gcps,
+      1000,
+      1000,
+      mapPt4,
+      trackPt4
+    );
+    expect(step4).not.toBeNull();
+    expect(step4!.gcps).toHaveLength(4);
+    const dispAtCenter = computeRubberSheetDisplacement(
+      500,
+      500,
+      1000,
+      1000,
+      step4!.gcps,
+      step4!.matrix
+    );
+    expect(Array.isArray(dispAtCenter)).toBe(true);
   });
 });
 

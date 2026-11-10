@@ -37,6 +37,7 @@ import type {
   RaceEvent,
   TimeMode,
 } from '../../shared/types.js';
+import { buildRubberSheetedMapUrl } from '../utils/rubberSheet.js';
 
 interface Props {
   event: RaceEvent;
@@ -71,6 +72,8 @@ export const ReplayWorkspace: React.FC<Props> = ({
   const [showMapCalibrator, setShowMapCalibrator] = useState<boolean>(true);
   const [snapStage, setSnapStage] = useState<
     | 'idle'
+    | 'pin_map'
+    | 'pin_track'
     | 'shift_map'
     | 'shift_track'
     | 'two_pt_map1'
@@ -90,6 +93,7 @@ export const ReplayWorkspace: React.FC<Props> = ({
   const mapRef = useRef<maplibregl.Map | null>(null);
   const mapReadyRef = useRef<boolean>(false);
   const runnerMarkersRef = useRef<Map<string, maplibregl.Marker>>(new Map());
+  const pinMarkersRef = useRef<maplibregl.Marker[]>([]);
   const rafRef = useRef<number | null>(null);
   const lastFrameMsRef = useRef<number | null>(null);
 
@@ -335,37 +339,66 @@ export const ReplayWorkspace: React.FC<Props> = ({
     }
   }, [osmOpacity, mapOpacity]);
 
-  // Update custom map if georef or uploaded screenshot changed
+  // Update custom map if georef or uploaded screenshot changed (including multi-pin Rubber-Sheeting)
   useEffect(() => {
     const map = mapRef.current;
     if (!map || !mapReadyRef.current || !event.map?.cornersLonLat) return;
-    const src = map.getSource('custom-map') as
-      | maplibregl.ImageSource
-      | undefined;
-    if (src) {
-      src.updateImage({
-        url: event.map.imageUrl,
-        coordinates: event.map.cornersLonLat,
+    const mapObj = event.map;
+    const corners = mapObj.cornersLonLat!;
+    let cancelled = false;
+
+    void buildRubberSheetedMapUrl(
+      mapObj.imageUrl,
+      mapObj.width,
+      mapObj.height,
+      mapObj.gcps,
+      mapObj.matrix
+    ).then((warpedUrl) => {
+      if (cancelled || !mapReadyRef.current) return;
+      const src = map.getSource('custom-map') as
+        | maplibregl.ImageSource
+        | undefined;
+      if (src) {
+        src.updateImage({
+          url: warpedUrl,
+          coordinates: corners,
+        });
+      } else {
+        map.addSource('custom-map', {
+          type: 'image',
+          url: warpedUrl,
+          coordinates: corners,
+        });
+        map.addLayer(
+          {
+            id: 'custom-map-layer',
+            type: 'raster',
+            source: 'custom-map',
+            paint: { 'raster-opacity': mapOpacity, 'raster-fade-duration': 0 },
+          },
+          'ghost-tracks-layer'
+        );
+      }
+    });
+
+    // Render pinned control points on the Replay map when calibrator is open
+    for (const pm of pinMarkersRef.current) pm.remove();
+    pinMarkersRef.current = [];
+    if (showMapCalibrator && mapObj.gcps) {
+      const cleanPins = mapObj.gcps.filter((g) => !g.id.startsWith('gcp-auto-'));
+      cleanPins.forEach((g, idx) => {
+        const el = document.createElement('div');
+        el.className =
+          'px-1.5 py-0.5 rounded-full bg-emerald-500 border-2 border-white text-slate-950 font-bold text-[10px] shadow-lg pointer-events-none flex items-center gap-0.5';
+        el.textContent = `📌${idx + 1}`;
+        const m = new maplibregl.Marker({ element: el })
+          .setLngLat([g.lon, g.lat])
+          .addTo(map);
+        pinMarkersRef.current.push(m);
       });
-    } else {
-      map.addSource('custom-map', {
-        type: 'image',
-        url: event.map.imageUrl,
-        coordinates: event.map.cornersLonLat,
-      });
-      map.addLayer(
-        {
-          id: 'custom-map-layer',
-          type: 'raster',
-          source: 'custom-map',
-          paint: { 'raster-opacity': mapOpacity, 'raster-fade-duration': 0 },
-        },
-        'ghost-tracks-layer'
-      );
     }
 
     // If the georeferenced map is outside the current camera view, fly to it automatically
-    const corners = event.map.cornersLonLat;
     const mapCenterLon = (corners[0][0] + corners[2][0]) / 2;
     const mapCenterLat = (corners[0][1] + corners[2][1]) / 2;
     const viewCenter = map.getCenter();
@@ -391,7 +424,11 @@ export const ReplayWorkspace: React.FC<Props> = ({
         { padding: 50, maxZoom: 16, duration: 500 }
       );
     }
-  }, [event.map]);
+
+    return () => {
+      cancelled = true;
+    };
+  }, [event.map, showMapCalibrator]);
 
   // Update ghost tracks & common start marker when participants list changes
   useEffect(() => {
@@ -652,7 +689,20 @@ export const ReplayWorkspace: React.FC<Props> = ({
     const onMapClick = (e: maplibregl.MapMouseEvent) => {
       const clicked: [number, number] = [e.lngLat.lng, e.lngLat.lat];
 
-      if (snapStage === 'shift_map') {
+      if (snapStage === 'pin_map') {
+        setPickedFeatureLonLat(clicked);
+        setSnapStage('pin_track');
+      } else if (snapStage === 'pin_track' && pickedFeatureLonLat) {
+        const mapPt = pickedFeatureLonLat;
+        setSnapStage('idle');
+        setPickedFeatureLonLat(null);
+        void nudgeMap({
+          addPin: {
+            mapLonLat: mapPt,
+            trackLonLat: clicked,
+          },
+        });
+      } else if (snapStage === 'shift_map') {
         setPickedFeatureLonLat(clicked);
         setSnapStage('shift_track');
       } else if (snapStage === 'shift_track' && pickedFeatureLonLat) {
@@ -709,6 +759,12 @@ export const ReplayWorkspace: React.FC<Props> = ({
     dNorthM?: number;
     scaleFactor?: number;
     dAngleDeg?: number;
+    addPin?: {
+      mapLonLat: [number, number];
+      trackLonLat: [number, number];
+    };
+    undoLastPin?: boolean;
+    clearPins?: boolean;
     twoPointSnap?: {
       pair1: { mapLonLat: [number, number]; trackLonLat: [number, number] };
       pair2: { mapLonLat: [number, number]; trackLonLat: [number, number] };
@@ -861,39 +917,83 @@ export const ReplayWorkspace: React.FC<Props> = ({
                 </button>
               </div>
 
-              {/* 2-point full auto-align (solves shift + scale + magnetic rotation in 4 clicks!) */}
-              <button
-                onClick={() => {
-                  if (snapStage.startsWith('two_pt')) {
-                    setSnapStage('idle');
-                    setPickedFeatureLonLat(null);
-                    setPair1Data(null);
-                  } else {
-                    setPickedFeatureLonLat(null);
-                    setPair1Data(null);
-                    setSnapStage('two_pt_map1');
-                  }
-                }}
-                className={`w-full py-2 px-3 rounded-lg font-medium flex items-center justify-center gap-1.5 border transition ${
-                  snapStage.startsWith('two_pt')
-                    ? 'bg-amber-500/25 border-amber-400 text-amber-200 animate-pulse'
-                    : 'bg-emerald-600 hover:bg-emerald-500 border-emerald-500 text-white shadow'
-                }`}
-              >
-                <Crosshair className="w-4 h-4 shrink-0" />
-                {!snapStage.startsWith('two_pt') &&
-                  'По 2 точкам: КАРТА → ТРЕК (сдвиг + поворот + масштаб)'}
-                {snapStage === 'two_pt_map1' &&
-                  'Точка 1: кликни ориентир №1 на КАРТЕ'}
-                {snapStage === 'two_pt_track1' &&
-                  'Точка 1: теперь кликни это же место на ТРЕКЕ'}
-                {snapStage === 'two_pt_map2' &&
-                  'Точка 2: кликни ориентир №2 на КАРТЕ'}
-                {snapStage === 'two_pt_track2' &&
-                  'Точка 2: теперь кликни это же место на ТРЕКЕ'}
-              </button>
+              {/* Multi-Pin Anchor ("Приколоть булавку КАРТА -> ТРЕК"): locks Start, КП2, КП5... simultaneously */}
+              <div className="bg-slate-950/90 p-2.5 rounded-lg border border-emerald-500/30 space-y-2">
+                <div className="flex items-center justify-between text-[11px]">
+                  <span className="text-emerald-300 font-semibold">
+                    📌 Булавки по КП и дорогам ({
+                      (event.map.gcps ?? []).filter(
+                        (g) => !g.id.startsWith('gcp-auto-')
+                      ).length
+                    })
+                  </span>
+                  <span className="text-slate-400 text-[10px]">
+                    {(event.map.gcps ?? []).filter(
+                      (g) => !g.id.startsWith('gcp-auto-')
+                    ).length === 0 && 'Старт → КП2 → дальний КП'}
+                    {(event.map.gcps ?? []).filter(
+                      (g) => !g.id.startsWith('gcp-auto-')
+                    ).length === 1 && '1 т.: сдвиг'}
+                    {(event.map.gcps ?? []).filter(
+                      (g) => !g.id.startsWith('gcp-auto-')
+                    ).length === 2 && '2 т.: поворот + масштаб'}
+                    {(event.map.gcps ?? []).filter(
+                      (g) => !g.id.startsWith('gcp-auto-')
+                    ).length === 3 && '3 т.: наклон фото X/Y'}
+                    {(event.map.gcps ?? []).filter(
+                      (g) => !g.id.startsWith('gcp-auto-')
+                    ).length >= 4 && '4+ т.: эластичная сетка'}
+                  </span>
+                </div>
 
-              {/* 1-point simple shift */}
+                <button
+                  onClick={() => {
+                    if (snapStage.startsWith('pin_')) {
+                      setSnapStage('idle');
+                      setPickedFeatureLonLat(null);
+                    } else {
+                      setPickedFeatureLonLat(null);
+                      setSnapStage('pin_map');
+                    }
+                  }}
+                  className={`w-full py-2 px-3 rounded-lg font-medium flex items-center justify-center gap-1.5 border transition ${
+                    snapStage.startsWith('pin_')
+                      ? 'bg-amber-500/25 border-amber-400 text-amber-200 animate-pulse'
+                      : 'bg-emerald-600 hover:bg-emerald-500 border-emerald-500 text-white shadow'
+                  }`}
+                >
+                  <Crosshair className="w-4 h-4 shrink-0" />
+                  {!snapStage.startsWith('pin_') &&
+                    '📌 + Приколоть точку: КАРТА → ТРЕК'}
+                  {snapStage === 'pin_map' &&
+                    '1/2: Кликни КП / поворот дороги на КАРТЕ'}
+                  {snapStage === 'pin_track' &&
+                    '2/2: Кликни это же место на GPS-ТРЕКЕ'}
+                </button>
+
+                {(event.map.gcps ?? []).filter(
+                  (g) => !g.id.startsWith('gcp-auto-')
+                ).length > 0 && (
+                  <div className="flex items-center gap-1.5 pt-0.5">
+                    <button
+                      onClick={() => void nudgeMap({ undoLastPin: true })}
+                      className="flex-1 py-1 px-2 rounded bg-slate-800 hover:bg-slate-700 text-slate-300 text-[11px] flex items-center justify-center gap-1"
+                      title="Удалить последнюю поставленную булавку"
+                    >
+                      <RotateCcw className="w-3 h-3" /> Отменить булавку
+                    </button>
+                    <button
+                      onClick={() => void nudgeMap({ clearPins: true })}
+                      className="py-1 px-2 rounded bg-slate-800 hover:bg-rose-900/50 text-slate-400 hover:text-rose-200 text-[11px]"
+                      title="Сбросить все булавки"
+                    >
+                      Сброс
+                    </button>
+                  </div>
+                )}
+              </div>
+
+              {/* 1-point simple shift without adding a pin */}
               <button
                 onClick={() => {
                   if (snapStage.startsWith('shift')) {
@@ -912,7 +1012,7 @@ export const ReplayWorkspace: React.FC<Props> = ({
               >
                 <Move className="w-3.5 h-3.5 shrink-0" />
                 {!snapStage.startsWith('shift') &&
-                  'Быстрый сдвиг по 1 точке (КАРТА → ТРЕК)'}
+                  'Просто сдвинуть всю карту (1 точка)'}
                 {snapStage === 'shift_map' &&
                   '1/2: Кликни место на КАРТЕ'}
                 {snapStage === 'shift_track' &&

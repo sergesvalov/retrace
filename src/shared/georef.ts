@@ -269,6 +269,8 @@ export function fitSimilarityTransform(
  * Fit 2D Affine transform (6 DOF) via Ordinary Least Squares in Web Mercator:
  *   X = a * px + b * py + tx
  *   Y = c * px + d * py + ty
+ * Includes collinearity safeguard: if the 3+ points lie nearly on a straight line
+ * (causing extreme anisotropy > 1.4x or reflection), smoothly regularizes toward Similarity.
  */
 export function fitAffineTransform(
   gcps: GCP[]
@@ -314,9 +316,39 @@ export function fitAffineTransform(
   ];
   const rowX = solve3x3(A, [sxX, syX, s1X]);
   const rowY = solve3x3(A, [sxY, syY, s1Y]);
-  if (!rowX || !rowY) return null;
+  if (!rowX || !rowY) return fitSimilarityTransform(gcps);
 
-  return [rowX[0], rowX[1], rowX[2], rowY[0], rowY[1], rowY[2]];
+  const [a, b, tx] = rowX;
+  const [c, d, ty] = rowY;
+
+  // Check singular values of 2x2 linear part [[a, b], [c, d]] to guard against collinear points
+  const det = a * d - b * c;
+  const frobSq = a * a + b * b + c * c + d * d;
+  const disc = Math.max(0, frobSq * frobSq - 4 * det * det);
+  const sMax = Math.sqrt(Math.max(0, (frobSq + Math.sqrt(disc)) / 2));
+  const sMin = Math.sqrt(Math.max(0, (frobSq - Math.sqrt(disc)) / 2));
+
+  // Image Y is down, Mercator Y is up -> valid orientation has det < 0 and reasonable aspect ratio
+  if (det >= 0 || sMin < 1e-7 || sMax / sMin > 1.45) {
+    const sim = fitSimilarityTransform(gcps);
+    if (!sim) return [a, b, tx, c, d, ty];
+    if (det >= 0 || sMin < 1e-7 || sMax / sMin > 2.2) {
+      return sim;
+    }
+    // Blend 65% affine + 35% similarity around centroid so it stays stable
+    const wAff = 0.65;
+    const wSim = 0.35;
+    return [
+      wAff * a + wSim * sim[0],
+      wAff * b + wSim * sim[1],
+      wAff * tx + wSim * sim[2],
+      wAff * c + wSim * sim[3],
+      wAff * d + wSim * sim[4],
+      wAff * ty + wSim * sim[5],
+    ];
+  }
+
+  return [a, b, tx, c, d, ty];
 }
 
 /** Apply affine matrix [a, b, tx, c, d, ty] to image pixel (px, py) -> [lon, lat] */
@@ -493,6 +525,160 @@ export function snapMapToTrackByTwoPairs(
   return { matrix: nextMatrix, cornersLonLat, rotationDeg };
 }
 
+/**
+ * Compute smooth Inverse-Distance-Weighted (Shepard Rubber-Sheeting) pixel displacement (dx, dy)
+ * at quad coordinate (u, v) for 4+ control points so local orienteering map distortions
+ * (ISOM generalization, ridges/valleys, camera perspective) vanish at every pinned control point.
+ */
+export function computeRubberSheetDisplacement(
+  u: number,
+  v: number,
+  width: number,
+  height: number,
+  gcps: GCP[],
+  matrix: [number, number, number, number, number, number]
+): [number, number] {
+  const clean = gcps.filter((g) => !g.id.startsWith('gcp-auto-'));
+  if (clean.length < 3) return [0, 0];
+
+  const anchors: Array<{ u: number; v: number; dx: number; dy: number }> = [];
+  let maxResidualPx = 0;
+
+  for (const g of clean) {
+    const uv = lonLatToPixel(matrix, g.lon, g.lat);
+    if (!uv) continue;
+    const dx = g.px - uv[0];
+    const dy = g.py - uv[1];
+    maxResidualPx = Math.max(maxResidualPx, Math.hypot(dx, dy));
+    anchors.push({ u: uv[0], v: uv[1], dx, dy });
+  }
+
+  if (maxResidualPx < 0.75 || anchors.length === 0) return [0, 0];
+
+  // Add soft zero-displacement anchors at outer corners (with lower weight) so map edges stay smooth
+  const cornerWeightFactor = 0.18;
+  const corners = [
+    { u: 0, v: 0 },
+    { u: width, v: 0 },
+    { u: width, v: height },
+    { u: 0, v: height },
+  ];
+
+  let sumW = 0;
+  let sumDx = 0;
+  let sumDy = 0;
+
+  for (const a of anchors) {
+    const d2 = (u - a.u) * (u - a.u) + (v - a.v) * (v - a.v);
+    if (d2 < 1e-3) return [a.dx, a.dy];
+    const w = 1 / Math.pow(d2 + 400, 1.35);
+    sumW += w;
+    sumDx += w * a.dx;
+    sumDy += w * a.dy;
+  }
+
+  for (const c of corners) {
+    const d2 = (u - c.u) * (u - c.u) + (v - c.v) * (v - c.v);
+    const w = cornerWeightFactor / Math.pow(d2 + 2500, 1.35);
+    sumW += w;
+  }
+
+  if (sumW < 1e-12) return [0, 0];
+  return [sumDx / sumW, sumDy / sumW];
+}
+
+/**
+ * Add a persistent Pin ("Булавка КАРТА -> ТРЕК") directly from a click on the displayed map (`mapLonLat`)
+ * and a click on the GPS track (`trackLonLat`).
+ * - 1 pin: shifts the map so Pin #1 locks onto the track.
+ * - 2 pins: solves Similarity (shift + scale + magnetic north rotation) so both pins lock onto the track.
+ * - 3+ pins: solves Affine (independent X/Y scale + camera tilt shear + rotation) + Rubber-Sheeting so ALL pins lock onto the track!
+ */
+export function addPinMapToTrack(
+  currentMatrix: [number, number, number, number, number, number],
+  existingGcps: GCP[],
+  width: number,
+  height: number,
+  mapLonLat: [number, number],
+  trackLonLat: [number, number],
+  customId?: string
+): {
+  gcps: GCP[];
+  matrix: [number, number, number, number, number, number];
+  cornersLonLat: [
+    [number, number],
+    [number, number],
+    [number, number],
+    [number, number],
+  ];
+  rmsErrorM: number;
+  rotationDeg: number;
+} | null {
+  const uv = lonLatToPixel(currentMatrix, mapLonLat[0], mapLonLat[1]);
+  if (!uv) return null;
+
+  const cleanExisting = existingGcps.filter(
+    (g) => !g.id.startsWith('gcp-auto-')
+  );
+  const [dx, dy] = computeRubberSheetDisplacement(
+    uv[0],
+    uv[1],
+    width,
+    height,
+    cleanExisting,
+    currentMatrix
+  );
+  const px = Math.round((uv[0] + dx) * 10) / 10;
+  const py = Math.round((uv[1] + dy) * 10) / 10;
+
+  const newPin: GCP = {
+    id: customId ?? `pin-${Date.now()}`,
+    label: `Булавка #${cleanExisting.length + 1}`,
+    px,
+    py,
+    lon: Number(trackLonLat[0].toFixed(6)),
+    lat: Number(trackLonLat[1].toFixed(6)),
+    residualM: 0,
+  };
+
+  const nextGcps = [...cleanExisting, newPin];
+
+  if (nextGcps.length === 1) {
+    // 1 pin: translate current matrix so (px, py) lands exactly on trackLonLat
+    const [nowLon, nowLat] = pixelToLonLat(currentMatrix, px, py);
+    const [m0x, m0y] = lonLatToMercator(nowLon, nowLat);
+    const [m1x, m1y] = lonLatToMercator(trackLonLat[0], trackLonLat[1]);
+    const nudged = nudgeMapMatrix(currentMatrix, width, height, {
+      dEastM: m1x - m0x,
+      dNorthM: m1y - m0y,
+    });
+    const rotationDeg =
+      Math.round(
+        ((Math.atan2(nudged.matrix[3], nudged.matrix[0]) * 180) / Math.PI) * 10
+      ) / 10;
+    return {
+      gcps: nextGcps,
+      matrix: nudged.matrix,
+      cornersLonLat: nudged.cornersLonLat,
+      rmsErrorM: 0,
+      rotationDeg,
+    };
+  }
+
+  // 2 pins -> similarity; 3+ pins -> affine
+  const mode: TransformType = nextGcps.length >= 3 ? 'affine' : 'similarity';
+  const sol = solveGeoref(nextGcps, width, height, mode);
+  if (!sol) return null;
+
+  return {
+    gcps: sol.gcpsWithResiduals,
+    matrix: sol.matrix,
+    cornersLonLat: sol.cornersLonLat,
+    rmsErrorM: sol.rmsErrorM,
+    rotationDeg: sol.rotationDeg,
+  };
+}
+
 export interface GeorefSolution {
   matrix: [number, number, number, number, number, number];
   cornersLonLat: [
@@ -508,19 +694,21 @@ export interface GeorefSolution {
 
 /**
  * Compute full georeferencing solution (matrix, 4 corners for MapLibre, RMS error in meters, rotation angle).
+ * Automatically upgrades from Similarity (4 DOF) to Affine (6 DOF: X/Y scale + camera tilt shear) when 3+ points are given.
  */
 export function solveGeoref(
   gcps: GCP[],
   width: number,
   height: number,
-  preferredMode: TransformType = 'north_up'
+  preferredMode: TransformType = 'similarity'
 ): GeorefSolution | null {
   if (gcps.length < 2) return null;
 
   let matrix: [number, number, number, number, number, number] | null = null;
   if (preferredMode === 'north_up') {
     matrix = fitNorthUpTransform(gcps);
-  } else if (preferredMode === 'affine' && gcps.length >= 3) {
+  } else if (gcps.length >= 3) {
+    // With 3+ points on an orienteering map, always use regularized Affine so X/Y scale difference & photo tilt are corrected!
     matrix = fitAffineTransform(gcps) ?? fitSimilarityTransform(gcps);
   } else {
     matrix = fitSimilarityTransform(gcps);

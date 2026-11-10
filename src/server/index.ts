@@ -6,6 +6,7 @@ import multipart from '@fastify/multipart';
 import fastifyStatic from '@fastify/static';
 import { nanoid } from 'nanoid';
 import {
+  addPinMapToTrack,
   autoPlaceScreenshotOnBounds,
   nudgeMapMatrix,
   snapMapToTrackByTwoPairs,
@@ -297,7 +298,7 @@ async function startServer() {
     return { event: evt };
   });
 
-  // Nudge map overlay directly (shift in meters, rotate in deg, scale) or snap by 2 pairs of points (map -> track)
+  // Nudge map overlay directly (shift in meters, rotate in deg, scale), add persistent Pin (map -> track), or snap by 2 pairs
   app.post<{
     Params: { id: string };
     Body: {
@@ -305,6 +306,12 @@ async function startServer() {
       dNorthM?: number;
       scaleFactor?: number;
       dAngleDeg?: number;
+      addPin?: {
+        mapLonLat: [number, number];
+        trackLonLat: [number, number];
+      };
+      undoLastPin?: boolean;
+      clearPins?: boolean;
       twoPointSnap?: {
         pair1: { mapLonLat: [number, number]; trackLonLat: [number, number] };
         pair2: { mapLonLat: [number, number]; trackLonLat: [number, number] };
@@ -337,7 +344,48 @@ async function startServer() {
       evt.map.cornersLonLat = init.cornersLonLat;
     }
 
-    if (req.body.twoPointSnap) {
+    if (req.body.clearPins) {
+      evt.map.gcps = [];
+      evt.map.rmsErrorM = undefined;
+    } else if (req.body.undoLastPin) {
+      const clean = evt.map.gcps.filter((g) => !g.id.startsWith('gcp-auto-'));
+      clean.pop();
+      evt.map.gcps = clean;
+      if (clean.length >= 2) {
+        const sol = solveGeoref(
+          clean,
+          evt.map.width,
+          evt.map.height,
+          clean.length >= 3 ? 'affine' : 'similarity'
+        );
+        if (sol) {
+          evt.map.gcps = sol.gcpsWithResiduals;
+          evt.map.matrix = sol.matrix;
+          evt.map.cornersLonLat = sol.cornersLonLat;
+          evt.map.rmsErrorM = sol.rmsErrorM;
+          evt.map.rotationDeg = sol.rotationDeg;
+        }
+      }
+    } else if (req.body.addPin) {
+      const pinned = addPinMapToTrack(
+        evt.map.matrix,
+        evt.map.gcps,
+        evt.map.width,
+        evt.map.height,
+        req.body.addPin.mapLonLat,
+        req.body.addPin.trackLonLat,
+        `pin-${nanoid(6)}`
+      );
+      if (pinned) {
+        evt.map.gcps = pinned.gcps;
+        evt.map.matrix = pinned.matrix;
+        evt.map.cornersLonLat = pinned.cornersLonLat;
+        evt.map.rmsErrorM = pinned.rmsErrorM;
+        evt.map.rotationDeg = pinned.rotationDeg;
+        evt.map.transformType =
+          pinned.gcps.length >= 3 ? 'affine' : 'similarity';
+      }
+    } else if (req.body.twoPointSnap) {
       const snapped = snapMapToTrackByTwoPairs(
         evt.map.matrix,
         evt.map.width,
