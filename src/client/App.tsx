@@ -103,7 +103,7 @@ export const App: React.FC = () => {
         const data = await res.json();
         const evt: RaceEvent = data.event;
         setCurrentEvent(evt);
-        setActiveTab('georef'); // Immediately open map georeferencing for a fresh event
+        setActiveTab('replay'); // Everything is done right in the main Replay screen (Variant B)!
         const listRes = await fetch('/api/events');
         const listData = await listRes.json();
         setEventsList(listData.events ?? []);

@@ -63,13 +63,23 @@ export const ReplayWorkspace: React.FC<Props> = ({ event, onEventUpdated }) => {
   const [uploadingScreenshot, setUploadingScreenshot] =
     useState<boolean>(false);
   const [uploadError, setUploadError] = useState<string | null>(null);
-  const [showMapCalibrator, setShowMapCalibrator] = useState<boolean>(false);
-  const [twoClickStep, setTwoClickStep] = useState<
-    'idle' | 'pick_map_feature' | 'pick_track_point'
+  const [showMapCalibrator, setShowMapCalibrator] = useState<boolean>(true);
+  const [snapStage, setSnapStage] = useState<
+    | 'idle'
+    | 'shift_map'
+    | 'shift_track'
+    | 'two_pt_map1'
+    | 'two_pt_track1'
+    | 'two_pt_map2'
+    | 'two_pt_track2'
   >('idle');
   const [pickedFeatureLonLat, setPickedFeatureLonLat] = useState<
     [number, number] | null
   >(null);
+  const [pair1Data, setPair1Data] = useState<{
+    mapLonLat: [number, number];
+    trackLonLat: [number, number];
+  } | null>(null);
 
   const mapContainerRef = useRef<HTMLDivElement | null>(null);
   const mapRef = useRef<maplibregl.Map | null>(null);
@@ -563,26 +573,57 @@ export const ReplayWorkspace: React.FC<Props> = ({ event, onEventUpdated }) => {
     }
   }
 
-  // Handle 2-click map-to-track snap directly on the replay map
+  // Handle direct click-on-map -> click-on-track alignment (both 1-point shift & 2-point full auto-align)
   useEffect(() => {
     const map = mapRef.current;
     if (!map) return;
 
     const onMapClick = (e: maplibregl.MapMouseEvent) => {
-      if (twoClickStep === 'pick_map_feature') {
-        setPickedFeatureLonLat([e.lngLat.lng, e.lngLat.lat]);
-        setTwoClickStep('pick_track_point');
-      } else if (twoClickStep === 'pick_track_point' && pickedFeatureLonLat) {
+      const clicked: [number, number] = [e.lngLat.lng, e.lngLat.lat];
+
+      if (snapStage === 'shift_map') {
+        setPickedFeatureLonLat(clicked);
+        setSnapStage('shift_track');
+      } else if (snapStage === 'shift_track' && pickedFeatureLonLat) {
         const [m0x, m0y] = lonLatToMercator(
           pickedFeatureLonLat[0],
           pickedFeatureLonLat[1]
         );
-        const [m1x, m1y] = lonLatToMercator(e.lngLat.lng, e.lngLat.lat);
-        const dEastM = m1x - m0x;
-        const dNorthM = m1y - m0y;
-        setTwoClickStep('idle');
+        const [m1x, m1y] = lonLatToMercator(clicked[0], clicked[1]);
+        setSnapStage('idle');
         setPickedFeatureLonLat(null);
-        void nudgeMap({ dEastM, dNorthM });
+        void nudgeMap({ dEastM: m1x - m0x, dNorthM: m1y - m0y });
+      } else if (snapStage === 'two_pt_map1') {
+        setPickedFeatureLonLat(clicked);
+        setSnapStage('two_pt_track1');
+      } else if (snapStage === 'two_pt_track1' && pickedFeatureLonLat) {
+        setPair1Data({
+          mapLonLat: pickedFeatureLonLat,
+          trackLonLat: clicked,
+        });
+        setPickedFeatureLonLat(null);
+        setSnapStage('two_pt_map2');
+      } else if (snapStage === 'two_pt_map2') {
+        setPickedFeatureLonLat(clicked);
+        setSnapStage('two_pt_track2');
+      } else if (
+        snapStage === 'two_pt_track2' &&
+        pickedFeatureLonLat &&
+        pair1Data
+      ) {
+        const pair2 = {
+          mapLonLat: pickedFeatureLonLat,
+          trackLonLat: clicked,
+        };
+        setSnapStage('idle');
+        setPickedFeatureLonLat(null);
+        setPair1Data(null);
+        void nudgeMap({
+          twoPointSnap: {
+            pair1: pair1Data,
+            pair2,
+          },
+        });
       }
     };
 
@@ -590,13 +631,17 @@ export const ReplayWorkspace: React.FC<Props> = ({ event, onEventUpdated }) => {
     return () => {
       map.off('click', onMapClick);
     };
-  }, [twoClickStep, pickedFeatureLonLat, event.id]);
+  }, [snapStage, pickedFeatureLonLat, pair1Data, event.id]);
 
   async function nudgeMap(params: {
     dEastM?: number;
     dNorthM?: number;
     scaleFactor?: number;
     dAngleDeg?: number;
+    twoPointSnap?: {
+      pair1: { mapLonLat: [number, number]; trackLonLat: [number, number] };
+      pair2: { mapLonLat: [number, number]; trackLonLat: [number, number] };
+    };
   }) {
     const res = await fetch(`/api/events/${event.id}/map-nudge`, {
       method: 'POST',
@@ -628,9 +673,13 @@ export const ReplayWorkspace: React.FC<Props> = ({ event, onEventUpdated }) => {
         <div className="lg:col-span-8 xl:col-span-9 relative flex flex-col min-h-[420px]">
           {/* Floating map layer controls */}
           <div className="absolute top-3 left-3 z-10 flex flex-wrap items-center gap-3 px-3.5 py-2 rounded-xl bg-slate-900/90 backdrop-blur border border-slate-800 shadow-xl text-xs">
-            <label className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg bg-slate-800 hover:bg-slate-700 border border-slate-700 text-slate-200 cursor-pointer transition">
-              <ImagePlus className="w-3.5 h-3.5 text-emerald-400" />
-              {uploadingScreenshot ? 'Загрузка...' : 'Скрин Google Maps'}
+            <label className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white font-medium cursor-pointer transition">
+              <ImagePlus className="w-3.5 h-3.5" />
+              {uploadingScreenshot
+                ? 'Загрузка...'
+                : event.map
+                  ? 'Заменить карту'
+                  : 'Загрузить карту / скрин'}
               <input
                 type="file"
                 accept="image/*"
@@ -700,7 +749,7 @@ export const ReplayWorkspace: React.FC<Props> = ({ event, onEventUpdated }) => {
               <button
                 onClick={() => setShowMapCalibrator((v) => !v)}
                 className={`inline-flex items-center gap-1 px-2.5 py-1 rounded-lg border transition ${
-                  showMapCalibrator || twoClickStep !== 'idle'
+                  showMapCalibrator || snapStage !== 'idle'
                     ? 'bg-emerald-500/20 border-emerald-400/60 text-emerald-300 font-medium'
                     : 'bg-slate-800 border-slate-700 text-slate-300 hover:text-white'
                 }`}
@@ -717,12 +766,12 @@ export const ReplayWorkspace: React.FC<Props> = ({ event, onEventUpdated }) => {
             <div className="absolute top-16 left-3 z-20 p-3 rounded-xl bg-slate-900/95 backdrop-blur border border-emerald-500/40 shadow-2xl text-xs space-y-2.5 w-80">
               <div className="flex items-center justify-between">
                 <span className="font-semibold text-emerald-300">
-                  Точная подгонка карты под трек
+                  Подгонка карты прямо под трек
                 </span>
                 <button
                   onClick={() => {
                     setShowMapCalibrator(false);
-                    setTwoClickStep('idle');
+                    setSnapStage('idle');
                   }}
                   className="text-slate-400 hover:text-white"
                 >
@@ -730,29 +779,62 @@ export const ReplayWorkspace: React.FC<Props> = ({ event, onEventUpdated }) => {
                 </button>
               </div>
 
-              {/* 2-click direct snap button */}
+              {/* 2-point full auto-align (solves shift + scale + magnetic rotation in 4 clicks!) */}
               <button
                 onClick={() => {
-                  if (twoClickStep === 'idle') {
-                    setTwoClickStep('pick_map_feature');
-                  } else {
-                    setTwoClickStep('idle');
+                  if (snapStage.startsWith('two_pt')) {
+                    setSnapStage('idle');
                     setPickedFeatureLonLat(null);
+                    setPair1Data(null);
+                  } else {
+                    setPickedFeatureLonLat(null);
+                    setPair1Data(null);
+                    setSnapStage('two_pt_map1');
                   }
                 }}
                 className={`w-full py-2 px-3 rounded-lg font-medium flex items-center justify-center gap-1.5 border transition ${
-                  twoClickStep !== 'idle'
+                  snapStage.startsWith('two_pt')
                     ? 'bg-amber-500/25 border-amber-400 text-amber-200 animate-pulse'
-                    : 'bg-emerald-600 hover:bg-emerald-500 border-emerald-500 text-white'
+                    : 'bg-emerald-600 hover:bg-emerald-500 border-emerald-500 text-white shadow'
                 }`}
               >
-                <Crosshair className="w-4 h-4" />
-                {twoClickStep === 'idle' &&
-                  'Сдвинуть в 2 клика (карта → трек)'}
-                {twoClickStep === 'pick_map_feature' &&
-                  '1/2: Кликни на ориентир на КАРТЕ'}
-                {twoClickStep === 'pick_track_point' &&
-                  '2/2: Теперь кликни на точку ТРЕКА'}
+                <Crosshair className="w-4 h-4 shrink-0" />
+                {!snapStage.startsWith('two_pt') &&
+                  'По 2 точкам: КАРТА → ТРЕК (сдвиг + поворот + масштаб)'}
+                {snapStage === 'two_pt_map1' &&
+                  'Точка 1: кликни ориентир №1 на КАРТЕ'}
+                {snapStage === 'two_pt_track1' &&
+                  'Точка 1: теперь кликни это же место на ТРЕКЕ'}
+                {snapStage === 'two_pt_map2' &&
+                  'Точка 2: кликни ориентир №2 на КАРТЕ'}
+                {snapStage === 'two_pt_track2' &&
+                  'Точка 2: теперь кликни это же место на ТРЕКЕ'}
+              </button>
+
+              {/* 1-point simple shift */}
+              <button
+                onClick={() => {
+                  if (snapStage.startsWith('shift')) {
+                    setSnapStage('idle');
+                    setPickedFeatureLonLat(null);
+                  } else {
+                    setPickedFeatureLonLat(null);
+                    setSnapStage('shift_map');
+                  }
+                }}
+                className={`w-full py-1.5 px-3 rounded-lg font-medium flex items-center justify-center gap-1.5 border transition ${
+                  snapStage.startsWith('shift')
+                    ? 'bg-amber-500/25 border-amber-400 text-amber-200 animate-pulse'
+                    : 'bg-slate-800 hover:bg-slate-700 border-slate-700 text-slate-200'
+                }`}
+              >
+                <Move className="w-3.5 h-3.5 shrink-0" />
+                {!snapStage.startsWith('shift') &&
+                  'Быстрый сдвиг по 1 точке (КАРТА → ТРЕК)'}
+                {snapStage === 'shift_map' &&
+                  '1/2: Кликни место на КАРТЕ'}
+                {snapStage === 'shift_track' &&
+                  '2/2: Кликни куда сдвинуть на ТРЕКЕ'}
               </button>
 
               {/* Shift buttons */}

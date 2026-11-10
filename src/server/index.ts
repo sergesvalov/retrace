@@ -8,6 +8,7 @@ import { nanoid } from 'nanoid';
 import {
   autoPlaceScreenshotOnBounds,
   nudgeMapMatrix,
+  snapMapToTrackByTwoPairs,
   solveGeoref,
 } from '../shared/georef.js';
 import {
@@ -265,7 +266,7 @@ async function startServer() {
     return { event: evt };
   });
 
-  // Nudge map overlay directly (shift in meters, rotate in deg, scale) or snap a map point to a track point
+  // Nudge map overlay directly (shift in meters, rotate in deg, scale) or snap by 2 pairs of points (map -> track)
   app.post<{
     Params: { id: string };
     Body: {
@@ -273,27 +274,65 @@ async function startServer() {
       dNorthM?: number;
       scaleFactor?: number;
       dAngleDeg?: number;
+      twoPointSnap?: {
+        pair1: { mapLonLat: [number, number]; trackLonLat: [number, number] };
+        pair2: { mapLonLat: [number, number]; trackLonLat: [number, number] };
+      };
     };
   }>('/api/events/:id/map-nudge', async (req, reply) => {
     const evt = eventsStore.get(req.params.id);
-    if (!evt || !evt.map || !evt.map.matrix) {
+    if (!evt || !evt.map) {
       return reply
         .code(404)
-        .send({ error: 'Сначала привяжите или загрузите карту' });
+        .send({ error: 'Сначала загрузите карту' });
     }
 
-    const res = nudgeMapMatrix(
-      evt.map.matrix,
-      evt.map.width,
-      evt.map.height,
-      req.body
-    );
-    evt.map.matrix = res.matrix;
-    evt.map.cornersLonLat = res.cornersLonLat;
-    evt.map.rotationDeg =
-      Math.round(
-        ((Math.atan2(res.matrix[3], res.matrix[0]) * 180) / Math.PI) * 10
-      ) / 10;
+    // If map has no matrix yet, initialize it onto the GPS track bounds first
+    if (!evt.map.matrix) {
+      const bounds = computeTracksBoundingBox(evt.participants) ?? {
+        minLon: 32.415,
+        maxLon: 32.435,
+        minLat: 34.765,
+        maxLat: 34.78,
+        startLon: 32.4245,
+        startLat: 34.772,
+      };
+      const init = autoPlaceScreenshotOnBounds(
+        evt.map.width,
+        evt.map.height,
+        bounds
+      );
+      evt.map.matrix = init.matrix;
+      evt.map.cornersLonLat = init.cornersLonLat;
+    }
+
+    if (req.body.twoPointSnap) {
+      const snapped = snapMapToTrackByTwoPairs(
+        evt.map.matrix,
+        evt.map.width,
+        evt.map.height,
+        req.body.twoPointSnap.pair1,
+        req.body.twoPointSnap.pair2
+      );
+      if (snapped) {
+        evt.map.matrix = snapped.matrix;
+        evt.map.cornersLonLat = snapped.cornersLonLat;
+        evt.map.rotationDeg = snapped.rotationDeg;
+      }
+    } else {
+      const res = nudgeMapMatrix(
+        evt.map.matrix,
+        evt.map.width,
+        evt.map.height,
+        req.body
+      );
+      evt.map.matrix = res.matrix;
+      evt.map.cornersLonLat = res.cornersLonLat;
+      evt.map.rotationDeg =
+        Math.round(
+          ((Math.atan2(res.matrix[3], res.matrix[0]) * 180) / Math.PI) * 10
+        ) / 10;
+    }
 
     await saveEventToDisk(evt);
     return { event: evt };

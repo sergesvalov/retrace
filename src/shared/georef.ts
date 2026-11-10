@@ -415,6 +415,84 @@ export function nudgeMapMatrix(
   return { matrix: nextMatrix, cornersLonLat };
 }
 
+/**
+ * Given an existing map matrix [a, b, tx, c, d, ty] and 2 pairs of clicks on the map canvas:
+ *   Pair 1: user clicked `mapPt1` (a landmark on the map overlay) and `trackPt1` (where that landmark is on the GPS track)
+ *   Pair 2: user clicked `mapPt2` (a second landmark on the map overlay) and `trackPt2` (where it is on the GPS track)
+ * Converts `mapPt1`, `mapPt2` back into image pixel coordinates `(px, py)` using the current matrix,
+ * then solves the exact 2-point Similarity transform (shift + scale + rotation) so both landmarks
+ * snap directly onto the GPS track!
+ */
+export function snapMapToTrackByTwoPairs(
+  currentMatrix: [number, number, number, number, number, number],
+  width: number,
+  height: number,
+  pair1: { mapLonLat: [number, number]; trackLonLat: [number, number] },
+  pair2: { mapLonLat: [number, number]; trackLonLat: [number, number] }
+): {
+  matrix: [number, number, number, number, number, number];
+  cornersLonLat: [
+    [number, number],
+    [number, number],
+    [number, number],
+    [number, number],
+  ];
+  rotationDeg: number;
+} | null {
+  const pxPy1 = lonLatToPixel(
+    currentMatrix,
+    pair1.mapLonLat[0],
+    pair1.mapLonLat[1]
+  );
+  const pxPy2 = lonLatToPixel(
+    currentMatrix,
+    pair2.mapLonLat[0],
+    pair2.mapLonLat[1]
+  );
+  if (!pxPy1 || !pxPy2) return null;
+
+  const syntheticGcps: GCP[] = [
+    {
+      id: 'snap-1',
+      label: 'Привязка #1',
+      px: pxPy1[0],
+      py: pxPy1[1],
+      lon: pair1.trackLonLat[0],
+      lat: pair1.trackLonLat[1],
+    },
+    {
+      id: 'snap-2',
+      label: 'Привязка #2',
+      px: pxPy2[0],
+      py: pxPy2[1],
+      lon: pair2.trackLonLat[0],
+      lat: pair2.trackLonLat[1],
+    },
+  ];
+
+  const nextMatrix = fitSimilarityTransform(syntheticGcps);
+  if (!nextMatrix) return null;
+
+  const cornersLonLat: [
+    [number, number],
+    [number, number],
+    [number, number],
+    [number, number],
+  ] = [
+    pixelToLonLat(nextMatrix, 0, 0),
+    pixelToLonLat(nextMatrix, width, 0),
+    pixelToLonLat(nextMatrix, width, height),
+    pixelToLonLat(nextMatrix, 0, height),
+  ];
+
+  const rotationDeg =
+    Math.round(
+      ((Math.atan2(nextMatrix[3], nextMatrix[0]) * 180) / Math.PI) * 10
+    ) / 10;
+
+  return { matrix: nextMatrix, cornersLonLat, rotationDeg };
+}
+
 export interface GeorefSolution {
   matrix: [number, number, number, number, number, number];
   cornersLonLat: [
