@@ -40,8 +40,7 @@ pipeline {
     stages {
         stage('Source Checkout') {
             steps {
-                // Build containers run as root and leave root-owned files in the workspace,
-                // which git as the jenkins user can't overwrite. Hand them back before checking out.
+                // Hand any root-owned files in the workspace back to jenkins before checkout.
                 fixWorkspacePermissions()
                 retry(3) {
                     checkout scm
@@ -49,31 +48,11 @@ pipeline {
             }
         }
 
-        stage('Clean Old Artifacts') {
+        stage('Build & Test Docker Image') {
             steps {
                 script {
-                    sh "docker compose down || true"
-                    sh "docker system prune -f --filter label=project=retrace || true"
-                }
-            }
-        }
-
-        stage('Code Quality') {
-            steps {
-                script {
-                    echo "Running TypeScript checks and Vitest unit tests..."
-                    sh """
-                    docker run --rm -v ${WORKSPACE}:/app -v retrace-npm-cache:/root/.npm -w /app node:22-slim sh -c "npm ci && npm run typecheck && npm test"
-                    """
-                }
-            }
-        }
-
-        stage('Build Docker Image') {
-            steps {
-                script {
-                    echo "Сборка Docker-образа Retrace (linux/amd64 для 192.168.0.225)..."
-                    sh "docker build --platform linux/amd64 -t ${DOCKER_IMAGE}:latest -f Dockerfile ."
+                    echo "Сборка и тестирование образа Retrace (typecheck + vitest + vite + esbuild)..."
+                    sh "docker build -t ${DOCKER_IMAGE}:latest -f Dockerfile ."
                 }
             }
         }
@@ -82,7 +61,9 @@ pipeline {
             steps {
                 script {
                     echo "Отправка образа в локальный реестр ${REGISTRY_IP}:${REGISTRY_PORT}..."
-                    sh "docker push ${DOCKER_IMAGE}:latest"
+                    retry(3) {
+                        sh "docker push ${DOCKER_IMAGE}:latest"
+                    }
                 }
             }
         }
@@ -111,10 +92,6 @@ pipeline {
     }
 
     post {
-        always {
-            // Файлы созданы root из контейнера: иначе следующий checkout не сможет их удалить.
-            removeRootOwnedPaths(dir: '.', paths: ['node_modules', 'dist'])
-        }
         success {
             echo "Успешное завершение пайплайна Retrace! Опубликовано на http://${PROD_SERVER_IP}:${params.APP_PORT ?: '8089'} 🎉"
         }
@@ -123,4 +100,3 @@ pipeline {
         }
     }
 }
-

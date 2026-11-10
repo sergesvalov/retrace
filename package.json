@@ -7,8 +7,8 @@
     "dev": "concurrently -n API,WEB -c cyan,magenta \"npm run dev:server\" \"npm run dev:web\"",
     "dev:server": "tsx watch src/server/index.ts",
     "dev:web": "vite",
-    "build": "tsc -b && vite build",
-    "start": "node --import tsx src/server/index.ts",
+    "build": "tsc -b && vite build && npx esbuild src/server/index.ts --bundle --platform=node --target=node22 --format=cjs --outfile=dist/server/index.cjs",
+    "start": "node dist/server/index.cjs",
     "test": "vitest run",
     "typecheck": "tsc --noEmit"
   },
