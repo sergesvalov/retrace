@@ -4,8 +4,10 @@ import {
   Compass,
   FolderPlus,
   MapPin,
+  Pencil,
   PlayCircle,
   Share2,
+  Trash2,
 } from 'lucide-react';
 import type { RaceEvent } from '../shared/types.js';
 import { GeorefWorkspace } from './components/GeorefWorkspace.js';
@@ -103,13 +105,60 @@ export const App: React.FC = () => {
         const data = await res.json();
         const evt: RaceEvent = data.event;
         setCurrentEvent(evt);
-        setActiveTab('replay'); // Everything is done right in the main Replay screen (Variant B)!
-        const listRes = await fetch('/api/events');
-        const listData = await listRes.json();
-        setEventsList(listData.events ?? []);
+        setActiveTab('georef'); // Open split-view (2 maps) so user can upload & see their map immediately
+        await refreshEventsList();
       }
     } finally {
       setCreatingEvent(false);
+    }
+  }
+
+  async function refreshEventsList() {
+    const listRes = await fetch('/api/events');
+    if (listRes.ok) {
+      const listData = await listRes.json();
+      setEventsList(listData.events ?? []);
+    }
+  }
+
+  async function handleRenameCurrentEvent() {
+    if (!currentEvent) return;
+    const nextTitle = window.prompt(
+      'Новое название мероприятия:',
+      currentEvent.title
+    );
+    if (!nextTitle || nextTitle.trim() === currentEvent.title) return;
+    const res = await fetch(`/api/events/${currentEvent.id}`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ title: nextTitle.trim() }),
+    });
+    if (res.ok) {
+      const data = await res.json();
+      setCurrentEvent(data.event);
+      await refreshEventsList();
+    }
+  }
+
+  async function handleDeleteCurrentEvent() {
+    if (!currentEvent) return;
+    const ok = window.confirm(
+      `Удалить мероприятие «${currentEvent.title}» со всеми его картами и треками?`
+    );
+    if (!ok) return;
+    const res = await fetch(`/api/events/${currentEvent.id}`, {
+      method: 'DELETE',
+    });
+    if (res.ok) {
+      const listRes = await fetch('/api/events');
+      const listData = await listRes.json();
+      const remaining: EventSummary[] = listData.events ?? [];
+      if (remaining.length > 0) {
+        setEventsList(remaining);
+        await loadEvent(remaining[0].id);
+      } else {
+        await initApp();
+      }
     }
   }
 
@@ -142,11 +191,11 @@ export const App: React.FC = () => {
 
           <div className="h-5 w-px bg-slate-800 mx-1" />
 
-          {/* Event selector */}
+          {/* Event selector + Edit + Delete + Create */}
           <select
             value={currentEvent?.id ?? ''}
             onChange={(e) => loadEvent(e.target.value)}
-            className="bg-slate-800 border border-slate-700 text-slate-100 text-xs rounded-lg px-2.5 py-1.5 max-w-[260px] truncate focus:outline-none focus:border-emerald-500"
+            className="bg-slate-800 border border-slate-700 text-slate-100 text-xs rounded-lg px-2.5 py-1.5 max-w-[240px] truncate focus:outline-none focus:border-emerald-500"
           >
             {eventsList.map((ev) => (
               <option key={ev.id} value={ev.id}>
@@ -156,10 +205,28 @@ export const App: React.FC = () => {
           </select>
 
           <button
+            onClick={handleRenameCurrentEvent}
+            disabled={!currentEvent}
+            className="p-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 border border-slate-700 text-slate-300 hover:text-white transition"
+            title="Переименовать текущее мероприятие"
+          >
+            <Pencil className="w-3.5 h-3.5" />
+          </button>
+
+          <button
+            onClick={handleDeleteCurrentEvent}
+            disabled={!currentEvent}
+            className="p-1.5 rounded-lg bg-slate-800 hover:bg-rose-900/60 border border-slate-700 hover:border-rose-500/50 text-slate-400 hover:text-rose-300 transition"
+            title="Удалить текущее мероприятие"
+          >
+            <Trash2 className="w-3.5 h-3.5" />
+          </button>
+
+          <button
             onClick={handleCreateNewEvent}
             disabled={creatingEvent}
             className="inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 border border-slate-700 text-xs text-slate-200 transition"
-            title="Создать новое событие без регистрации"
+            title="Создать новое мероприятие"
           >
             <FolderPlus className="w-3.5 h-3.5 text-emerald-400" />
             <span className="hidden md:inline">Новое событие</span>
@@ -228,12 +295,18 @@ export const App: React.FC = () => {
         ) : activeTab === 'replay' ? (
           <ReplayWorkspace
             event={currentEvent}
-            onEventUpdated={(evt) => setCurrentEvent(evt)}
+            onEventUpdated={(evt) => {
+              setCurrentEvent(evt);
+              void refreshEventsList();
+            }}
           />
         ) : (
           <GeorefWorkspace
             event={currentEvent}
-            onEventUpdated={(evt) => setCurrentEvent(evt)}
+            onEventUpdated={(evt) => {
+              setCurrentEvent(evt);
+              void refreshEventsList();
+            }}
           />
         )}
       </main>

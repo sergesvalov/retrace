@@ -193,11 +193,16 @@ async function startServer() {
       const width = Number(widthField) || 1200;
       const height = Number(heightField) || 900;
 
-      // Auto-place screenshot onto the bounding box of existing GPS tracks (North-Up mode for Google Maps)
-      const trackBounds = computeTracksBoundingBox(evt.participants);
-      const autoPlaced = trackBounds
-        ? autoPlaceScreenshotOnBounds(width, height, trackBounds)
-        : null;
+      // Auto-place screenshot onto the bounding box of existing GPS tracks (or default Paphos bounds if no tracks yet)
+      const trackBounds = computeTracksBoundingBox(evt.participants) ?? {
+        minLon: 32.415,
+        maxLon: 32.435,
+        minLat: 34.765,
+        maxLat: 34.78,
+        startLon: 32.4245,
+        startLat: 34.772,
+      };
+      const autoPlaced = autoPlaceScreenshotOnBounds(width, height, trackBounds);
 
       const mapOverlay: MapOverlay = {
         id: nanoid(8),
@@ -205,11 +210,11 @@ async function startServer() {
         imageUrl: `/uploads/${fileId}`,
         width,
         height,
-        gcps: autoPlaced?.gcps ?? [],
+        gcps: autoPlaced.gcps,
         transformType: 'similarity',
-        matrix: autoPlaced?.matrix,
-        cornersLonLat: autoPlaced?.cornersLonLat,
-        rmsErrorM: autoPlaced ? 0 : undefined,
+        matrix: autoPlaced.matrix,
+        cornersLonLat: autoPlaced.cornersLonLat,
+        rmsErrorM: 0,
         rotationDeg: 0,
       };
 
@@ -387,6 +392,27 @@ async function startServer() {
 
         evt.participants.push(participant);
         syncAllParticipantsToCommonStartSpot(evt.participants);
+
+        // If map was uploaded before any tracks existed (still on auto-placed default bounds), move it onto the tracks!
+        if (
+          evt.map &&
+          (!evt.map.matrix ||
+            evt.map.gcps.length === 0 ||
+            evt.map.gcps.every((g) => g.id.startsWith('gcp-auto-')))
+        ) {
+          const trackBounds = computeTracksBoundingBox(evt.participants);
+          if (trackBounds) {
+            const autoPlaced = autoPlaceScreenshotOnBounds(
+              evt.map.width,
+              evt.map.height,
+              trackBounds
+            );
+            evt.map.gcps = autoPlaced.gcps;
+            evt.map.matrix = autoPlaced.matrix;
+            evt.map.cornersLonLat = autoPlaced.cornersLonLat;
+          }
+        }
+
         await saveEventToDisk(evt);
         return { event: evt, participant };
       } catch (err: any) {
