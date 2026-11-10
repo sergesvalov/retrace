@@ -5,7 +5,9 @@ import {
   computeRubberSheetDisplacement,
   fitAffineTransform,
   lonLatToMercator,
+  lonLatToPixel,
   mercatorToLonLat,
+  nudgeMapMatrix,
   pixelToLonLat,
   solveGeoref,
 } from '../shared/georef.js';
@@ -49,16 +51,39 @@ describe('Georeferencing math (Web Mercator similarity & affine)', () => {
     expect(sol!.cornersLonLat).toHaveLength(4);
   });
 
-  it('auto-places map onto track bounds with zero initial rotation', () => {
+  it('auto-places map onto track bounds and scales/rotates strictly around anchorLonLat without moving Start', () => {
     const placed = autoPlaceScreenshotOnBounds(1200, 800, {
-      minLon: 37.54,
-      maxLon: 37.56,
-      minLat: 55.595,
-      maxLat: 55.605,
+      minLon: 33.34,
+      maxLon: 33.36,
+      minLat: 34.94,
+      maxLat: 34.96,
     });
     expect(placed.cornersLonLat).toHaveLength(4);
-    expect(placed.matrix[1]).toBe(0);
-    expect(placed.matrix[3]).toBe(0);
+
+    // Anchor at Start (bottom-right of map)
+    const anchorLonLat: [number, number] = [33.355, 34.943];
+    const startPxPy = lonLatToPixel(
+      placed.matrix,
+      anchorLonLat[0],
+      anchorLonLat[1]
+    )!;
+
+    // Scale by 1.5x, rotate by 12 deg, and stretch X by 1.08x around anchorLonLat
+    const nudged = nudgeMapMatrix(placed.matrix, 1200, 800, {
+      scaleFactor: 1.5,
+      dAngleDeg: 12,
+      stretchXFactor: 1.08,
+      anchorLonLat,
+    });
+
+    // The image pixel that was at anchorLonLat must STILL map to the exact same anchorLonLat!
+    const afterLonLat = pixelToLonLat(
+      nudged.matrix,
+      startPxPy[0],
+      startPxPy[1]
+    );
+    expect(afterLonLat[0]).toBeCloseTo(anchorLonLat[0], 6);
+    expect(afterLonLat[1]).toBeCloseTo(anchorLonLat[1], 6);
   });
 
   it('progressively locks 1, 2, 3, and 4+ pins (Start -> CP2 -> CP5) via addPinMapToTrack and rubber-sheeting', () => {

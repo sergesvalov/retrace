@@ -2,22 +2,23 @@ import React, { useEffect, useMemo, useRef, useState } from 'react';
 import maplibregl from 'maplibre-gl';
 import {
   Activity,
+  Anchor,
   ArrowDown,
   ArrowLeft,
   ArrowRight,
   ArrowUp,
   Check,
   Clock,
-  Columns2,
-  Crosshair,
   Eye,
   EyeOff,
   Flag,
   Flame,
   Gauge,
+  Globe,
   Heart,
   ImagePlus,
   Layers,
+  Move,
   Navigation,
   Pause,
   Play,
@@ -26,9 +27,12 @@ import {
   RotateCw,
   Trash2,
   Zap,
-  ZoomIn,
-  ZoomOut,
 } from 'lucide-react';
+import {
+  lonLatToMercator,
+  matrixToCorners,
+  nudgeMapMatrix,
+} from '../../shared/georef.js';
 import {
   analyzeLegBetweenSpots,
   formatDuration,
@@ -37,18 +41,16 @@ import {
   type SpeedNormMode,
 } from '../../shared/trackParser.js';
 import type {
-  GCP,
   ParticipantTrack,
   RaceEvent,
   TimeMode,
 } from '../../shared/types.js';
-import { buildRubberSheetedMapUrl } from '../utils/rubberSheet.js';
 
 interface Props {
   event: RaceEvent;
   onEventUpdated: (evt: RaceEvent) => void;
-  twoMapsMode?: boolean;
-  onToggleTwoMaps?: (open: boolean) => void;
+  fitMapMode?: boolean;
+  onToggleFitMap?: (open: boolean) => void;
 }
 
 const SPEED_OPTIONS = [1, 2, 5, 10, 20, 40, 60];
@@ -62,14 +64,14 @@ const TAIL_OPTIONS = [
 export const ReplayWorkspace: React.FC<Props> = ({
   event,
   onEventUpdated,
-  twoMapsMode = true,
-  onToggleTwoMaps,
+  fitMapMode = false,
+  onToggleFitMap,
 }) => {
   const [isPlaying, setIsPlaying] = useState<boolean>(false);
   const [playbackRate, setPlaybackRate] = useState<number>(10);
   const [raceTimeSec, setRaceTimeSec] = useState<number>(0);
   const [tailLengthSec, setTailLengthSec] = useState<number>(120);
-  const [mapOpacity, setMapOpacity] = useState<number>(0.82);
+  const [mapOpacity, setMapOpacity] = useState<number>(0.78);
   const [osmOpacity, setOsmOpacity] = useState<number>(0.85);
   const [useSatelliteBase, setUseSatelliteBase] = useState<boolean>(false);
   const [speedHeatmap, setSpeedHeatmap] = useState<boolean>(false);
@@ -79,30 +81,23 @@ export const ReplayWorkspace: React.FC<Props> = ({
     useState<boolean>(false);
   const [uploadError, setUploadError] = useState<string | null>(null);
 
-  // Left Scanned Map state (for 2-map side-by-side mode)
-  const [pendingScanPixel, setPendingScanPixel] = useState<{
-    px: number;
-    py: number;
-  } | null>(null);
-  const [scanZoom, setScanZoom] = useState<number>(1);
-  const [scanPan, setScanPan] = useState<{ x: number; y: number }>({
-    x: 0,
-    y: 0,
-  });
-  const isPanningScanRef = useRef(false);
-  const scanDragStartRef = useRef<{
-    clientX: number;
-    clientY: number;
-    panX: number;
-    panY: number;
-    moved: boolean;
-  }>({ clientX: 0, clientY: 0, panX: 0, panY: 0, moved: false });
-  const draggingScanGcpIdRef = useRef<string | null>(null);
-  const scanImgRef = useRef<HTMLImageElement | null>(null);
+  // Interactive Map Fitting state (drag map directly with mouse + sliders around Start anchor)
+  const [dragMovesMap, setDragMovesMap] = useState<boolean>(true);
+  const [anchorLonLat, setAnchorLonLat] = useState<[number, number] | null>(
+    null
+  );
+  const [scalePct, setScalePct] = useState<number>(100);
+  const [angleDeg, setAngleDeg] = useState<number>(0);
+  const [stretchPct, setStretchPct] = useState<number>(0);
 
-  // Map click interaction stages:
-  // - spot_start: click any point on the map to launch all runners simultaneously from that point
-  // - leg_start / leg_end: click 2 points (CP A -> CP B) to analyze route choice + Livelox speed normalization
+  const prevScalePctRef = useRef<number>(100);
+  const prevAngleDegRef = useRef<number>(0);
+  const prevStretchPctRef = useRef<number>(0);
+  const liveMatrixRef = useRef<
+    [number, number, number, number, number, number] | null
+  >(event.map?.matrix ?? null);
+
+  // Map click interaction stages for Spot Start & Leg Route-Choice Analysis
   const [snapStage, setSnapStage] = useState<
     'idle' | 'spot_start' | 'leg_start' | 'leg_end'
   >('idle');
@@ -110,7 +105,6 @@ export const ReplayWorkspace: React.FC<Props> = ({
     [number, number] | null
   >(null);
 
-  // Selected custom start spot or leg (A -> B)
   const [customStartSpot, setCustomStartSpot] = useState<
     [number, number] | null
   >(null);
@@ -123,22 +117,61 @@ export const ReplayWorkspace: React.FC<Props> = ({
   const mapRef = useRef<maplibregl.Map | null>(null);
   const mapReadyRef = useRef<boolean>(false);
   const runnerMarkersRef = useRef<Map<string, maplibregl.Marker>>(new Map());
-  const pinMarkersRef = useRef<maplibregl.Marker[]>([]);
+  const anchorMarkerRef = useRef<maplibregl.Marker | null>(null);
   const legMarkersRef = useRef<maplibregl.Marker[]>([]);
   const rafRef = useRef<number | null>(null);
   const lastFrameMsRef = useRef<number | null>(null);
 
-  // Keep latest refs for MapLibre event handlers
-  const pendingScanPixelRef = useRef(pendingScanPixel);
-  pendingScanPixelRef.current = pendingScanPixel;
   const eventRef = useRef(event);
   eventRef.current = event;
+  const anchorLonLatRef = useRef(anchorLonLat);
+  anchorLonLatRef.current = anchorLonLat;
 
-  const cleanPins = useMemo(
-    () =>
-      (event.map?.gcps ?? []).filter((g) => !g.id.startsWith('gcp-auto-')),
-    [event.map?.gcps]
-  );
+  // Compute common start coordinate of visible participants (default anchor for scaling & rotating the map!)
+  const commonStartLonLat = useMemo<[number, number] | null>(() => {
+    const valid = event.participants.filter(
+      (p) => p.visible && p.points.length > 0
+    );
+    if (valid.length === 0) {
+      if (event.map?.cornersLonLat) {
+        const c = event.map.cornersLonLat;
+        return [(c[0][0] + c[2][0]) / 2, (c[0][1] + c[2][1]) / 2];
+      }
+      return null;
+    }
+    let sumLon = 0;
+    let sumLat = 0;
+    for (const p of valid) {
+      const startPt =
+        p.points.find((pt) => pt.t >= p.trimStartSec) ?? p.points[0];
+      sumLon += startPt.lon;
+      sumLat += startPt.lat;
+    }
+    return [sumLon / valid.length, sumLat / valid.length];
+  }, [event.participants, event.map?.cornersLonLat]);
+
+  // Keep anchor defaulted to the GPS Start point unless user dragged the anchor
+  const effectiveAnchorLonLat = anchorLonLat ?? commonStartLonLat;
+  anchorLonLatRef.current = effectiveAnchorLonLat;
+
+  // Sync liveMatrixRef whenever event.map.matrix changes from server
+  useEffect(() => {
+    liveMatrixRef.current = event.map?.matrix ?? null;
+  }, [event.map?.matrix]);
+
+  // Reset per-event UI state when switching events
+  useEffect(() => {
+    setAnchorLonLat(null);
+    setScalePct(100);
+    setAngleDeg(0);
+    setStretchPct(0);
+    prevScalePctRef.current = 100;
+    prevAngleDegRef.current = 0;
+    prevStretchPctRef.current = 0;
+    setCustomStartSpot(null);
+    setSelectedLeg(null);
+    setSpeedNormMode('real');
+  }, [event.id]);
 
   // Compute group mean speed (m/s) for Livelox speed normalization
   const groupReferenceSpeedMs = useMemo(() => {
@@ -162,24 +195,6 @@ export const ReplayWorkspace: React.FC<Props> = ({
       selectedLeg.endLonLat
     );
   }, [event.participants, selectedLeg]);
-
-  // Reset scan zoom/pan and leg selection when switching events
-  useEffect(() => {
-    setPendingScanPixel(null);
-    setScanZoom(1);
-    setScanPan({ x: 0, y: 0 });
-    setCustomStartSpot(null);
-    setSelectedLeg(null);
-    setSpeedNormMode('real');
-  }, [event.id]);
-
-  // Resize MapLibre whenever switching between 2-maps and 1-map layout
-  useEffect(() => {
-    const timer = setTimeout(() => {
-      mapRef.current?.resize();
-    }, 60);
-    return () => clearTimeout(timer);
-  }, [twoMapsMode]);
 
   // Compute earliest start epoch across participants for 'real' time mode
   const eventEpochZeroMs = useMemo(() => {
@@ -246,7 +261,7 @@ export const ReplayWorkspace: React.FC<Props> = ({
     };
   }, [isPlaying, playbackRate, totalDurationSec]);
 
-  // Initialize MapLibre GL map (Right Pane)
+  // Initialize MapLibre GL map
   useEffect(() => {
     if (!mapContainerRef.current) return;
 
@@ -342,7 +357,7 @@ export const ReplayWorkspace: React.FC<Props> = ({
         paint: {
           'line-color': '#ffffff',
           'line-width': 4.5,
-          'line-opacity': 0.55,
+          'line-opacity': 0.6,
         },
       });
       map.addLayer({
@@ -352,8 +367,8 @@ export const ReplayWorkspace: React.FC<Props> = ({
         layout: { 'line-cap': 'round', 'line-join': 'round' },
         paint: {
           'line-color': ['get', 'color'],
-          'line-width': 2.5,
-          'line-opacity': 0.68,
+          'line-width': 2.75,
+          'line-opacity': 0.78,
         },
       });
 
@@ -394,7 +409,7 @@ export const ReplayWorkspace: React.FC<Props> = ({
         },
       });
 
-      // 5. Common Start Spot Marker
+      // 5. Common Start Spot Circle
       map.addSource('common-start', {
         type: 'geojson',
         data: buildCommonStartGeoJson(event.participants),
@@ -418,8 +433,8 @@ export const ReplayWorkspace: React.FC<Props> = ({
       mapReadyRef.current = false;
       for (const m of runnerMarkersRef.current.values()) m.remove();
       runnerMarkersRef.current.clear();
-      for (const pm of pinMarkersRef.current) pm.remove();
-      pinMarkersRef.current = [];
+      anchorMarkerRef.current?.remove();
+      anchorMarkerRef.current = null;
       for (const lm of legMarkersRef.current) lm.remove();
       legMarkersRef.current = [];
       map.remove();
@@ -427,12 +442,7 @@ export const ReplayWorkspace: React.FC<Props> = ({
     };
   }, [event.id]);
 
-  // Effective custom map opacity: dim while picking a point from Left Scan so OSM roads and GPS tracks are clear
-  const effectiveCustomMapOpacity = pendingScanPixel
-    ? Math.min(mapOpacity, 0.3)
-    : mapOpacity;
-
-  // Update raster opacities when sliders or pendingScanPixel change
+  // Update raster opacities when sliders change
   useEffect(() => {
     const map = mapRef.current;
     if (!map || !mapReadyRef.current) return;
@@ -447,23 +457,15 @@ export const ReplayWorkspace: React.FC<Props> = ({
       );
     }
     if (map.getLayer('custom-map-layer')) {
-      map.setPaintProperty(
-        'custom-map-layer',
-        'raster-opacity',
-        effectiveCustomMapOpacity
-      );
+      map.setPaintProperty('custom-map-layer', 'raster-opacity', mapOpacity);
     }
-  }, [osmOpacity, effectiveCustomMapOpacity, useSatelliteBase]);
+  }, [osmOpacity, mapOpacity, useSatelliteBase]);
 
   // Update or remove custom map when `event.map` changes
   useEffect(() => {
     const map = mapRef.current;
     if (!map || !mapReadyRef.current) return;
 
-    for (const pm of pinMarkersRef.current) pm.remove();
-    pinMarkersRef.current = [];
-
-    // If map was deleted or has no corners, remove the layer and source cleanly!
     if (!event.map?.cornersLonLat) {
       if (map.getLayer('custom-map-layer')) {
         map.removeLayer('custom-map-layer');
@@ -476,85 +478,252 @@ export const ReplayWorkspace: React.FC<Props> = ({
 
     const mapObj = event.map;
     const corners = mapObj.cornersLonLat!;
-    let cancelled = false;
+    const src = map.getSource('custom-map') as
+      | maplibregl.ImageSource
+      | undefined;
 
-    void buildRubberSheetedMapUrl(
-      mapObj.imageUrl,
-      mapObj.width,
-      mapObj.height,
-      mapObj.gcps,
-      mapObj.matrix
-    ).then((warpedUrl) => {
-      if (cancelled || !mapReadyRef.current) return;
+    if (src) {
+      src.updateImage({
+        url: mapObj.imageUrl,
+        coordinates: corners,
+      });
+    } else {
+      map.addSource('custom-map', {
+        type: 'image',
+        url: mapObj.imageUrl,
+        coordinates: corners,
+      });
+      map.addLayer(
+        {
+          id: 'custom-map-layer',
+          type: 'raster',
+          source: 'custom-map',
+          paint: {
+            'raster-opacity': mapOpacity,
+            'raster-fade-duration': 0,
+          },
+        },
+        'ghost-tracks-casing'
+      );
+    }
+  }, [event.map]);
+
+  // Show draggable green "⚓ СТАРТ (Якорь)" marker when `fitMapMode` is active
+  useEffect(() => {
+    const map = mapRef.current;
+    if (!map || !mapReadyRef.current) return;
+
+    anchorMarkerRef.current?.remove();
+    anchorMarkerRef.current = null;
+
+    if (!fitMapMode || !effectiveAnchorLonLat) return;
+
+    const el = document.createElement('div');
+    el.className =
+      'px-2 py-0.5 rounded-full bg-emerald-500 border-2 border-white text-slate-950 font-bold text-[11px] shadow-xl cursor-grab flex items-center gap-1 select-none';
+    el.textContent = '⚓ СТАРТ (якорь)';
+    el.title =
+      'Точка вращения и масштабирования карты! Совместите треугольник Старта карты с этой точкой, и при масштабировании Старт не собьётся.';
+    el.addEventListener('mousedown', (ev) => ev.stopPropagation());
+
+    const marker = new maplibregl.Marker({ element: el, draggable: true })
+      .setLngLat(effectiveAnchorLonLat)
+      .addTo(map);
+
+    marker.on('dragend', () => {
+      const lngLat = marker.getLngLat();
+      setAnchorLonLat([
+        Number(lngLat.lng.toFixed(6)),
+        Number(lngLat.lat.toFixed(6)),
+      ]);
+    });
+
+    anchorMarkerRef.current = marker;
+
+    return () => {
+      marker.remove();
+      anchorMarkerRef.current = null;
+    };
+  }, [fitMapMode, effectiveAnchorLonLat?.[0], effectiveAnchorLonLat?.[1]]);
+
+  // Direct 60 FPS mouse dragging of the custom map overlay when `fitMapMode && dragMovesMap` is active
+  useEffect(() => {
+    const map = mapRef.current;
+    if (!map) return;
+
+    const shouldCaptureDrag =
+      fitMapMode &&
+      dragMovesMap &&
+      Boolean(event.map) &&
+      snapStage === 'idle';
+
+    if (!shouldCaptureDrag) {
+      map.dragPan.enable();
+      return;
+    }
+
+    map.dragPan.disable();
+    const canvas = map.getCanvasContainer();
+
+    let isDraggingMap = false;
+    let startMercator: [number, number] | null = null;
+    let startMatrix: [number, number, number, number, number, number] | null =
+      null;
+
+    const onMouseDown = (e: MouseEvent) => {
+      // Allow Shift+drag or Right/Middle click to pan the viewport camera
+      if (e.button !== 0 || e.shiftKey) {
+        map.dragPan.enable();
+        return;
+      }
+      if (!liveMatrixRef.current || !eventRef.current.map) return;
+      e.preventDefault();
+      const rect = canvas.getBoundingClientRect();
+      const lngLat = map.unproject([
+        e.clientX - rect.left,
+        e.clientY - rect.top,
+      ]);
+      startMercator = lonLatToMercator(lngLat.lng, lngLat.lat);
+      startMatrix = [...liveMatrixRef.current] as [
+        number,
+        number,
+        number,
+        number,
+        number,
+        number,
+      ];
+      isDraggingMap = true;
+    };
+
+    const onMouseMove = (e: MouseEvent) => {
+      if (
+        !isDraggingMap ||
+        !startMercator ||
+        !startMatrix ||
+        !eventRef.current.map
+      ) {
+        return;
+      }
+      const rect = canvas.getBoundingClientRect();
+      const lngLat = map.unproject([
+        e.clientX - rect.left,
+        e.clientY - rect.top,
+      ]);
+      const [mx, my] = lonLatToMercator(lngLat.lng, lngLat.lat);
+      const dEastM = mx - startMercator[0];
+      const dNorthM = my - startMercator[1];
+
+      const nextMatrix: [number, number, number, number, number, number] = [
+        startMatrix[0],
+        startMatrix[1],
+        startMatrix[2] + dEastM,
+        startMatrix[3],
+        startMatrix[4],
+        startMatrix[5] + dNorthM,
+      ];
+      liveMatrixRef.current = nextMatrix;
+
+      const corners = matrixToCorners(
+        nextMatrix,
+        eventRef.current.map.width,
+        eventRef.current.map.height
+      );
       const src = map.getSource('custom-map') as
         | maplibregl.ImageSource
         | undefined;
       if (src) {
-        src.updateImage({
-          url: warpedUrl,
-          coordinates: corners,
-        });
-      } else {
-        map.addSource('custom-map', {
-          type: 'image',
-          url: warpedUrl,
-          coordinates: corners,
-        });
-        map.addLayer(
-          {
-            id: 'custom-map-layer',
-            type: 'raster',
-            source: 'custom-map',
-            paint: {
-              'raster-opacity': effectiveCustomMapOpacity,
-              'raster-fade-duration': 0,
-            },
-          },
-          'ghost-tracks-casing'
-        );
+        src.setCoordinates(corners);
       }
-    });
+    };
 
-    // Render draggable pin badges (📌1, 📌2, ...) on the Right Map when in 2-maps mode
-    if (twoMapsMode && mapObj.gcps) {
-      const pins = mapObj.gcps.filter((g) => !g.id.startsWith('gcp-auto-'));
-      pins.forEach((g, idx) => {
-        const el = document.createElement('div');
-        el.className =
-          'px-1.5 py-0.5 rounded-full bg-emerald-500 border-2 border-white text-slate-950 font-bold text-[11px] shadow-lg cursor-grab flex items-center gap-0.5 select-none';
-        el.textContent = `📌${idx + 1}`;
-        el.title = `Булавка #${idx + 1} (перетащите мышью для подстройки на треке/OSM)`;
-        el.addEventListener('click', (ev) => ev.stopPropagation());
+    const onMouseUp = () => {
+      if (isDraggingMap && liveMatrixRef.current) {
+        isDraggingMap = false;
+        void saveMatrixToServer(liveMatrixRef.current);
+      }
+      map.dragPan.disable();
+    };
 
-        const m = new maplibregl.Marker({ element: el, draggable: true })
-          .setLngLat([g.lon, g.lat])
-          .addTo(map);
-
-        m.on('dragend', () => {
-          const pos = m.getLngLat();
-          const currentPins = (eventRef.current.map?.gcps ?? []).filter(
-            (item) => !item.id.startsWith('gcp-auto-')
-          );
-          const next = currentPins.map((item) =>
-            item.id === g.id
-              ? {
-                  ...item,
-                  lon: Number(pos.lng.toFixed(6)),
-                  lat: Number(pos.lat.toFixed(6)),
-                }
-              : item
-          );
-          void saveGcpsDirectly(next);
-        });
-
-        pinMarkersRef.current.push(m);
-      });
-    }
+    canvas.addEventListener('mousedown', onMouseDown);
+    window.addEventListener('mousemove', onMouseMove);
+    window.addEventListener('mouseup', onMouseUp);
 
     return () => {
-      cancelled = true;
+      canvas.removeEventListener('mousedown', onMouseDown);
+      window.removeEventListener('mousemove', onMouseMove);
+      window.removeEventListener('mouseup', onMouseUp);
+      map.dragPan.enable();
     };
-  }, [event.map, twoMapsMode]);
+  }, [fitMapMode, dragMovesMap, Boolean(event.map), snapStage]);
+
+  // Apply live 60 FPS transform around `effectiveAnchorLonLat` and update MapLibre ImageSource
+  function applyLiveNudge(params: {
+    dEastM?: number;
+    dNorthM?: number;
+    scaleFactor?: number;
+    stretchXFactor?: number;
+    dAngleDeg?: number;
+    commitToServer?: boolean;
+  }) {
+    const map = mapRef.current;
+    const mapMeta = eventRef.current.map;
+    if (!map || !mapMeta || !liveMatrixRef.current) return;
+
+    const res = nudgeMapMatrix(
+      liveMatrixRef.current,
+      mapMeta.width,
+      mapMeta.height,
+      {
+        ...params,
+        anchorLonLat: anchorLonLatRef.current ?? undefined,
+      }
+    );
+    liveMatrixRef.current = res.matrix;
+
+    const src = map.getSource('custom-map') as
+      | maplibregl.ImageSource
+      | undefined;
+    if (src) {
+      src.setCoordinates(res.cornersLonLat);
+    }
+
+    if (params.commitToServer) {
+      void saveMatrixToServer(res.matrix);
+    }
+  }
+
+  async function saveMatrixToServer(
+    matrix: [number, number, number, number, number, number]
+  ) {
+    const res = await fetch(`/api/events/${eventRef.current.id}/map-nudge`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ matrix }),
+    });
+    if (res.ok) {
+      const data = await res.json();
+      onEventUpdated(data.event);
+    }
+  }
+
+  async function handleResetMapAutoFit() {
+    const res = await fetch(`/api/events/${event.id}/map-nudge`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ resetAutoFit: true }),
+    });
+    if (res.ok) {
+      const data = await res.json();
+      setScalePct(100);
+      setAngleDeg(0);
+      setStretchPct(0);
+      prevScalePctRef.current = 100;
+      prevAngleDegRef.current = 0;
+      prevStretchPctRef.current = 0;
+      setAnchorLonLat(null);
+      onEventUpdated(data.event);
+    }
+  }
 
   // Render custom start spot or selected leg (A -> B) markers & line on MapLibre
   useEffect(() => {
@@ -640,7 +809,7 @@ export const ReplayWorkspace: React.FC<Props> = ({
     }
   }, [event.participants]);
 
-  // Compute live interpolated states for each participant at `raceTimeSec` (with Livelox speed normalization)
+  // Compute live interpolated states for each participant at `raceTimeSec`
   const runnerStates = useMemo(() => {
     return event.participants.map((p) => ({
       participant: p,
@@ -755,24 +924,6 @@ export const ReplayWorkspace: React.FC<Props> = ({
     }));
   }, [runnerStates]);
 
-  async function saveGcpsDirectly(nextGcps: GCP[]) {
-    if (!event.map) return;
-    const res = await fetch(`/api/events/${event.id}/georef`, {
-      method: 'PUT',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        gcps: nextGcps,
-        transformType: nextGcps.length >= 3 ? 'affine' : 'similarity',
-        width: event.map.width,
-        height: event.map.height,
-      }),
-    });
-    if (res.ok) {
-      const data = await res.json();
-      onEventUpdated(data.event);
-    }
-  }
-
   async function handleDeleteCurrentMap() {
     if (!event.map) return;
     if (!window.confirm('Удалить загруженную карту из этого мероприятия?')) {
@@ -784,6 +935,7 @@ export const ReplayWorkspace: React.FC<Props> = ({
     if (res.ok) {
       const data = await res.json();
       onEventUpdated(data.event);
+      onToggleFitMap?.(false);
     }
   }
 
@@ -854,8 +1006,14 @@ export const ReplayWorkspace: React.FC<Props> = ({
       });
       if (res.ok) {
         const data = await res.json();
+        setScalePct(100);
+        setAngleDeg(0);
+        setStretchPct(0);
+        prevScalePctRef.current = 100;
+        prevAngleDegRef.current = 0;
+        prevStretchPctRef.current = 0;
         onEventUpdated(data.event);
-        onToggleTwoMaps?.(true);
+        onToggleFitMap?.(true);
       }
     } finally {
       setUploadingScreenshot(false);
@@ -907,9 +1065,7 @@ export const ReplayWorkspace: React.FC<Props> = ({
     }
   }
 
-  // Click on Right Map (OSM + Track):
-  // 1) If user clicked a point on Left Scan (`pendingScanPixel`), pairs it immediately into a new Pin!
-  // 2) Or handles `spot_start` (mass start from clicked point) or `leg_start` -> `leg_end` (leg analysis).
+  // Click on Map for `spot_start` (mass start from clicked point) or `leg_start` -> `leg_end` (leg analysis)
   useEffect(() => {
     const map = mapRef.current;
     if (!map) return;
@@ -920,26 +1076,6 @@ export const ReplayWorkspace: React.FC<Props> = ({
         Number(e.lngLat.lat.toFixed(6)),
       ];
 
-      // Priority 1: Completing a point clicked on the Left Scanned Map!
-      if (pendingScanPixelRef.current && eventRef.current.map) {
-        const scanPt = pendingScanPixelRef.current;
-        const currentPins = (eventRef.current.map.gcps ?? []).filter(
-          (g) => !g.id.startsWith('gcp-auto-')
-        );
-        const newPin: GCP = {
-          id: `pin-${Date.now()}`,
-          label: `Булавка #${currentPins.length + 1}`,
-          px: Math.round(scanPt.px),
-          py: Math.round(scanPt.py),
-          lon: clicked[0],
-          lat: clicked[1],
-        };
-        setPendingScanPixel(null);
-        void saveGcpsDirectly([...currentPins, newPin]);
-        return;
-      }
-
-      // Priority 2: Launch all runners simultaneously from any clicked spot on the map ("Пуск с одной общей точки")
       if (snapStage === 'spot_start') {
         setSnapStage('idle');
         setSelectedLeg(null);
@@ -948,7 +1084,6 @@ export const ReplayWorkspace: React.FC<Props> = ({
         return;
       }
 
-      // Priority 3: Pick a leg (CP A -> CP B) for route choice & Livelox speed normalization analysis
       if (snapStage === 'leg_start') {
         setPickedFeatureLonLat(clicked);
         setSnapStage('leg_end');
@@ -969,29 +1104,6 @@ export const ReplayWorkspace: React.FC<Props> = ({
       map.off('click', onMapClick);
     };
   }, [snapStage, pickedFeatureLonLat, event.id]);
-
-  async function nudgeMap(params: {
-    dEastM?: number;
-    dNorthM?: number;
-    scaleFactor?: number;
-    dAngleDeg?: number;
-    addPin?: {
-      mapLonLat: [number, number];
-      trackLonLat: [number, number];
-    };
-    undoLastPin?: boolean;
-    clearPins?: boolean;
-  }) {
-    const res = await fetch(`/api/events/${event.id}/map-nudge`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(params),
-    });
-    if (res.ok) {
-      const data = await res.json();
-      onEventUpdated(data.event);
-    }
-  }
 
   async function syncStartAtSpot(
     spot?: [number, number],
@@ -1025,374 +1137,39 @@ export const ReplayWorkspace: React.FC<Props> = ({
     await syncStartAtSpot();
   }
 
-  // Left Scanned Map mouse handlers (zoom, pan, click to place point, drag existing pin)
-  function clientPosToScanPixel(
-    clientX: number,
-    clientY: number
-  ): { px: number; py: number } | null {
-    if (!scanImgRef.current || !event.map) return null;
-    const rect = scanImgRef.current.getBoundingClientRect();
-    if (rect.width <= 0 || rect.height <= 0) return null;
-    const actualW = scanImgRef.current.naturalWidth || event.map.width;
-    const actualH = scanImgRef.current.naturalHeight || event.map.height;
-    const relX = Math.max(0, Math.min(1, (clientX - rect.left) / rect.width));
-    const relY = Math.max(0, Math.min(1, (clientY - rect.top) / rect.height));
-    return { px: relX * actualW, py: relY * actualH };
+  function handleScaleSliderChange(nextPct: number, commit = false) {
+    const clamped = Math.max(40, Math.min(260, nextPct));
+    const factor = clamped / prevScalePctRef.current;
+    prevScalePctRef.current = clamped;
+    setScalePct(clamped);
+    applyLiveNudge({ scaleFactor: factor, commitToServer: commit });
   }
 
-  function handleScanMouseDown(e: React.MouseEvent<HTMLDivElement>) {
-    if (e.button !== 0) return;
-    isPanningScanRef.current = true;
-    scanDragStartRef.current = {
-      clientX: e.clientX,
-      clientY: e.clientY,
-      panX: scanPan.x,
-      panY: scanPan.y,
-      moved: false,
-    };
+  function handleAngleSliderChange(nextDeg: number, commit = false) {
+    const clamped = Math.max(-60, Math.min(60, nextDeg));
+    const delta = clamped - prevAngleDegRef.current;
+    prevAngleDegRef.current = clamped;
+    setAngleDeg(clamped);
+    applyLiveNudge({ dAngleDeg: delta, commitToServer: commit });
   }
 
-  function handleScanMouseMove(e: React.MouseEvent<HTMLDivElement>) {
-    if (draggingScanGcpIdRef.current && event.map) {
-      const pt = clientPosToScanPixel(e.clientX, e.clientY);
-      if (!pt) return;
-      const targetId = draggingScanGcpIdRef.current;
-      const updatedGcps = cleanPins.map((g) =>
-        g.id === targetId
-          ? { ...g, px: Math.round(pt.px), py: Math.round(pt.py) }
-          : g
-      );
-      onEventUpdated({
-        ...event,
-        map: { ...event.map, gcps: updatedGcps },
-      });
-      return;
-    }
-
-    if (!isPanningScanRef.current) return;
-    const dx = e.clientX - scanDragStartRef.current.clientX;
-    const dy = e.clientY - scanDragStartRef.current.clientY;
-    if (Math.hypot(dx, dy) > 5) {
-      scanDragStartRef.current.moved = true;
-      setScanPan({
-        x: scanDragStartRef.current.panX + dx,
-        y: scanDragStartRef.current.panY + dy,
-      });
-    }
+  function handleStretchSliderChange(nextPct: number, commit = false) {
+    const clamped = Math.max(-25, Math.min(25, nextPct));
+    const factor = (1 + clamped / 100) / (1 + prevStretchPctRef.current / 100);
+    prevStretchPctRef.current = clamped;
+    setStretchPct(clamped);
+    applyLiveNudge({ stretchXFactor: factor, commitToServer: commit });
   }
-
-  function handleScanMouseUp(e: React.MouseEvent<HTMLDivElement>) {
-    if (draggingScanGcpIdRef.current) {
-      draggingScanGcpIdRef.current = null;
-      void saveGcpsDirectly(cleanPins);
-      return;
-    }
-
-    if (!isPanningScanRef.current) return;
-    isPanningScanRef.current = false;
-
-    if (!scanDragStartRef.current.moved) {
-      const pt = clientPosToScanPixel(e.clientX, e.clientY);
-      if (pt) {
-        setPendingScanPixel(pt);
-      }
-    }
-  }
-
-  function handleScanWheel(e: React.WheelEvent<HTMLDivElement>) {
-    e.preventDefault();
-    const factor = e.deltaY < 0 ? 1.18 : 1 / 1.18;
-    setScanZoom((prev) =>
-      Math.max(0.8, Math.min(8, Number((prev * factor).toFixed(2))))
-    );
-  }
-
-  const nextPinNum = cleanPins.length + 1;
 
   return (
     <div className="flex flex-col h-full bg-slate-950 text-slate-100">
-      {/* Main workspace: [Left Scan Map (when twoMapsMode)] + [Right OSM/Track Map] + [Right Analytics Sidebar] */}
+      {/* Main workspace: [Unified Map Pane] + [Right Analytics Sidebar] */}
       <div className="grid grid-cols-1 lg:grid-cols-12 flex-1 min-h-0">
-        {/* LEFT MAP: Scanned Orienteering Map (shown when twoMapsMode is true) */}
-        {twoMapsMode && (
-          <div className="lg:col-span-4 xl:col-span-4 flex flex-col border-r border-slate-800 bg-slate-950 overflow-hidden min-h-[360px]">
-            <div className="px-3 py-2 bg-slate-900 border-b border-slate-800 flex items-center justify-between gap-2 text-xs">
-              <span className="font-semibold text-emerald-300 truncate">
-                1. Скан карты ориентирования
-              </span>
-              <div className="flex items-center gap-1 shrink-0">
-                <button
-                  onClick={() =>
-                    setScanZoom((z) =>
-                      Math.max(0.8, Number((z / 1.25).toFixed(2)))
-                    )
-                  }
-                  className="p-1 rounded bg-slate-800 hover:bg-slate-700 text-slate-300"
-                  title="Отдалить скан"
-                >
-                  <ZoomOut className="w-3.5 h-3.5" />
-                </button>
-                <button
-                  onClick={() => {
-                    setScanZoom(1);
-                    setScanPan({ x: 0, y: 0 });
-                  }}
-                  className="px-1.5 py-0.5 rounded bg-slate-800 hover:bg-slate-700 text-slate-300 font-mono text-[11px]"
-                  title="Сбросить масштаб скана"
-                >
-                  {Math.round(scanZoom * 100)}%
-                </button>
-                <button
-                  onClick={() =>
-                    setScanZoom((z) =>
-                      Math.min(8, Number((z * 1.25).toFixed(2)))
-                    )
-                  }
-                  className="p-1 rounded bg-slate-800 hover:bg-slate-700 text-slate-300"
-                  title="Приблизить скан"
-                >
-                  <ZoomIn className="w-3.5 h-3.5" />
-                </button>
-              </div>
-            </div>
-
-            <div
-              className={`px-3 py-1.5 text-xs border-b flex items-center justify-between gap-2 ${
-                pendingScanPixel
-                  ? 'bg-amber-500/20 border-amber-400/50 text-amber-200 font-medium animate-pulse'
-                  : 'bg-slate-900/60 border-slate-800 text-slate-300'
-              }`}
-            >
-              {pendingScanPixel ? (
-                <>
-                  <span className="flex items-center gap-1.5">
-                    <Crosshair className="w-3.5 h-3.5 shrink-0 text-amber-300" />
-                    Шаг 2: теперь кликни это же место на ПРАВОЙ карте (на треке или OSM) →
-                  </span>
-                  <button
-                    onClick={() => setPendingScanPixel(null)}
-                    className="px-2 py-0.5 rounded bg-slate-900/80 text-amber-300 hover:text-white shrink-0"
-                  >
-                    Отмена
-                  </button>
-                </>
-              ) : (
-                <span>
-                  Шаг 1: кликни Старт / КП / дорогу{' '}
-                  <strong>на скане ниже</strong> (булавка #{nextPinNum})
-                </span>
-              )}
-            </div>
-
-            <div
-              onMouseDown={handleScanMouseDown}
-              onMouseMove={handleScanMouseMove}
-              onMouseUp={handleScanMouseUp}
-              onWheel={handleScanWheel}
-              className="relative flex-1 overflow-hidden flex items-center justify-center bg-slate-950 cursor-crosshair select-none"
-            >
-              {event.map ? (
-                <div
-                  style={{
-                    transform: `translate(${scanPan.x}px, ${scanPan.y}px) scale(${scanZoom})`,
-                    transformOrigin: 'center center',
-                  }}
-                  className="relative inline-block shadow-2xl border border-slate-800 transition-transform duration-75"
-                >
-                  <img
-                    ref={scanImgRef}
-                    src={event.map.imageUrl}
-                    alt={event.map.name}
-                    draggable={false}
-                    className="max-h-[46vh] max-w-full w-auto object-contain select-none pointer-events-none"
-                  />
-
-                  {cleanPins.map((g, idx) => (
-                    <div
-                      key={g.id}
-                      onMouseDown={(ev) => {
-                        ev.stopPropagation();
-                        draggingScanGcpIdRef.current = g.id;
-                      }}
-                      style={{
-                        left: `${(g.px / event.map!.width) * 100}%`,
-                        top: `${(g.py / event.map!.height) * 100}%`,
-                        transform: `translate(-50%, -50%) scale(${1 / scanZoom})`,
-                      }}
-                      title={`Булавка #${idx + 1} (можно перетащить мышью на скане)`}
-                      className="absolute px-1.5 py-0.5 rounded-full bg-emerald-500 border-2 border-white text-slate-950 font-bold text-[11px] flex items-center justify-center shadow-lg cursor-grab"
-                    >
-                      📌{idx + 1}
-                    </div>
-                  ))}
-
-                  {pendingScanPixel && (
-                    <div
-                      style={{
-                        left: `${(pendingScanPixel.px / event.map.width) * 100}%`,
-                        top: `${(pendingScanPixel.py / event.map.height) * 100}%`,
-                        transform: `translate(-50%, -50%) scale(${1 / scanZoom})`,
-                      }}
-                      className="absolute w-7 h-7 rounded-full bg-amber-400 border-2 border-white text-slate-950 font-bold text-xs flex items-center justify-center animate-bounce pointer-events-none shadow-xl"
-                    >
-                      ?
-                    </div>
-                  )}
-                </div>
-              ) : (
-                <div className="text-center text-slate-500 space-y-3 p-6">
-                  <ImagePlus className="w-10 h-10 mx-auto text-slate-600" />
-                  <p className="text-xs">
-                    Загрузите скан спортивной карты, чтобы привязать его к GPS-треку и OpenStreetMap
-                  </p>
-                  <label className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-medium cursor-pointer transition">
-                    <ImagePlus className="w-3.5 h-3.5" />
-                    Загрузить скан карты
-                    <input
-                      type="file"
-                      accept="image/*"
-                      className="hidden"
-                      onChange={handleQuickScreenshotUpload}
-                    />
-                  </label>
-                </div>
-              )}
-            </div>
-
-            {event.map && (
-              <div className="p-2.5 bg-slate-900 border-t border-slate-800 space-y-2 text-xs shrink-0">
-                <div className="flex items-center justify-between">
-                  <span className="font-semibold text-emerald-300">
-                    📌 Булавок: {cleanPins.length}{' '}
-                    <span className="text-slate-400 font-normal">
-                      {cleanPins.length === 0 && '(Старт → КП2 → дальний КП)'}
-                      {cleanPins.length === 1 && '(1 т.: сдвиг)'}
-                      {cleanPins.length === 2 && '(2 т.: поворот + масштаб)'}
-                      {cleanPins.length === 3 && '(3 т.: наклон фото X/Y)'}
-                      {cleanPins.length >= 4 && '(4+ т.: эластичная сетка)'}
-                    </span>
-                  </span>
-                  {cleanPins.length > 0 && (
-                    <div className="flex items-center gap-1">
-                      <button
-                        onClick={() => void nudgeMap({ undoLastPin: true })}
-                        className="px-2 py-0.5 rounded bg-slate-800 hover:bg-slate-700 text-slate-300 text-[11px] flex items-center gap-1"
-                        title="Удалить последнюю булавку"
-                      >
-                        <RotateCcw className="w-3 h-3" /> Отменить
-                      </button>
-                      <button
-                        onClick={() => void nudgeMap({ clearPins: true })}
-                        className="px-2 py-0.5 rounded bg-slate-800 hover:bg-rose-900/50 text-slate-400 hover:text-rose-200 text-[11px]"
-                        title="Сбросить все булавки"
-                      >
-                        Сброс
-                      </button>
-                    </div>
-                  )}
-                </div>
-
-                <div className="flex flex-wrap items-center justify-between gap-1.5 bg-slate-950/80 p-1.5 rounded-lg border border-slate-800">
-                  <div className="flex items-center gap-1">
-                    <span className="text-[10px] text-slate-400 mr-0.5">
-                      Сдвиг:
-                    </span>
-                    <button
-                      onClick={() => nudgeMap({ dEastM: -15 })}
-                      className="p-1 rounded bg-slate-800 hover:bg-slate-700"
-                      title="Запад (-15м)"
-                    >
-                      <ArrowLeft className="w-3 h-3" />
-                    </button>
-                    <button
-                      onClick={() => nudgeMap({ dNorthM: 15 })}
-                      className="p-1 rounded bg-slate-800 hover:bg-slate-700"
-                      title="Север (+15м)"
-                    >
-                      <ArrowUp className="w-3 h-3" />
-                    </button>
-                    <button
-                      onClick={() => nudgeMap({ dNorthM: -15 })}
-                      className="p-1 rounded bg-slate-800 hover:bg-slate-700"
-                      title="Юг (-15м)"
-                    >
-                      <ArrowDown className="w-3 h-3" />
-                    </button>
-                    <button
-                      onClick={() => nudgeMap({ dEastM: 15 })}
-                      className="p-1 rounded bg-slate-800 hover:bg-slate-700"
-                      title="Восток (+15м)"
-                    >
-                      <ArrowRight className="w-3 h-3" />
-                    </button>
-                  </div>
-
-                  <div className="flex items-center gap-1">
-                    <button
-                      onClick={() => nudgeMap({ dAngleDeg: 1 })}
-                      className="px-1.5 py-0.5 rounded bg-slate-800 hover:bg-slate-700 flex items-center gap-0.5 text-[11px]"
-                      title="Повернуть против часовой (+1°)"
-                    >
-                      <RotateCcw className="w-3 h-3" /> 1°
-                    </button>
-                    <button
-                      onClick={() => nudgeMap({ dAngleDeg: -1 })}
-                      className="px-1.5 py-0.5 rounded bg-slate-800 hover:bg-slate-700 flex items-center gap-0.5 text-[11px]"
-                      title="Повернуть по часовой (-1°)"
-                    >
-                      <RotateCw className="w-3 h-3" /> 1°
-                    </button>
-                  </div>
-
-                  <div className="flex items-center gap-1">
-                    <button
-                      onClick={() => nudgeMap({ scaleFactor: 0.98 })}
-                      className="px-1.5 py-0.5 rounded bg-slate-800 hover:bg-slate-700 text-[11px]"
-                      title="Уменьшить карту (-2%)"
-                    >
-                      -2%
-                    </button>
-                    <button
-                      onClick={() => nudgeMap({ scaleFactor: 1.02 })}
-                      className="px-1.5 py-0.5 rounded bg-slate-800 hover:bg-slate-700 text-[11px]"
-                      title="Увеличить карту (+2%)"
-                    >
-                      +2%
-                    </button>
-                  </div>
-                </div>
-
-                {onToggleTwoMaps && (
-                  <button
-                    onClick={() => onToggleTwoMaps(false)}
-                    className="w-full py-1.5 px-3 rounded-lg bg-emerald-600/20 hover:bg-emerald-600/30 border border-emerald-500/40 text-emerald-300 font-medium flex items-center justify-center gap-1.5 transition"
-                  >
-                    <Check className="w-3.5 h-3.5" />
-                    Готово — развернуть 1 общую карту на весь экран
-                  </button>
-                )}
-              </div>
-            )}
-          </div>
-        )}
-
-        {/* RIGHT MAP: Interactive OSM + Overlaid Scan + GPS Tracks + Replay */}
-        <div
-          className={`${
-            twoMapsMode
-              ? 'lg:col-span-5 xl:col-span-5'
-              : 'lg:col-span-8 xl:col-span-9'
-          } relative flex flex-col min-h-[420px]`}
-        >
+        {/* MAIN MAP PANE */}
+        <div className="lg:col-span-8 xl:col-span-9 flex flex-col min-h-[420px] relative overflow-hidden">
           {/* Docked Top Map Toolbar */}
-          <div className="px-3 py-2 bg-slate-900 border-b border-slate-800 flex flex-wrap items-center justify-between gap-2 text-xs shrink-0">
+          <div className="relative z-10 px-3 py-2 bg-slate-900 border-b border-slate-800 flex flex-wrap items-center justify-between gap-2 text-xs shrink-0">
             <div className="flex flex-wrap items-center gap-2">
-              {twoMapsMode && (
-                <span className="font-semibold text-sky-300">
-                  2. Карта OSM + Трек
-                </span>
-              )}
-
               <label className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white font-medium cursor-pointer transition">
                 <ImagePlus className="w-3.5 h-3.5" />
                 {uploadingScreenshot
@@ -1409,13 +1186,27 @@ export const ReplayWorkspace: React.FC<Props> = ({
               </label>
 
               {event.map && (
-                <button
-                  onClick={handleDeleteCurrentMap}
-                  className="p-1 rounded-lg bg-slate-800 hover:bg-rose-900/60 border border-slate-700 hover:border-rose-500/50 text-slate-400 hover:text-rose-300 transition"
-                  title="Удалить загруженную карту из этого мероприятия"
-                >
-                  <Trash2 className="w-3.5 h-3.5" />
-                </button>
+                <>
+                  <button
+                    onClick={() => onToggleFitMap?.(!fitMapMode)}
+                    className={`inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg font-medium border transition ${
+                      fitMapMode
+                        ? 'bg-amber-500 border-amber-400 text-slate-950 font-semibold shadow'
+                        : 'bg-slate-800 hover:bg-slate-700 border-slate-700 text-amber-300'
+                    }`}
+                  >
+                    <Move className="w-3.5 h-3.5" />
+                    {fitMapMode ? 'Подгонка включена' : '✋ Подогнать карту'}
+                  </button>
+
+                  <button
+                    onClick={handleDeleteCurrentMap}
+                    className="p-1 rounded-lg bg-slate-800 hover:bg-rose-900/60 border border-slate-700 hover:border-rose-500/50 text-slate-400 hover:text-rose-300 transition"
+                    title="Удалить загруженную карту из этого мероприятия"
+                  >
+                    <Trash2 className="w-3.5 h-3.5" />
+                  </button>
+                </>
               )}
 
               <div className="flex items-center gap-1.5">
@@ -1487,25 +1278,241 @@ export const ReplayWorkspace: React.FC<Props> = ({
                 <Flame className="w-3.5 h-3.5" />
                 Темп
               </button>
-
-              {onToggleTwoMaps && !twoMapsMode && (
-                <button
-                  onClick={() => onToggleTwoMaps(true)}
-                  className="inline-flex items-center gap-1 px-2.5 py-1 rounded-lg bg-emerald-600/25 hover:bg-emerald-600/35 border border-emerald-400/50 text-emerald-200 font-medium transition"
-                  title="Открыть 2 карты рядом: Скан слева + Трек/OSM справа"
-                >
-                  <Columns2 className="w-3.5 h-3.5" />
-                  Подогнать карту (2 карты)
-                </button>
-              )}
             </div>
           </div>
+
+          {/* SIMPLE, DIRECT MAP FITTING PANEL (shown when fitMapMode is active) */}
+          {fitMapMode && event.map && (
+            <div className="relative z-10 px-3 py-2.5 bg-slate-900/95 border-b border-amber-500/40 space-y-2 text-xs shrink-0 shadow-xl">
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <div className="flex flex-wrap items-center gap-2">
+                  <span className="font-semibold text-amber-300 flex items-center gap-1.5">
+                    <Anchor className="w-3.5 h-3.5" />
+                    Шаг 1: потяни карту мышкой, совместив Старт △ с зелёной точкой ⚓ СТАРТ. Шаг 2: подгони Масштаб и Поворот ползунками!
+                  </span>
+                </div>
+
+                <div className="flex items-center gap-1.5">
+                  {/* Mouse drag mode switch: move map vs move screen */}
+                  <button
+                    onClick={() => setDragMovesMap((v) => !v)}
+                    className={`inline-flex items-center gap-1 px-2.5 py-1 rounded-lg border font-medium transition ${
+                      dragMovesMap
+                        ? 'bg-amber-500 text-slate-950 border-amber-400'
+                        : 'bg-slate-800 text-sky-300 border-slate-700'
+                    }`}
+                    title="Переключить действие левой кнопки мыши: двигать саму карту под треком или двигать камеру"
+                  >
+                    {dragMovesMap ? (
+                      <>
+                        <Move className="w-3.5 h-3.5" />
+                        Мышь: двигает КАРТУ
+                      </>
+                    ) : (
+                      <>
+                        <Globe className="w-3.5 h-3.5" />
+                        Мышь: двигает ЭКРАН
+                      </>
+                    )}
+                  </button>
+
+                  <button
+                    onClick={() => void handleResetMapAutoFit()}
+                    className="px-2 py-1 rounded-lg bg-slate-800 hover:bg-slate-700 border border-slate-700 text-slate-300 hover:text-white transition"
+                    title="Сбросить карту в исходное положение над треком"
+                  >
+                    ↺ Сбросить
+                  </button>
+
+                  <button
+                    onClick={() => onToggleFitMap?.(false)}
+                    className="inline-flex items-center gap-1 px-3 py-1 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white font-semibold transition"
+                  >
+                    <Check className="w-3.5 h-3.5" />
+                    Готово
+                  </button>
+                </div>
+              </div>
+
+              {/* Sliders row: Scale + Rotation + Stretch X/Y + Fine shift arrows (all pivot around ⚓ СТАРТ!) */}
+              <div className="grid grid-cols-1 md:grid-cols-12 gap-2.5 items-center bg-slate-950/90 p-2 rounded-xl border border-slate-800">
+                {/* 1. Scale Slider */}
+                <div className="md:col-span-4 flex items-center gap-1.5">
+                  <span className="text-slate-300 font-medium w-20 shrink-0">
+                    Масштаб: <strong className="text-emerald-400">{scalePct}%</strong>
+                  </span>
+                  <button
+                    onClick={() => handleScaleSliderChange(scalePct - 1, true)}
+                    className="px-1.5 py-0.5 rounded bg-slate-800 hover:bg-slate-700 text-slate-200 font-mono"
+                    title="Уменьшить на 1% вокруг ⚓ СТАРТ"
+                  >
+                    -
+                  </button>
+                  <input
+                    type="range"
+                    min={40}
+                    max={260}
+                    step={1}
+                    value={scalePct}
+                    onChange={(e) =>
+                      handleScaleSliderChange(parseFloat(e.target.value), false)
+                    }
+                    onMouseUp={() =>
+                      liveMatrixRef.current &&
+                      void saveMatrixToServer(liveMatrixRef.current)
+                    }
+                    onTouchEnd={() =>
+                      liveMatrixRef.current &&
+                      void saveMatrixToServer(liveMatrixRef.current)
+                    }
+                    className="flex-1 accent-emerald-500 cursor-pointer"
+                  />
+                  <button
+                    onClick={() => handleScaleSliderChange(scalePct + 1, true)}
+                    className="px-1.5 py-0.5 rounded bg-slate-800 hover:bg-slate-700 text-slate-200 font-mono"
+                    title="Увеличить на 1% вокруг ⚓ СТАРТ"
+                  >
+                    +
+                  </button>
+                </div>
+
+                {/* 2. Rotation Slider */}
+                <div className="md:col-span-4 flex items-center gap-1.5">
+                  <span className="text-slate-300 font-medium w-20 shrink-0">
+                    Поворот:{' '}
+                    <strong className="text-amber-400">
+                      {angleDeg > 0 ? `+${angleDeg}°` : `${angleDeg}°`}
+                    </strong>
+                  </span>
+                  <button
+                    onClick={() =>
+                      handleAngleSliderChange(
+                        Math.round((angleDeg - 0.5) * 10) / 10,
+                        true
+                      )
+                    }
+                    className="p-1 rounded bg-slate-800 hover:bg-slate-700 text-slate-200"
+                    title="Повернуть на -0.5° вокруг ⚓ СТАРТ"
+                  >
+                    <RotateCw className="w-3 h-3" />
+                  </button>
+                  <input
+                    type="range"
+                    min={-45}
+                    max={45}
+                    step={0.5}
+                    value={angleDeg}
+                    onChange={(e) =>
+                      handleAngleSliderChange(parseFloat(e.target.value), false)
+                    }
+                    onMouseUp={() =>
+                      liveMatrixRef.current &&
+                      void saveMatrixToServer(liveMatrixRef.current)
+                    }
+                    onTouchEnd={() =>
+                      liveMatrixRef.current &&
+                      void saveMatrixToServer(liveMatrixRef.current)
+                    }
+                    className="flex-1 accent-amber-500 cursor-pointer"
+                  />
+                  <button
+                    onClick={() =>
+                      handleAngleSliderChange(
+                        Math.round((angleDeg + 0.5) * 10) / 10,
+                        true
+                      )
+                    }
+                    className="p-1 rounded bg-slate-800 hover:bg-slate-700 text-slate-200"
+                    title="Повернуть на +0.5° вокруг ⚓ СТАРТ"
+                  >
+                    <RotateCcw className="w-3 h-3" />
+                  </button>
+                </div>
+
+                {/* 3. Stretch X/Y Slider + Fine Nudge Arrows */}
+                <div className="md:col-span-4 flex items-center justify-between gap-2">
+                  <div className="flex items-center gap-1.5 flex-1">
+                    <span
+                      className="text-slate-300 font-medium shrink-0"
+                      title="Растяжение по ширине/высоте (если фото карты снято телефоном чуть под углом)"
+                    >
+                      Ш/В:{' '}
+                      <strong className="text-sky-400">
+                        {stretchPct > 0 ? `+${stretchPct}%` : `${stretchPct}%`}
+                      </strong>
+                    </span>
+                    <input
+                      type="range"
+                      min={-25}
+                      max={25}
+                      step={1}
+                      value={stretchPct}
+                      onChange={(e) =>
+                        handleStretchSliderChange(
+                          parseFloat(e.target.value),
+                          false
+                        )
+                      }
+                      onMouseUp={() =>
+                        liveMatrixRef.current &&
+                        void saveMatrixToServer(liveMatrixRef.current)
+                      }
+                      onTouchEnd={() =>
+                        liveMatrixRef.current &&
+                        void saveMatrixToServer(liveMatrixRef.current)
+                      }
+                      className="flex-1 accent-sky-500 cursor-pointer"
+                    />
+                  </div>
+
+                  <div className="flex items-center gap-0.5 shrink-0">
+                    <button
+                      onClick={() =>
+                        applyLiveNudge({ dEastM: -5, commitToServer: true })
+                      }
+                      className="p-1 rounded bg-slate-800 hover:bg-slate-700"
+                      title="Сдвинуть карту на 5м влево"
+                    >
+                      <ArrowLeft className="w-3 h-3" />
+                    </button>
+                    <button
+                      onClick={() =>
+                        applyLiveNudge({ dNorthM: 5, commitToServer: true })
+                      }
+                      className="p-1 rounded bg-slate-800 hover:bg-slate-700"
+                      title="Сдвинуть карту на 5м вверх"
+                    >
+                      <ArrowUp className="w-3 h-3" />
+                    </button>
+                    <button
+                      onClick={() =>
+                        applyLiveNudge({ dNorthM: -5, commitToServer: true })
+                      }
+                      className="p-1 rounded bg-slate-800 hover:bg-slate-700"
+                      title="Сдвинуть карту на 5м вниз"
+                    >
+                      <ArrowDown className="w-3 h-3" />
+                    </button>
+                    <button
+                      onClick={() =>
+                        applyLiveNudge({ dEastM: 5, commitToServer: true })
+                      }
+                      className="p-1 rounded bg-slate-800 hover:bg-slate-700"
+                      title="Сдвинуть карту на 5м вправо"
+                    >
+                      <ArrowRight className="w-3 h-3" />
+                    </button>
+                  </div>
+                </div>
+              </div>
+            </div>
+          )}
 
           {/* Active Map Click Prompt Banner (for Spot Start or Leg Selection) */}
           {(snapStage === 'spot_start' ||
             snapStage === 'leg_start' ||
             snapStage === 'leg_end') && (
-            <div className="px-3 py-1.5 bg-fuchsia-600/25 border-b border-fuchsia-400/50 text-fuchsia-200 text-xs font-medium flex items-center justify-between animate-pulse">
+            <div className="relative z-10 px-3 py-1.5 bg-fuchsia-600/25 border-b border-fuchsia-400/50 text-fuchsia-200 text-xs font-medium flex items-center justify-between animate-pulse shrink-0">
               <span>
                 {snapStage === 'spot_start' &&
                   '🏁 Кликните любую точку на карте (КП / развилку), чтобы запустить все треки одновременно из этого места!'}
@@ -1539,21 +1546,21 @@ export const ReplayWorkspace: React.FC<Props> = ({
             </div>
           )}
 
+          {/* MapLibre Canvas Container — strictly relative + overflow-hidden so canvas never escapes */}
           <div
             ref={mapContainerRef}
-            className={`flex-1 w-full ${
-              pendingScanPixel ||
-              snapStage === 'spot_start' ||
-              snapStage === 'leg_start' ||
-              snapStage === 'leg_end'
+            className={`relative flex-1 w-full overflow-hidden ${
+              snapStage !== 'idle'
                 ? 'cursor-crosshair'
-                : ''
+                : fitMapMode && dragMovesMap && event.map
+                  ? 'cursor-move'
+                  : ''
             }`}
           />
         </div>
 
         {/* Right sidebar: Participants, Route-Choice Leg Analysis, Livelox Speed Normalization */}
-        <div className="lg:col-span-3 xl:col-span-3 flex flex-col border-l border-slate-800 bg-slate-900/80 overflow-hidden">
+        <div className="lg:col-span-4 xl:col-span-3 flex flex-col border-l border-slate-800 bg-slate-900/80 overflow-hidden">
           <div className="p-3 border-b border-slate-800 space-y-2">
             <div className="flex items-center justify-between">
               <span className="text-xs font-semibold uppercase tracking-wider text-slate-400">
@@ -1698,7 +1705,7 @@ export const ReplayWorkspace: React.FC<Props> = ({
             </div>
           </div>
 
-          {/* Selected Leg Route-Choice Comparison Panel (Mosfiloti straight vs contour vs road analysis!) */}
+          {/* Selected Leg Route-Choice Comparison Panel */}
           {legAnalysis && (
             <div className="p-3 border-b border-fuchsia-500/30 bg-fuchsia-950/20 space-y-2 text-xs shrink-0 max-h-56 overflow-y-auto">
               <div className="flex items-center justify-between">
@@ -1714,7 +1721,8 @@ export const ReplayWorkspace: React.FC<Props> = ({
               </div>
 
               {legAnalysis.stats.map((st, idx) => {
-                const bestLegSec = legAnalysis.stats[0]?.legTimeSec ?? st.legTimeSec;
+                const bestLegSec =
+                  legAnalysis.stats[0]?.legTimeSec ?? st.legTimeSec;
                 const diffSec = st.legTimeSec - bestLegSec;
                 return (
                   <div
@@ -1947,7 +1955,7 @@ export const ReplayWorkspace: React.FC<Props> = ({
       </div>
 
       {/* Bottom Playback Transport Bar */}
-      <div className="px-4 py-3 bg-slate-900 border-t border-slate-800 flex flex-wrap items-center gap-4">
+      <div className="px-4 py-3 bg-slate-900 border-t border-slate-800 flex flex-wrap items-center gap-4 shrink-0 z-10">
         <div className="flex items-center gap-2">
           <button
             onClick={() => setIsPlaying((p) => !p)}

@@ -1,9 +1,9 @@
 import React, { useEffect, useState } from 'react';
 import {
   Check,
-  Columns2,
   Compass,
   FolderPlus,
+  Move,
   Pencil,
   PlayCircle,
   Share2,
@@ -25,7 +25,7 @@ interface EventSummary {
 export const App: React.FC = () => {
   const [eventsList, setEventsList] = useState<EventSummary[]>([]);
   const [currentEvent, setCurrentEvent] = useState<RaceEvent | null>(null);
-  const [twoMapsMode, setTwoMapsMode] = useState<boolean>(true);
+  const [fitMapMode, setFitMapMode] = useState<boolean>(false);
   const [copiedSlug, setCopiedSlug] = useState(false);
   const [creatingEvent, setCreatingEvent] = useState(false);
 
@@ -102,7 +102,6 @@ export const App: React.FC = () => {
         const data = await res.json();
         const evt: RaceEvent = data.event;
         setCurrentEvent(evt);
-        setTwoMapsMode(true);
         await refreshEventsList();
       }
     } finally {
@@ -171,14 +170,10 @@ export const App: React.FC = () => {
     setTimeout(() => setCopiedSlug(false), 2000);
   }
 
-  const activePinCount = (currentEvent?.map?.gcps ?? []).filter(
-    (g) => !g.id.startsWith('gcp-auto-')
-  ).length;
-
   return (
     <div className="flex flex-col h-screen w-screen overflow-hidden bg-slate-950 text-slate-100">
       {/* Top Application Header */}
-      <header className="h-14 px-4 bg-slate-900 border-b border-slate-800 flex items-center justify-between gap-4 shrink-0">
+      <header className="h-14 px-4 bg-slate-900 border-b border-slate-800 flex items-center justify-between gap-4 shrink-0 z-20">
         <div className="flex items-center gap-2.5 min-w-0">
           <div className="flex items-center gap-2">
             <div className="w-8 h-8 rounded-xl bg-emerald-500/15 border border-emerald-500/40 flex items-center justify-center text-emerald-400">
@@ -238,35 +233,31 @@ export const App: React.FC = () => {
           </button>
         </div>
 
-        {/* Center Mode Switch: 2 Maps (Scan + Track/OSM) vs 1 Combined Map */}
+        {/* Center Mode Switch: Replay vs Interactive Map Fit */}
         <div className="flex items-center bg-slate-950 p-1 rounded-xl border border-slate-800">
           <button
-            onClick={() => setTwoMapsMode(true)}
+            onClick={() => setFitMapMode(false)}
             className={`inline-flex items-center gap-1.5 px-3.5 py-1.5 rounded-lg text-xs font-medium transition ${
-              twoMapsMode
+              !fitMapMode
                 ? 'bg-emerald-600 text-white shadow'
                 : 'text-slate-400 hover:text-slate-200'
             }`}
-            title="Слева — скан спортивной карты, справа — карта OSM с твоим GPS-треком и плеером"
           >
-            <Columns2 className="w-4 h-4" />2 карты: Скан + Трек/OSM
-            {activePinCount > 0 && (
-              <span className="px-1.5 py-0.2 rounded bg-slate-900/60 text-[10px] text-emerald-200">
-                📌{activePinCount}
-              </span>
-            )}
+            <PlayCircle className="w-4 h-4" />
+            Реплей и анализ
           </button>
 
           <button
-            onClick={() => setTwoMapsMode(false)}
+            onClick={() => setFitMapMode(true)}
             className={`inline-flex items-center gap-1.5 px-3.5 py-1.5 rounded-lg text-xs font-medium transition ${
-              !twoMapsMode
-                ? 'bg-emerald-600 text-white shadow'
+              fitMapMode
+                ? 'bg-amber-500 text-slate-950 font-semibold shadow'
                 : 'text-slate-400 hover:text-slate-200'
             }`}
-            title="Одна общая карта на весь экран (наложение скана + треки + реплей)"
+            title="Перетаскивай карту мышкой прямо под GPS-трек и крути ползунки масштаба/поворота вокруг Старта"
           >
-            <PlayCircle className="w-4 h-4" />1 общая карта (Реплей)
+            <Move className="w-4 h-4" />
+            ✋ Подогнать карту мышкой
           </button>
         </div>
 
@@ -300,8 +291,8 @@ export const App: React.FC = () => {
         ) : (
           <ReplayWorkspace
             event={currentEvent}
-            twoMapsMode={twoMapsMode}
-            onToggleTwoMaps={setTwoMapsMode}
+            fitMapMode={fitMapMode}
+            onToggleFitMap={setFitMapMode}
             onEventUpdated={(evt) => {
               setCurrentEvent(evt);
               void refreshEventsList();

@@ -7,6 +7,7 @@ import {
   addPinMapToTrack,
   autoPlaceScreenshotOnBounds,
   lonLatToMercator,
+  matrixToCorners,
   nudgeMapMatrix,
   pixelToLonLat,
   solveGeoref,
@@ -346,14 +347,18 @@ async function startServer() {
     return { event: evt };
   });
 
-  // Nudge map overlay directly (shift in meters, rotate in deg, scale) or manage pins
+  // Nudge map overlay directly (shift in meters, rotate in deg, scale, or set matrix directly)
   app.post<{
     Params: { id: string };
     Body: {
+      matrix?: [number, number, number, number, number, number];
+      resetAutoFit?: boolean;
       dEastM?: number;
       dNorthM?: number;
       scaleFactor?: number;
+      stretchXFactor?: number;
       dAngleDeg?: number;
+      anchorLonLat?: [number, number];
       addPin?: {
         mapLonLat: [number, number];
         trackLonLat: [number, number];
@@ -367,8 +372,8 @@ async function startServer() {
       return reply.code(404).send({ error: 'Сначала загрузите карту' });
     }
 
-    if (!evt.map.matrix) {
-      const bounds = computeTracksBoundingBox(evt.participants) ?? {
+    const defaultBounds = () =>
+      computeTracksBoundingBox(evt.participants) ?? {
         minLon: 32.415,
         maxLon: 32.435,
         minLat: 34.765,
@@ -376,16 +381,37 @@ async function startServer() {
         startLon: 32.4245,
         startLat: 34.772,
       };
+
+    if (!evt.map.matrix || req.body.resetAutoFit) {
       const init = autoPlaceScreenshotOnBounds(
         evt.map.width,
         evt.map.height,
-        bounds
+        defaultBounds()
       );
       evt.map.matrix = init.matrix;
       evt.map.cornersLonLat = init.cornersLonLat;
+      evt.map.gcps = [];
+      evt.map.rmsErrorM = undefined;
+      evt.map.rotationDeg = 0;
+      if (req.body.resetAutoFit) {
+        await saveEventToDisk(evt);
+        return { event: evt };
+      }
     }
 
-    if (req.body.clearPins) {
+    if (
+      Array.isArray(req.body.matrix) &&
+      req.body.matrix.length === 6 &&
+      req.body.matrix.every((v) => typeof v === 'number' && Number.isFinite(v))
+    ) {
+      const m = req.body.matrix;
+      evt.map.matrix = m;
+      evt.map.cornersLonLat = matrixToCorners(m, evt.map.width, evt.map.height);
+      evt.map.gcps = [];
+      evt.map.rmsErrorM = undefined;
+      evt.map.rotationDeg =
+        Math.round(((Math.atan2(m[3], m[0]) * 180) / Math.PI) * 10) / 10;
+    } else if (req.body.clearPins) {
       evt.map.gcps = [];
       evt.map.rmsErrorM = undefined;
     } else if (req.body.undoLastPin) {
@@ -687,6 +713,9 @@ async function startServer() {
       const stat = await fs.stat(resolved);
       if (stat.isFile()) {
         const ext = path.extname(resolved).toLowerCase();
+        if (ext === '.html') {
+          reply.header('Cache-Control', 'no-cache, no-store, must-revalidate');
+        }
         reply.header(
           'Content-Type',
           MIME_BY_EXT[ext] ?? 'application/octet-stream'
@@ -700,6 +729,7 @@ async function startServer() {
       const indexHtml = await fs.readFile(
         path.join(clientDistDir, 'index.html')
       );
+      reply.header('Cache-Control', 'no-cache, no-store, must-revalidate');
       reply.header('Content-Type', 'text/html; charset=utf-8');
       return reply.send(indexHtml);
     } catch {

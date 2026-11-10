@@ -88,8 +88,8 @@ export function autoPlaceScreenshotOnBounds(
   const [maxX, maxY] = lonLatToMercator(bounds.maxLon, bounds.maxLat);
   const centerX = (minX + maxX) / 2;
   const centerY = (minY + maxY) / 2;
-  const spanX = Math.max(300, (maxX - minX) * 1.35);
-  const spanY = Math.max(300, (maxY - minY) * 1.35);
+  const spanX = Math.max(300, (maxX - minX) * 1.75);
+  const spanY = Math.max(300, (maxY - minY) * 1.75);
 
   const s = Math.max(spanX / width, spanY / height);
   const tx = centerX - (s * width) / 2;
@@ -103,19 +103,28 @@ export function autoPlaceScreenshotOnBounds(
     ty,
   ];
 
-  const cornersLonLat: [
-    [number, number],
-    [number, number],
-    [number, number],
-    [number, number],
-  ] = [
+  const cornersLonLat = matrixToCorners(matrix, width, height);
+
+  return { matrix, cornersLonLat };
+}
+
+/** Compute the 4 corners [topLeft, topRight, bottomRight, bottomLeft] in [lon, lat] for MapLibre ImageSource */
+export function matrixToCorners(
+  matrix: [number, number, number, number, number, number],
+  width: number,
+  height: number
+): [
+  [number, number],
+  [number, number],
+  [number, number],
+  [number, number],
+] {
+  return [
     pixelToLonLat(matrix, 0, 0),
     pixelToLonLat(matrix, width, 0),
     pixelToLonLat(matrix, width, height),
     pixelToLonLat(matrix, 0, height),
   ];
-
-  return { matrix, cornersLonLat };
 }
 
 /**
@@ -282,8 +291,9 @@ export function lonLatToPixel(
 }
 
 /**
- * Apply rigid/scale nudge in Web Mercator (dEastM, dNorthM, scaleFactor, dAngleDeg around image center)
- * directly to an existing 2x3 matrix [a, b, tx, c, d, ty] and return updated matrix & 4 corners.
+ * Apply shift (dEastM, dNorthM), scale (scaleFactor), X-stretch (stretchXFactor), and rotation (dAngleDeg)
+ * around a geographic anchor point `anchorLonLat` (e.g. the GPS Start point, so the Start never moves
+ * while scaling or rotating!) or around the image center if no anchor is given.
  */
 export function nudgeMapMatrix(
   matrix: [number, number, number, number, number, number],
@@ -293,7 +303,9 @@ export function nudgeMapMatrix(
     dEastM?: number;
     dNorthM?: number;
     scaleFactor?: number;
+    stretchXFactor?: number;
     dAngleDeg?: number;
+    anchorLonLat?: [number, number];
   }
 ): {
   matrix: [number, number, number, number, number, number];
@@ -305,23 +317,51 @@ export function nudgeMapMatrix(
   ];
 } {
   const [a, b, tx, c, d, ty] = matrix;
-  const cx = width / 2;
-  const cy = height / 2;
-  const centerMx = a * cx + b * cy + tx;
-  const centerMy = c * cx + d * cy + ty;
+
+  let pivotMx: number;
+  let pivotMy: number;
+  if (nudge.anchorLonLat) {
+    [pivotMx, pivotMy] = lonLatToMercator(
+      nudge.anchorLonLat[0],
+      nudge.anchorLonLat[1]
+    );
+  } else {
+    const cx = width / 2;
+    const cy = height / 2;
+    pivotMx = a * cx + b * cy + tx;
+    pivotMy = c * cx + d * cy + ty;
+  }
 
   const k = nudge.scaleFactor ?? 1;
+  const sx = nudge.stretchXFactor ?? 1;
   const rad = ((nudge.dAngleDeg ?? 0) * Math.PI) / 180;
   const cos = Math.cos(rad) * k;
   const sin = Math.sin(rad) * k;
 
-  const na = cos * a - sin * c;
+  // Apply image-space X stretch first (a*sx, c*sx), then world-space scale & rotation around pivot
+  const as = a * sx;
+  const cs = c * sx;
+
+  // Compute pixel under pivot before stretch so pivot remains invariant under stretch too
+  const det = a * d - b * c;
+  let pivotPx = width / 2;
+  let pivotPy = height / 2;
+  if (Math.abs(det) > 1e-12) {
+    const dx = pivotMx - tx;
+    const dy = pivotMy - ty;
+    pivotPx = (d * dx - b * dy) / det;
+    pivotPy = (-c * dx + a * dy) / det;
+  }
+
+  const na = cos * as - sin * cs;
   const nb = cos * b - sin * d;
-  const nc = sin * a + cos * c;
+  const nc = sin * as + cos * cs;
   const nd = sin * b + cos * d;
 
-  const ntx = centerMx - (na * cx + nb * cy) + (nudge.dEastM ?? 0);
-  const nty = centerMy - (nc * cx + nd * cy) + (nudge.dNorthM ?? 0);
+  const ntx =
+    pivotMx - (na * pivotPx + nb * pivotPy) + (nudge.dEastM ?? 0);
+  const nty =
+    pivotMy - (nc * pivotPx + nd * pivotPy) + (nudge.dNorthM ?? 0);
 
   const nextMatrix: [number, number, number, number, number, number] = [
     na,
@@ -332,17 +372,7 @@ export function nudgeMapMatrix(
     nty,
   ];
 
-  const cornersLonLat: [
-    [number, number],
-    [number, number],
-    [number, number],
-    [number, number],
-  ] = [
-    pixelToLonLat(nextMatrix, 0, 0),
-    pixelToLonLat(nextMatrix, width, 0),
-    pixelToLonLat(nextMatrix, width, height),
-    pixelToLonLat(nextMatrix, 0, height),
-  ];
+  const cornersLonLat = matrixToCorners(nextMatrix, width, height);
 
   return { matrix: nextMatrix, cornersLonLat };
 }
