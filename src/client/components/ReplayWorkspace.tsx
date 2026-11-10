@@ -2,7 +2,12 @@ import React, { useEffect, useMemo, useRef, useState } from 'react';
 import maplibregl from 'maplibre-gl';
 import {
   Activity,
+  ArrowDown,
+  ArrowLeft,
+  ArrowRight,
+  ArrowUp,
   Clock,
+  Crosshair,
   Eye,
   EyeOff,
   Flag,
@@ -11,12 +16,17 @@ import {
   Heart,
   ImagePlus,
   Layers,
+  Move,
   Pause,
   Play,
   Plus,
   RotateCcw,
+  RotateCw,
   Trash2,
+  ZoomIn,
+  ZoomOut,
 } from 'lucide-react';
+import { lonLatToMercator } from '../../shared/georef.js';
 import {
   formatDuration,
   formatPaceMinKm,
@@ -53,6 +63,13 @@ export const ReplayWorkspace: React.FC<Props> = ({ event, onEventUpdated }) => {
   const [uploadingScreenshot, setUploadingScreenshot] =
     useState<boolean>(false);
   const [uploadError, setUploadError] = useState<string | null>(null);
+  const [showMapCalibrator, setShowMapCalibrator] = useState<boolean>(false);
+  const [twoClickStep, setTwoClickStep] = useState<
+    'idle' | 'pick_map_feature' | 'pick_track_point'
+  >('idle');
+  const [pickedFeatureLonLat, setPickedFeatureLonLat] = useState<
+    [number, number] | null
+  >(null);
 
   const mapContainerRef = useRef<HTMLDivElement | null>(null);
   const mapRef = useRef<maplibregl.Map | null>(null);
@@ -546,6 +563,52 @@ export const ReplayWorkspace: React.FC<Props> = ({ event, onEventUpdated }) => {
     }
   }
 
+  // Handle 2-click map-to-track snap directly on the replay map
+  useEffect(() => {
+    const map = mapRef.current;
+    if (!map) return;
+
+    const onMapClick = (e: maplibregl.MapMouseEvent) => {
+      if (twoClickStep === 'pick_map_feature') {
+        setPickedFeatureLonLat([e.lngLat.lng, e.lngLat.lat]);
+        setTwoClickStep('pick_track_point');
+      } else if (twoClickStep === 'pick_track_point' && pickedFeatureLonLat) {
+        const [m0x, m0y] = lonLatToMercator(
+          pickedFeatureLonLat[0],
+          pickedFeatureLonLat[1]
+        );
+        const [m1x, m1y] = lonLatToMercator(e.lngLat.lng, e.lngLat.lat);
+        const dEastM = m1x - m0x;
+        const dNorthM = m1y - m0y;
+        setTwoClickStep('idle');
+        setPickedFeatureLonLat(null);
+        void nudgeMap({ dEastM, dNorthM });
+      }
+    };
+
+    map.on('click', onMapClick);
+    return () => {
+      map.off('click', onMapClick);
+    };
+  }, [twoClickStep, pickedFeatureLonLat, event.id]);
+
+  async function nudgeMap(params: {
+    dEastM?: number;
+    dNorthM?: number;
+    scaleFactor?: number;
+    dAngleDeg?: number;
+  }) {
+    const res = await fetch(`/api/events/${event.id}/map-nudge`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(params),
+    });
+    if (res.ok) {
+      const data = await res.json();
+      onEventUpdated(data.event);
+    }
+  }
+
   async function syncCommonStartSpot() {
     const res = await fetch(`/api/events/${event.id}/sync-start`, {
       method: 'POST',
@@ -632,7 +695,155 @@ export const ReplayWorkspace: React.FC<Props> = ({ event, onEventUpdated }) => {
               <Flame className="w-3.5 h-3.5" />
               Темп-хитмап
             </button>
+
+            {event.map && (
+              <button
+                onClick={() => setShowMapCalibrator((v) => !v)}
+                className={`inline-flex items-center gap-1 px-2.5 py-1 rounded-lg border transition ${
+                  showMapCalibrator || twoClickStep !== 'idle'
+                    ? 'bg-emerald-500/20 border-emerald-400/60 text-emerald-300 font-medium'
+                    : 'bg-slate-800 border-slate-700 text-slate-300 hover:text-white'
+                }`}
+                title="Подогнать сдвиг, поворот или масштаб карты прямо под GPS-трек"
+              >
+                <Move className="w-3.5 h-3.5" />
+                Подогнать карту под трек
+              </button>
+            )}
           </div>
+
+          {/* Direct Map-to-Track Calibration Floating Widget */}
+          {event.map && showMapCalibrator && (
+            <div className="absolute top-16 left-3 z-20 p-3 rounded-xl bg-slate-900/95 backdrop-blur border border-emerald-500/40 shadow-2xl text-xs space-y-2.5 w-80">
+              <div className="flex items-center justify-between">
+                <span className="font-semibold text-emerald-300">
+                  Точная подгонка карты под трек
+                </span>
+                <button
+                  onClick={() => {
+                    setShowMapCalibrator(false);
+                    setTwoClickStep('idle');
+                  }}
+                  className="text-slate-400 hover:text-white"
+                >
+                  ✕
+                </button>
+              </div>
+
+              {/* 2-click direct snap button */}
+              <button
+                onClick={() => {
+                  if (twoClickStep === 'idle') {
+                    setTwoClickStep('pick_map_feature');
+                  } else {
+                    setTwoClickStep('idle');
+                    setPickedFeatureLonLat(null);
+                  }
+                }}
+                className={`w-full py-2 px-3 rounded-lg font-medium flex items-center justify-center gap-1.5 border transition ${
+                  twoClickStep !== 'idle'
+                    ? 'bg-amber-500/25 border-amber-400 text-amber-200 animate-pulse'
+                    : 'bg-emerald-600 hover:bg-emerald-500 border-emerald-500 text-white'
+                }`}
+              >
+                <Crosshair className="w-4 h-4" />
+                {twoClickStep === 'idle' &&
+                  'Сдвинуть в 2 клика (карта → трек)'}
+                {twoClickStep === 'pick_map_feature' &&
+                  '1/2: Кликни на ориентир на КАРТЕ'}
+                {twoClickStep === 'pick_track_point' &&
+                  '2/2: Теперь кликни на точку ТРЕКА'}
+              </button>
+
+              {/* Shift buttons */}
+              <div className="grid grid-cols-2 gap-2 pt-1">
+                <div className="bg-slate-950/80 p-2 rounded-lg border border-slate-800 space-y-1">
+                  <div className="text-[10px] text-slate-400 text-center">
+                    Сдвиг карты (15 м)
+                  </div>
+                  <div className="flex flex-col items-center gap-1">
+                    <button
+                      onClick={() => nudgeMap({ dNorthM: 15 })}
+                      className="p-1 rounded bg-slate-800 hover:bg-slate-700"
+                      title="На север (+15м)"
+                    >
+                      <ArrowUp className="w-3.5 h-3.5" />
+                    </button>
+                    <div className="flex items-center gap-2">
+                      <button
+                        onClick={() => nudgeMap({ dEastM: -15 })}
+                        className="p-1 rounded bg-slate-800 hover:bg-slate-700"
+                        title="На запад (-15м)"
+                      >
+                        <ArrowLeft className="w-3.5 h-3.5" />
+                      </button>
+                      <button
+                        onClick={() => nudgeMap({ dEastM: 15 })}
+                        className="p-1 rounded bg-slate-800 hover:bg-slate-700"
+                        title="На восток (+15м)"
+                      >
+                        <ArrowRight className="w-3.5 h-3.5" />
+                      </button>
+                    </div>
+                    <button
+                      onClick={() => nudgeMap({ dNorthM: -15 })}
+                      className="p-1 rounded bg-slate-800 hover:bg-slate-700"
+                      title="На юг (-15м)"
+                    >
+                      <ArrowDown className="w-3.5 h-3.5" />
+                    </button>
+                  </div>
+                </div>
+
+                {/* Rotation & Scale */}
+                <div className="bg-slate-950/80 p-2 rounded-lg border border-slate-800 flex flex-col justify-between">
+                  <div>
+                    <div className="text-[10px] text-slate-400 text-center mb-1">
+                      Поворот ({event.map.rotationDeg ?? 0}°)
+                    </div>
+                    <div className="flex items-center justify-center gap-1.5">
+                      <button
+                        onClick={() => nudgeMap({ dAngleDeg: 1 })}
+                        className="px-2 py-1 rounded bg-slate-800 hover:bg-slate-700 flex items-center gap-1"
+                        title="Повернуть против часовой (+1°)"
+                      >
+                        <RotateCcw className="w-3 h-3" /> 1°
+                      </button>
+                      <button
+                        onClick={() => nudgeMap({ dAngleDeg: -1 })}
+                        className="px-2 py-1 rounded bg-slate-800 hover:bg-slate-700 flex items-center gap-1"
+                        title="Повернуть по часовой (-1°)"
+                      >
+                        <RotateCw className="w-3 h-3" /> 1°
+                      </button>
+                    </div>
+                  </div>
+
+                  <div>
+                    <div className="text-[10px] text-slate-400 text-center mb-1">
+                      Масштаб карты
+                    </div>
+                    <div className="flex items-center justify-center gap-1.5">
+                      <button
+                        onClick={() => nudgeMap({ scaleFactor: 0.98 })}
+                        className="px-2 py-1 rounded bg-slate-800 hover:bg-slate-700 flex items-center gap-1"
+                        title="Уменьшить карту (-2%)"
+                      >
+                        <ZoomOut className="w-3 h-3" /> -2%
+                      </button>
+                      <button
+                        onClick={() => nudgeMap({ scaleFactor: 1.02 })}
+                        className="px-2 py-1 rounded bg-slate-800 hover:bg-slate-700 flex items-center gap-1"
+                        title="Увеличить карту (+2%)"
+                      >
+                        <ZoomIn className="w-3 h-3" /> +2%
+                      </button>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            </div>
+          )}
 
           {/* Speed heatmap legend */}
           {speedHeatmap && (

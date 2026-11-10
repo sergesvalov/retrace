@@ -60,7 +60,7 @@ export const GeorefWorkspace: React.FC<Props> = ({ event, onEventUpdated }) => {
   const mapObj = event.map;
   const [gcps, setGcps] = useState<GCP[]>(mapObj?.gcps ?? []);
   const [transformType, setTransformType] = useState<TransformType>(
-    mapObj?.transformType ?? 'north_up'
+    mapObj?.transformType ?? 'similarity'
   );
   const [pendingPixel, setPendingPixel] = useState<{
     px: number;
@@ -78,7 +78,7 @@ export const GeorefWorkspace: React.FC<Props> = ({ event, onEventUpdated }) => {
 
   useEffect(() => {
     setGcps(event.map?.gcps ?? []);
-    setTransformType(event.map?.transformType ?? 'north_up');
+    setTransformType(event.map?.transformType ?? 'similarity');
     setPendingPixel(null);
   }, [event.id, event.map?.id]);
 

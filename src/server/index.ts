@@ -7,6 +7,7 @@ import fastifyStatic from '@fastify/static';
 import { nanoid } from 'nanoid';
 import {
   autoPlaceScreenshotOnBounds,
+  nudgeMapMatrix,
   solveGeoref,
 } from '../shared/georef.js';
 import {
@@ -204,7 +205,7 @@ async function startServer() {
         width,
         height,
         gcps: autoPlaced?.gcps ?? [],
-        transformType: 'north_up',
+        transformType: 'similarity',
         matrix: autoPlaced?.matrix,
         cornersLonLat: autoPlaced?.cornersLonLat,
         rmsErrorM: autoPlaced ? 0 : undefined,
@@ -259,6 +260,40 @@ async function startServer() {
       evt.map.cornersLonLat = undefined;
       evt.map.rmsErrorM = undefined;
     }
+
+    await saveEventToDisk(evt);
+    return { event: evt };
+  });
+
+  // Nudge map overlay directly (shift in meters, rotate in deg, scale) or snap a map point to a track point
+  app.post<{
+    Params: { id: string };
+    Body: {
+      dEastM?: number;
+      dNorthM?: number;
+      scaleFactor?: number;
+      dAngleDeg?: number;
+    };
+  }>('/api/events/:id/map-nudge', async (req, reply) => {
+    const evt = eventsStore.get(req.params.id);
+    if (!evt || !evt.map || !evt.map.matrix) {
+      return reply
+        .code(404)
+        .send({ error: 'Сначала привяжите или загрузите карту' });
+    }
+
+    const res = nudgeMapMatrix(
+      evt.map.matrix,
+      evt.map.width,
+      evt.map.height,
+      req.body
+    );
+    evt.map.matrix = res.matrix;
+    evt.map.cornersLonLat = res.cornersLonLat;
+    evt.map.rotationDeg =
+      Math.round(
+        ((Math.atan2(res.matrix[3], res.matrix[0]) * 180) / Math.PI) * 10
+      ) / 10;
 
     await saveEventToDisk(evt);
     return { event: evt };

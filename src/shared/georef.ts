@@ -348,6 +348,73 @@ export function lonLatToPixel(
   return [px, py];
 }
 
+/**
+ * Apply rigid/scale nudge in Web Mercator (dEastM, dNorthM, scaleFactor, dAngleDeg around image center)
+ * directly to an existing 2x3 matrix [a, b, tx, c, d, ty] and return updated matrix & 4 corners.
+ */
+export function nudgeMapMatrix(
+  matrix: [number, number, number, number, number, number],
+  width: number,
+  height: number,
+  nudge: {
+    dEastM?: number;
+    dNorthM?: number;
+    scaleFactor?: number;
+    dAngleDeg?: number;
+  }
+): {
+  matrix: [number, number, number, number, number, number];
+  cornersLonLat: [
+    [number, number],
+    [number, number],
+    [number, number],
+    [number, number],
+  ];
+} {
+  let [a, b, tx, c, d, ty] = matrix;
+  const cx = width / 2;
+  const cy = height / 2;
+  const centerMx = a * cx + b * cy + tx;
+  const centerMy = c * cx + d * cy + ty;
+
+  const k = nudge.scaleFactor ?? 1;
+  const rad = ((nudge.dAngleDeg ?? 0) * Math.PI) / 180;
+  const cos = Math.cos(rad) * k;
+  const sin = Math.sin(rad) * k;
+
+  // Rotate & scale linear part around image center
+  const na = cos * a - sin * c;
+  const nb = cos * b - sin * d;
+  const nc = sin * a + cos * c;
+  const nd = sin * b + cos * d;
+
+  const ntx = centerMx - (na * cx + nb * cy) + (nudge.dEastM ?? 0);
+  const nty = centerMy - (nc * cx + nd * cy) + (nudge.dNorthM ?? 0);
+
+  const nextMatrix: [number, number, number, number, number, number] = [
+    na,
+    nb,
+    ntx,
+    nc,
+    nd,
+    nty,
+  ];
+
+  const cornersLonLat: [
+    [number, number],
+    [number, number],
+    [number, number],
+    [number, number],
+  ] = [
+    pixelToLonLat(nextMatrix, 0, 0),
+    pixelToLonLat(nextMatrix, width, 0),
+    pixelToLonLat(nextMatrix, width, height),
+    pixelToLonLat(nextMatrix, 0, height),
+  ];
+
+  return { matrix: nextMatrix, cornersLonLat };
+}
+
 export interface GeorefSolution {
   matrix: [number, number, number, number, number, number];
   cornersLonLat: [
