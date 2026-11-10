@@ -385,6 +385,197 @@ export function computeTracksBoundingBox(participants: ParticipantTrack[]): {
   return { minLon, maxLon, minLat, maxLat, startLon, startLat };
 }
 
+export type SpeedNormMode = 'real' | 'livelox_handicap' | 'equal_speed';
+
+export interface LegParticipantStats {
+  participantId: string;
+  name: string;
+  color: string;
+  tStartSec: number;
+  tEndSec: number;
+  legTimeSec: number;
+  normalizedLegTimeSec: number;
+  straightDistM: number;
+  routeDistM: number;
+  detourPct: number;
+  avgSpeedMs: number;
+  overallSpeedMs: number;
+  paceIndexPct: number;
+  eleGainM: number;
+  eleLossM: number;
+}
+
+/**
+ * Find the point along `points` (at or after `afterTimeSec`) that passes closest to `[targetLon, targetLat]`.
+ */
+export function findClosestPassagePoint(
+  points: TrackPoint[],
+  targetLon: number,
+  targetLat: number,
+  afterTimeSec = 0
+): { pt: TrackPoint; idx: number; distFromTargetM: number } | null {
+  if (points.length === 0) return null;
+  let bestIdx = -1;
+  let bestDist = Infinity;
+
+  for (let i = 0; i < points.length; i++) {
+    if (points[i].t < afterTimeSec) continue;
+    const d = haversineDistanceM(
+      targetLon,
+      targetLat,
+      points[i].lon,
+      points[i].lat
+    );
+    if (d < bestDist) {
+      bestDist = d;
+      bestIdx = i;
+    }
+  }
+
+  if (bestIdx === -1) {
+    bestIdx = points.length - 1;
+    bestDist = haversineDistanceM(
+      targetLon,
+      targetLat,
+      points[bestIdx].lon,
+      points[bestIdx].lat
+    );
+  }
+
+  return {
+    pt: points[bestIdx],
+    idx: bestIdx,
+    distFromTargetM: Math.round(bestDist),
+  };
+}
+
+/**
+ * Synchronize all participants to depart simultaneously at 00:00 from an arbitrary clicked spot on the map
+ * (e.g., any Control Point КП or road fork).
+ */
+export function syncAllParticipantsToSpot(
+  participants: ParticipantTrack[],
+  spotLon: number,
+  spotLat: number
+): void {
+  for (const p of participants) {
+    const closest = findClosestPassagePoint(p.points, spotLon, spotLat, 0);
+    if (closest) {
+      p.trimStartSec = Math.max(0, Math.floor(closest.pt.t));
+      p.trimEndSec = p.durationSec;
+      p.offsetSec = 0;
+    }
+  }
+}
+
+/**
+ * Analyze a leg between two arbitrary map points `startLonLat` (КП A) and `endLonLat` (КП B)
+ * for route-choice comparison (straight vs road vs contour, elevation gain/loss, and Livelox speed normalization).
+ */
+export function analyzeLegBetweenSpots(
+  participants: ParticipantTrack[],
+  startLonLat: [number, number],
+  endLonLat: [number, number]
+): {
+  straightDistM: number;
+  groupMeanSpeedMs: number;
+  stats: LegParticipantStats[];
+} {
+  const straightDistM = Math.max(
+    1,
+    Math.round(
+      haversineDistanceM(
+        startLonLat[0],
+        startLonLat[1],
+        endLonLat[0],
+        endLonLat[1]
+      )
+    )
+  );
+
+  const visible = participants.filter((p) => p.visible && p.points.length >= 2);
+  const overallSpeeds = visible.map((p) =>
+    p.durationSec > 0 ? p.totalDistanceM / p.durationSec : 2.5
+  );
+  const groupMeanSpeedMs =
+    overallSpeeds.length > 0
+      ? overallSpeeds.reduce((a, b) => a + b, 0) / overallSpeeds.length
+      : 2.5;
+
+  const stats: LegParticipantStats[] = [];
+
+  for (const p of visible) {
+    const startHit = findClosestPassagePoint(
+      p.points,
+      startLonLat[0],
+      startLonLat[1],
+      0
+    );
+    if (!startHit) continue;
+    const endHit = findClosestPassagePoint(
+      p.points,
+      endLonLat[0],
+      endLonLat[1],
+      startHit.pt.t + 3
+    );
+    if (!endHit || endHit.idx <= startHit.idx) continue;
+
+    const tStartSec = Math.round(startHit.pt.t);
+    const tEndSec = Math.round(endHit.pt.t);
+    const legTimeSec = Math.max(1, tEndSec - tStartSec);
+    const routeDistM = Math.max(
+      1,
+      Math.round(endHit.pt.distM - startHit.pt.distM)
+    );
+    const detourPct = Math.round((routeDistM / straightDistM - 1) * 100);
+    const avgSpeedMs = routeDistM / legTimeSec;
+    const overallSpeedMs =
+      p.durationSec > 0 ? p.totalDistanceM / p.durationSec : avgSpeedMs;
+    const paceIndexPct =
+      overallSpeedMs > 0
+        ? Math.round((avgSpeedMs / overallSpeedMs - 1) * 100)
+        : 0;
+
+    // Livelox handicap-normalized leg time: removes physical fitness difference between runners
+    const normalizedLegTimeSec = Math.round(
+      legTimeSec * (overallSpeedMs / Math.max(0.5, groupMeanSpeedMs))
+    );
+
+    let eleGainM = 0;
+    let eleLossM = 0;
+    for (let i = startHit.idx + 1; i <= endHit.idx; i++) {
+      const e0 = p.points[i - 1].ele;
+      const e1 = p.points[i].ele;
+      if (e0 !== undefined && e1 !== undefined) {
+        const diff = e1 - e0;
+        if (diff > 0.2) eleGainM += diff;
+        else if (diff < -0.2) eleLossM += -diff;
+      }
+    }
+
+    stats.push({
+      participantId: p.id,
+      name: p.name,
+      color: p.color,
+      tStartSec,
+      tEndSec,
+      legTimeSec,
+      normalizedLegTimeSec,
+      straightDistM,
+      routeDistM,
+      detourPct,
+      avgSpeedMs,
+      overallSpeedMs,
+      paceIndexPct,
+      eleGainM: Math.round(eleGainM),
+      eleLossM: Math.round(eleLossM),
+    });
+  }
+
+  stats.sort((a, b) => a.legTimeSec - b.legTimeSec);
+  return { straightDistM, groupMeanSpeedMs, stats };
+}
+
 export interface InterpolatedState {
   lat: number;
   lon: number;
@@ -398,27 +589,92 @@ export interface InterpolatedState {
 
 /**
  * Interpolate participant position & metrics at race clock `raceTimeSec`.
+ * Supports Livelox speed normalization (`livelox_handicap` and `equal_speed`).
  */
 export function interpolateTrackAt(
   track: ParticipantTrack,
   raceTimeSec: number,
   timeMode: 'from_start' | 'real',
-  eventEpochZeroMs: number
+  eventEpochZeroMs: number,
+  speedNormMode: SpeedNormMode = 'real',
+  referenceSpeedMs = 2.8
 ): InterpolatedState | null {
   const pts = track.points;
   if (pts.length === 0) return null;
 
+  const minT = track.trimStartSec;
+  const maxT = Math.min(track.trimEndSec, track.durationSec);
+  const pStart = findPointAtT(pts, minT);
+
+  // Mode 3: Constant equal speed along each runner's chosen trajectory (shows pure geometry/detour cost)
+  if (speedNormMode === 'equal_speed' && timeMode === 'from_start') {
+    const pEnd = findPointAtT(pts, maxT);
+    const targetDistM =
+      pStart.distM + Math.max(0, raceTimeSec) * Math.max(0.5, referenceSpeedMs);
+    if (raceTimeSec <= 0) {
+      return {
+        lat: pStart.lat,
+        lon: pStart.lon,
+        speedMs: referenceSpeedMs,
+        distM: 0,
+        hr: pStart.hr,
+        ele: pStart.ele,
+        finished: false,
+        notStarted: true,
+      };
+    }
+    if (targetDistM >= pEnd.distM) {
+      return {
+        lat: pEnd.lat,
+        lon: pEnd.lon,
+        speedMs: 0,
+        distM: Math.max(0, pEnd.distM - pStart.distM),
+        hr: pEnd.hr,
+        ele: pEnd.ele,
+        finished: true,
+        notStarted: false,
+      };
+    }
+    let lo = 0;
+    let hi = pts.length - 1;
+    while (lo + 1 < hi) {
+      const mid = (lo + hi) >> 1;
+      if (pts[mid].distM <= targetDistM) lo = mid;
+      else hi = mid;
+    }
+    const p0 = pts[lo];
+    const p1 = pts[hi];
+    const dSpan = p1.distM - p0.distM;
+    const alpha = dSpan > 1e-6 ? (targetDistM - p0.distM) / dSpan : 0;
+    return {
+      lat: p0.lat + (p1.lat - p0.lat) * alpha,
+      lon: p0.lon + (p1.lon - p0.lon) * alpha,
+      speedMs: p0.speedMs + (p1.speedMs - p0.speedMs) * alpha,
+      distM: Math.max(0, targetDistM - pStart.distM),
+      hr: p0.hr ?? p1.hr,
+      ele: p0.ele ?? p1.ele,
+      finished: false,
+      notStarted: false,
+    };
+  }
+
   let localT: number;
   if (timeMode === 'from_start') {
-    localT = raceTimeSec - track.offsetSec + track.trimStartSec;
+    const overallSpeedMs =
+      track.durationSec > 0
+        ? track.totalDistanceM / track.durationSec
+        : referenceSpeedMs;
+    const rateFactor =
+      speedNormMode === 'livelox_handicap' && referenceSpeedMs > 0.3
+        ? overallSpeedMs / referenceSpeedMs
+        : 1;
+    localT =
+      (raceTimeSec - track.offsetSec) * rateFactor + track.trimStartSec;
   } else {
     const targetAbsMs =
       eventEpochZeroMs + (raceTimeSec - track.offsetSec) * 1000;
     localT = (targetAbsMs - pts[0].absTimeMs) / 1000;
   }
-
-  const minT = track.trimStartSec;
-  const maxT = Math.min(track.trimEndSec, track.durationSec);
 
   if (localT <= minT) {
     const p = findPointAtT(pts, minT);
@@ -435,7 +691,6 @@ export function interpolateTrackAt(
   }
   if (localT >= maxT) {
     const p = findPointAtT(pts, maxT);
-    const pStart = findPointAtT(pts, minT);
     return {
       lat: p.lat,
       lon: p.lon,
@@ -461,8 +716,6 @@ export function interpolateTrackAt(
   const p1 = pts[hi];
   const span = p1.t - p0.t;
   const alpha = span > 1e-6 ? (localT - p0.t) / span : 0;
-
-  const pStart = findPointAtT(pts, minT);
 
   return {
     lat: p0.lat + (p1.lat - p0.lat) * alpha,

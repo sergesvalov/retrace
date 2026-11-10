@@ -147,6 +147,10 @@ export const App: React.FC = () => {
       method: 'DELETE',
     });
     if (res.ok) {
+      const url = new URL(window.location.href);
+      url.searchParams.delete('event');
+      window.history.replaceState({}, '', url.toString());
+
       const listRes = await fetch('/api/events');
       const listData = await listRes.json();
       const remaining: EventSummary[] = listData.events ?? [];

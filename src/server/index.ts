@@ -16,12 +16,14 @@ import {
 } from '../shared/georef.js';
 import {
   computeTracksBoundingBox,
+  findClosestPassagePoint,
   normalizeSamplesToTrack,
   parseFitBuffer,
   parseGpxText,
   parseTcxText,
   pickTrackColor,
   syncAllParticipantsToCommonStartSpot,
+  syncAllParticipantsToSpot,
 } from '../shared/trackParser.js';
 import type {
   ControlPoint,
@@ -565,14 +567,71 @@ async function startServer() {
     }
   );
 
-  // Synchronize all participants to depart simultaneously from the common start spot
-  app.post<{ Params: { id: string } }>(
-    '/api/events/:id/sync-start',
+  // Synchronize all participants to depart simultaneously from the common start spot OR any clicked spot on the map
+  app.post<{
+    Params: { id: string };
+    Body?: {
+      spotLon?: number;
+      spotLat?: number;
+      endLon?: number;
+      endLat?: number;
+    };
+  }>('/api/events/:id/sync-start', async (req, reply) => {
+    const evt = eventsStore.get(req.params.id);
+    if (!evt) return reply.code(404).send({ error: 'Событие не найдено' });
+
+    if (
+      req.body?.spotLon !== undefined &&
+      req.body?.spotLat !== undefined
+    ) {
+      syncAllParticipantsToSpot(
+        evt.participants,
+        req.body.spotLon,
+        req.body.spotLat
+      );
+      if (
+        req.body?.endLon !== undefined &&
+        req.body?.endLat !== undefined
+      ) {
+        for (const p of evt.participants) {
+          const endHit = findClosestPassagePoint(
+            p.points,
+            req.body.endLon,
+            req.body.endLat,
+            p.trimStartSec + 3
+          );
+          if (endHit && endHit.pt.t > p.trimStartSec) {
+            p.trimEndSec = Math.min(p.durationSec, Math.ceil(endHit.pt.t));
+          }
+        }
+      }
+    } else {
+      for (const p of evt.participants) {
+        p.trimEndSec = p.durationSec;
+      }
+      syncAllParticipantsToCommonStartSpot(evt.participants);
+    }
+
+    evt.timeMode = 'from_start';
+    await saveEventToDisk(evt);
+    return { event: evt };
+  });
+
+  // Delete map from an event
+  app.delete<{ Params: { id: string } }>(
+    '/api/events/:id/map',
     async (req, reply) => {
       const evt = eventsStore.get(req.params.id);
       if (!evt) return reply.code(404).send({ error: 'Событие не найдено' });
-      syncAllParticipantsToCommonStartSpot(evt.participants);
-      evt.timeMode = 'from_start';
+      if (evt.map?.imageUrl?.startsWith('/uploads/')) {
+        const fileName = path.basename(evt.map.imageUrl);
+        try {
+          await fs.unlink(path.join(UPLOADS_DIR, fileName));
+        } catch {
+          // ignore
+        }
+      }
+      evt.map = undefined;
       await saveEventToDisk(evt);
       return { event: evt };
     }
@@ -583,8 +642,17 @@ async function startServer() {
     '/api/events/:id',
     async (req, reply) => {
       const { id } = req.params;
-      if (!eventsStore.has(id)) {
+      const evt = eventsStore.get(id);
+      if (!evt) {
         return reply.code(404).send({ error: 'Событие не найдено' });
+      }
+      if (evt.map?.imageUrl?.startsWith('/uploads/')) {
+        const fileName = path.basename(evt.map.imageUrl);
+        try {
+          await fs.unlink(path.join(UPLOADS_DIR, fileName));
+        } catch {
+          // ignore
+        }
       }
       eventsStore.delete(id);
       try {
