@@ -26,6 +26,14 @@ const OSM_STYLE: maplibregl.StyleSpecification = {
       tileSize: 256,
       attribution: '© OpenStreetMap contributors',
     },
+    satellite: {
+      type: 'raster',
+      tiles: [
+        'https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}',
+      ],
+      tileSize: 256,
+      attribution: '© Esri World Imagery',
+    },
   },
   layers: [
     {
@@ -34,6 +42,16 @@ const OSM_STYLE: maplibregl.StyleSpecification = {
       source: 'osm',
       minzoom: 0,
       maxzoom: 19,
+    },
+    {
+      id: 'satellite-tiles',
+      type: 'raster',
+      source: 'satellite',
+      minzoom: 0,
+      maxzoom: 19,
+      paint: {
+        'raster-opacity': 0,
+      },
     },
   ],
 };
@@ -49,6 +67,7 @@ export const GeorefWorkspace: React.FC<Props> = ({ event, onEventUpdated }) => {
     py: number;
   } | null>(null);
   const [overlayOpacity, setOverlayOpacity] = useState<number>(0.72);
+  const [useSatelliteBase, setUseSatelliteBase] = useState<boolean>(false);
   const [saving, setSaving] = useState(false);
   const [uploading, setUploading] = useState(false);
 
@@ -69,7 +88,7 @@ export const GeorefWorkspace: React.FC<Props> = ({ event, onEventUpdated }) => {
       ? solveGeoref(gcps, mapObj.width, mapObj.height, transformType)
       : null;
 
-  // Initialize MapLibre right-hand map
+  // Initialize MapLibre right-hand map with Satellite + Hybrid OSM road overlay
   useEffect(() => {
     if (!mapContainerRef.current) return;
     const firstRunnerPt = event.participants[0]?.points[0];
@@ -78,17 +97,23 @@ export const GeorefWorkspace: React.FC<Props> = ({ event, onEventUpdated }) => {
         ? [gcps[0].lon, gcps[0].lat]
         : firstRunnerPt
           ? [firstRunnerPt.lon, firstRunnerPt.lat]
-          : [37.554, 55.6025];
+          : [33.4135, 34.9535];
 
     const map = new maplibregl.Map({
       container: mapContainerRef.current,
       style: OSM_STYLE,
       center: initialCenter,
-      zoom: 14.2,
+      zoom: 15,
     });
 
     map.addControl(new maplibregl.NavigationControl(), 'top-right');
     mapInstanceRef.current = map;
+
+    map.on('load', () => {
+      if (event.participants.length > 0) {
+        fitMapToTracksOrGcps(map, event);
+      }
+    });
 
     return () => {
       map.remove();
@@ -311,11 +336,29 @@ export const GeorefWorkspace: React.FC<Props> = ({ event, onEventUpdated }) => {
   function handleImageClick(e: React.MouseEvent<HTMLImageElement>) {
     if (!imgRef.current || !mapObj) return;
     const rect = imgRef.current.getBoundingClientRect();
+    const actualWidth = imgRef.current.naturalWidth || mapObj.width;
+    const actualHeight = imgRef.current.naturalHeight || mapObj.height;
     const relX = (e.clientX - rect.left) / rect.width;
     const relY = (e.clientY - rect.top) / rect.height;
-    const px = relX * mapObj.width;
-    const py = relY * mapObj.height;
+    const px = relX * actualWidth;
+    const py = relY * actualHeight;
     setPendingPixel({ px, py });
+  }
+
+  function handleImageLoad(e: React.SyntheticEvent<HTMLImageElement>) {
+    const img = e.currentTarget;
+    if (
+      mapObj &&
+      img.naturalWidth > 0 &&
+      img.naturalHeight > 0 &&
+      (mapObj.width !== img.naturalWidth || mapObj.height !== img.naturalHeight)
+    ) {
+      mapObj.width = img.naturalWidth;
+      mapObj.height = img.naturalHeight;
+      if (gcps.length >= 2) {
+        void persistGeoref(gcps, transformType);
+      }
+    }
   }
 
   function removeGcp(id: string) {
@@ -464,6 +507,7 @@ export const GeorefWorkspace: React.FC<Props> = ({ event, onEventUpdated }) => {
                   ref={imgRef}
                   src={mapObj.imageUrl}
                   alt={mapObj.name}
+                  onLoad={handleImageLoad}
                   onClick={handleImageClick}
                   className="max-h-[58vh] w-auto object-contain cursor-crosshair select-none"
                 />
@@ -573,9 +617,44 @@ export const GeorefWorkspace: React.FC<Props> = ({ event, onEventUpdated }) => {
         <div className="lg:col-span-7 flex flex-col relative">
           <div className="px-3 py-1.5 bg-slate-900/60 border-b border-slate-800 flex items-center justify-between text-xs text-slate-400">
             <span>
-              2. Подложка OpenStreetMap + предпросмотр наложенной карты (маркеры
+              2. Подложка + предпросмотр наложенной карты и GPS-треков (маркеры
               можно перетаскивать)
             </span>
+            <div className="flex items-center gap-1.5">
+              <button
+                onClick={() => {
+                  const next = !useSatelliteBase;
+                  setUseSatelliteBase(next);
+                  const m = mapInstanceRef.current;
+                  if (m && m.getLayer('satellite-tiles')) {
+                    m.setPaintProperty(
+                      'satellite-tiles',
+                      'raster-opacity',
+                      next ? 1 : 0
+                    );
+                  }
+                }}
+                className={`px-2 py-0.5 rounded border transition ${
+                  useSatelliteBase
+                    ? 'bg-sky-600 border-sky-400 text-white font-medium'
+                    : 'bg-slate-800 border-slate-700 text-slate-300 hover:text-white'
+                }`}
+              >
+                {useSatelliteBase ? 'Спутник (вкл)' : 'Подложка: Спутник / OSM'}
+              </button>
+              {event.participants.length > 0 && (
+                <button
+                  onClick={() => {
+                    if (mapInstanceRef.current) {
+                      fitMapToTracksOrGcps(mapInstanceRef.current, event);
+                    }
+                  }}
+                  className="px-2 py-0.5 rounded bg-emerald-600/20 border border-emerald-500/40 text-emerald-300 hover:bg-emerald-600/30"
+                >
+                  Показать мои треки
+                </button>
+              )}
+            </div>
           </div>
           <div ref={mapContainerRef} className="flex-1 w-full min-h-[420px]" />
         </div>
@@ -583,4 +662,40 @@ export const GeorefWorkspace: React.FC<Props> = ({ event, onEventUpdated }) => {
     </div>
   );
 };
+
+function fitMapToTracksOrGcps(map: maplibregl.Map, event: RaceEvent) {
+  let minLon = Infinity,
+    maxLon = -Infinity,
+    minLat = Infinity,
+    maxLat = -Infinity;
+  let count = 0;
+
+  for (const p of event.participants) {
+    for (const pt of p.points) {
+      if (pt.lon < minLon) minLon = pt.lon;
+      if (pt.lon > maxLon) maxLon = pt.lon;
+      if (pt.lat < minLat) minLat = pt.lat;
+      if (pt.lat > maxLat) maxLat = pt.lat;
+      count++;
+    }
+  }
+  if (count === 0 && event.map?.gcps) {
+    for (const g of event.map.gcps) {
+      if (g.lon < minLon) minLon = g.lon;
+      if (g.lon > maxLon) maxLon = g.lon;
+      if (g.lat < minLat) minLat = g.lat;
+      if (g.lat > maxLat) maxLat = g.lat;
+      count++;
+    }
+  }
+  if (count >= 2) {
+    map.fitBounds(
+      [
+        [minLon, minLat],
+        [maxLon, maxLat],
+      ],
+      { padding: 50, maxZoom: 16.5, duration: 600 }
+    );
+  }
+}
 

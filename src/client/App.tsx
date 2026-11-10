@@ -40,11 +40,39 @@ export const App: React.FC = () => {
 
     const listRes = await fetch('/api/events');
     const listData = await listRes.json();
-    const summaries: EventSummary[] = listData.events ?? [];
-    setEventsList(summaries);
+    let summaries: EventSummary[] = listData.events ?? [];
 
-    const targetId = eventParam || summaries[0]?.id || 'demo-bitza-2026';
-    await loadEvent(targetId);
+    if (summaries.length === 0) {
+      // Auto-create a clean empty event if none exist yet
+      const createRes = await fetch('/api/events', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ title: 'Тренировка' }),
+      });
+      if (createRes.ok) {
+        const created = await createRes.json();
+        const evt: RaceEvent = created.event;
+        summaries = [
+          {
+            id: evt.id,
+            slug: evt.slug,
+            title: evt.title,
+            description: evt.description,
+            participantCount: 0,
+            hasMap: false,
+          },
+        ];
+      }
+    }
+
+    setEventsList(summaries);
+    const targetId =
+      eventParam && summaries.some((s) => s.id === eventParam || s.slug === eventParam)
+        ? eventParam
+        : summaries[0]?.id;
+    if (targetId) {
+      await loadEvent(targetId);
+    }
   }
 
   async function loadEvent(idOrSlug: string) {

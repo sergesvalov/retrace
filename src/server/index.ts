@@ -5,7 +5,6 @@ import cors from '@fastify/cors';
 import multipart from '@fastify/multipart';
 import fastifyStatic from '@fastify/static';
 import { nanoid } from 'nanoid';
-import { createDemoOrienteeringEvent } from '../shared/demoData.js';
 import {
   autoPlaceScreenshotOnBounds,
   solveGeoref,
@@ -40,8 +39,6 @@ async function ensureDirs() {
 
 async function loadAllEvents(): Promise<Map<string, RaceEvent>> {
   const map = new Map<string, RaceEvent>();
-  const demo = createDemoOrienteeringEvent();
-  map.set(demo.id, demo);
 
   try {
     const files = await fs.readdir(EVENTS_DIR);
@@ -49,6 +46,7 @@ async function loadAllEvents(): Promise<Map<string, RaceEvent>> {
       if (!f.endsWith('.json')) continue;
       const raw = await fs.readFile(path.join(EVENTS_DIR, f), 'utf8');
       const evt = JSON.parse(raw) as RaceEvent;
+      if (evt.id === 'demo-bitza-2026') continue;
       map.set(evt.id, evt);
     }
   } catch {
@@ -384,6 +382,24 @@ async function startServer() {
       evt.timeMode = 'from_start';
       await saveEventToDisk(evt);
       return { event: evt };
+    }
+  );
+
+  // Delete entire event
+  app.delete<{ Params: { id: string } }>(
+    '/api/events/:id',
+    async (req, reply) => {
+      const { id } = req.params;
+      if (!eventsStore.has(id)) {
+        return reply.code(404).send({ error: 'Событие не найдено' });
+      }
+      eventsStore.delete(id);
+      try {
+        await fs.unlink(path.join(EVENTS_DIR, `${id}.json`));
+      } catch {
+        // ignore
+      }
+      return { ok: true };
     }
   );
 
