@@ -1,19 +1,16 @@
 import React, { useEffect, useState } from 'react';
 import {
   Check,
+  Columns2,
   Compass,
   FolderPlus,
-  MapPin,
   Pencil,
   PlayCircle,
   Share2,
   Trash2,
 } from 'lucide-react';
 import type { RaceEvent } from '../shared/types.js';
-import { GeorefWorkspace } from './components/GeorefWorkspace.js';
 import { ReplayWorkspace } from './components/ReplayWorkspace.js';
-
-type ActiveTab = 'replay' | 'georef';
 
 interface EventSummary {
   id: string;
@@ -28,7 +25,7 @@ interface EventSummary {
 export const App: React.FC = () => {
   const [eventsList, setEventsList] = useState<EventSummary[]>([]);
   const [currentEvent, setCurrentEvent] = useState<RaceEvent | null>(null);
-  const [activeTab, setActiveTab] = useState<ActiveTab>('replay');
+  const [twoMapsMode, setTwoMapsMode] = useState<boolean>(true);
   const [copiedSlug, setCopiedSlug] = useState(false);
   const [creatingEvent, setCreatingEvent] = useState(false);
 
@@ -45,7 +42,6 @@ export const App: React.FC = () => {
     let summaries: EventSummary[] = listData.events ?? [];
 
     if (summaries.length === 0) {
-      // Auto-create a clean empty event if none exist yet
       const createRes = await fetch('/api/events', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -69,7 +65,8 @@ export const App: React.FC = () => {
 
     setEventsList(summaries);
     const targetId =
-      eventParam && summaries.some((s) => s.id === eventParam || s.slug === eventParam)
+      eventParam &&
+      summaries.some((s) => s.id === eventParam || s.slug === eventParam)
         ? eventParam
         : summaries[0]?.id;
     if (targetId) {
@@ -105,7 +102,7 @@ export const App: React.FC = () => {
         const data = await res.json();
         const evt: RaceEvent = data.event;
         setCurrentEvent(evt);
-        setActiveTab('georef'); // Open split-view (2 maps) so user can upload & see their map immediately
+        setTwoMapsMode(true);
         await refreshEventsList();
       }
     } finally {
@@ -170,11 +167,15 @@ export const App: React.FC = () => {
     setTimeout(() => setCopiedSlug(false), 2000);
   }
 
+  const activePinCount = (currentEvent?.map?.gcps ?? []).filter(
+    (g) => !g.id.startsWith('gcp-auto-')
+  ).length;
+
   return (
     <div className="flex flex-col h-screen w-screen overflow-hidden bg-slate-950 text-slate-100">
       {/* Top Application Header */}
       <header className="h-14 px-4 bg-slate-900 border-b border-slate-800 flex items-center justify-between gap-4 shrink-0">
-        <div className="flex items-center gap-3 min-w-0">
+        <div className="flex items-center gap-2.5 min-w-0">
           <div className="flex items-center gap-2">
             <div className="w-8 h-8 rounded-xl bg-emerald-500/15 border border-emerald-500/40 flex items-center justify-center text-emerald-400">
               <Compass className="w-5 h-5" />
@@ -183,7 +184,7 @@ export const App: React.FC = () => {
               <span className="font-bold tracking-tight text-white text-base">
                 Retrace
               </span>
-              <span className="hidden sm:inline-block ml-2 text-[11px] px-2 py-0.5 rounded-full bg-slate-800 text-slate-400">
+              <span className="hidden xl:inline-block ml-2 text-[11px] px-2 py-0.5 rounded-full bg-slate-800 text-slate-400">
                 GPS Replay & Map Georef
               </span>
             </div>
@@ -233,35 +234,35 @@ export const App: React.FC = () => {
           </button>
         </div>
 
-        {/* Center Navigation Tabs: Replay vs Map Georeferencing */}
+        {/* Center Mode Switch: 2 Maps (Scan + Track/OSM) vs 1 Combined Map */}
         <div className="flex items-center bg-slate-950 p-1 rounded-xl border border-slate-800">
           <button
-            onClick={() => setActiveTab('replay')}
+            onClick={() => setTwoMapsMode(true)}
             className={`inline-flex items-center gap-1.5 px-3.5 py-1.5 rounded-lg text-xs font-medium transition ${
-              activeTab === 'replay'
+              twoMapsMode
                 ? 'bg-emerald-600 text-white shadow'
                 : 'text-slate-400 hover:text-slate-200'
             }`}
+            title="Слева — скан спортивной карты, справа — карта OSM с твоим GPS-треком и плеером"
           >
-            <PlayCircle className="w-4 h-4" />
-            Реплей и треки ({currentEvent?.participants.length ?? 0})
+            <Columns2 className="w-4 h-4" />2 карты: Скан + Трек/OSM
+            {activePinCount > 0 && (
+              <span className="px-1.5 py-0.2 rounded bg-slate-900/60 text-[10px] text-emerald-200">
+                📌{activePinCount}
+              </span>
+            )}
           </button>
 
           <button
-            onClick={() => setActiveTab('georef')}
+            onClick={() => setTwoMapsMode(false)}
             className={`inline-flex items-center gap-1.5 px-3.5 py-1.5 rounded-lg text-xs font-medium transition ${
-              activeTab === 'georef'
+              !twoMapsMode
                 ? 'bg-emerald-600 text-white shadow'
                 : 'text-slate-400 hover:text-slate-200'
             }`}
+            title="Одна общая карта на весь экран (наложение скана + треки + реплей)"
           >
-            <MapPin className="w-4 h-4" />
-            Привязка карты (GCP)
-            {currentEvent?.map?.rmsErrorM !== undefined && (
-              <span className="px-1.5 py-0.2 rounded bg-slate-900/60 text-[10px] text-emerald-300">
-                ±{currentEvent.map.rmsErrorM}м
-              </span>
-            )}
+            <PlayCircle className="w-4 h-4" />1 общая карта (Реплей)
           </button>
         </div>
 
@@ -292,23 +293,15 @@ export const App: React.FC = () => {
           <div className="flex items-center justify-center h-full text-sm text-slate-400">
             Загрузка события...
           </div>
-        ) : activeTab === 'replay' ? (
+        ) : (
           <ReplayWorkspace
             event={currentEvent}
+            twoMapsMode={twoMapsMode}
+            onToggleTwoMaps={setTwoMapsMode}
             onEventUpdated={(evt) => {
               setCurrentEvent(evt);
               void refreshEventsList();
             }}
-            onSwitchToGeoref={() => setActiveTab('georef')}
-          />
-        ) : (
-          <GeorefWorkspace
-            event={currentEvent}
-            onEventUpdated={(evt) => {
-              setCurrentEvent(evt);
-              void refreshEventsList();
-            }}
-            onSwitchToReplay={() => setActiveTab('replay')}
           />
         )}
       </main>
@@ -317,4 +310,3 @@ export const App: React.FC = () => {
 };
 
 export default App;
-

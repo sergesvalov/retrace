@@ -8,7 +8,9 @@ import { nanoid } from 'nanoid';
 import {
   addPinMapToTrack,
   autoPlaceScreenshotOnBounds,
+  lonLatToMercator,
   nudgeMapMatrix,
+  pixelToLonLat,
   snapMapToTrackByTwoPairs,
   solveGeoref,
 } from '../shared/georef.js';
@@ -289,6 +291,24 @@ async function startServer() {
       evt.map.cornersLonLat = solution.cornersLonLat;
       evt.map.rmsErrorM = solution.rmsErrorM;
       evt.map.rotationDeg = solution.rotationDeg;
+    } else if (gcps.length === 1 && evt.map.matrix) {
+      const g = gcps[0];
+      const [nowLon, nowLat] = pixelToLonLat(evt.map.matrix, g.px, g.py);
+      const [m0x, m0y] = lonLatToMercator(nowLon, nowLat);
+      const [m1x, m1y] = lonLatToMercator(g.lon, g.lat);
+      const nudged = nudgeMapMatrix(
+        evt.map.matrix,
+        evt.map.width,
+        evt.map.height,
+        {
+          dEastM: m1x - m0x,
+          dNorthM: m1y - m0y,
+        }
+      );
+      evt.map.gcps = [{ ...g, residualM: 0 }];
+      evt.map.matrix = nudged.matrix;
+      evt.map.cornersLonLat = nudged.cornersLonLat;
+      evt.map.rmsErrorM = 0;
     } else {
       evt.map.gcps = gcps;
       evt.map.rmsErrorM = undefined;
