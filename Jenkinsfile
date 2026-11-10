@@ -40,9 +40,8 @@ pipeline {
     stages {
         stage('Source Checkout') {
             steps {
-                // Remove any leftover host node_modules or dist from previous builds and fix ownership
-                removeRootOwnedPaths(['node_modules', 'dist', 'tsconfig.tsbuildinfo'])
                 fixWorkspacePermissions()
+                sh 'rm -rf node_modules dist tsconfig.tsbuildinfo'
                 retry(3) {
                     checkout scm
                 }
