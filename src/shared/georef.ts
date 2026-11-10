@@ -1,0 +1,420 @@
+import type { GCP, TransformType } from './types.js';
+
+const EARTH_RADIUS = 6378137.0;
+const MAX_LAT = 85.05112877980659;
+
+/** Convert [lon, lat] in degrees to Web Mercator EPSG:3857 [x, y] in meters */
+export function lonLatToMercator(lon: number, lat: number): [number, number] {
+  const clampedLat = Math.max(-MAX_LAT, Math.min(MAX_LAT, lat));
+  const x = (lon * Math.PI * EARTH_RADIUS) / 180.0;
+  const y =
+    Math.log(Math.tan(((90.0 + clampedLat) * Math.PI) / 360.0)) * EARTH_RADIUS;
+  return [x, y];
+}
+
+/** Convert Web Mercator EPSG:3857 [x, y] in meters to [lon, lat] in degrees */
+export function mercatorToLonLat(x: number, y: number): [number, number] {
+  const lon = (x * 180.0) / (Math.PI * EARTH_RADIUS);
+  const lat =
+    (360.0 * Math.atan(Math.exp(y / EARTH_RADIUS))) / Math.PI - 90.0;
+  return [lon, lat];
+}
+
+/** Ground scale correction factor cos(lat) so Mercator distances become true ground meters */
+export function mercatorGroundFactor(lat: number): number {
+  return Math.cos((lat * Math.PI) / 180.0);
+}
+
+/** Haversine distance in meters between two [lon, lat] points */
+export function haversineDistanceM(
+  lon1: number,
+  lat1: number,
+  lon2: number,
+  lat2: number
+): number {
+  const toRad = Math.PI / 180.0;
+  const dLat = (lat2 - lat1) * toRad;
+  const dLon = (lon2 - lon1) * toRad;
+  const a =
+    Math.sin(dLat / 2) * Math.sin(dLat / 2) +
+    Math.cos(lat1 * toRad) *
+      Math.cos(lat2 * toRad) *
+      Math.sin(dLon / 2) *
+      Math.sin(dLon / 2);
+  return 2 * EARTH_RADIUS * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+}
+
+/**
+ * Solve 3x3 linear system A * x = b using Gaussian elimination with partial pivoting.
+ */
+function solve3x3(A: number[][], b: number[]): [number, number, number] | null {
+  const M = A.map((row, i) => [...row, b[i]]);
+  for (let col = 0; col < 3; col++) {
+    let pivot = col;
+    for (let row = col + 1; row < 3; row++) {
+      if (Math.abs(M[row][col]) > Math.abs(M[pivot][col])) {
+        pivot = row;
+      }
+    }
+    if (Math.abs(M[pivot][col]) < 1e-11) return null;
+    [M[col], M[pivot]] = [M[pivot], M[col]];
+    const div = M[col][col];
+    for (let j = col; j < 4; j++) M[col][j] /= div;
+    for (let row = 0; row < 3; row++) {
+      if (row !== col) {
+        const factor = M[row][col];
+        for (let j = col; j < 4; j++) {
+          M[row][j] -= factor * M[col][j];
+        }
+      }
+    }
+  }
+  return [M[0][3], M[1][3], M[2][3]];
+}
+
+/**
+ * Fit North-Up Scale+Translate transform (3 DOF: isotropic scale s, tx, ty, zero rotation)
+ * Ideal for screenshots from Google Maps / OpenStreetMap / Yandex Maps where North is strictly up:
+ *   X =  s * px + tx
+ *   Y = -s * py + ty
+ * Requires only 2 control points (e.g. start point + 1 landmark, or 2 corners).
+ */
+export function fitNorthUpTransform(
+  gcps: GCP[]
+): [number, number, number, number, number, number] | null {
+  if (gcps.length < 2) return null;
+  const n = gcps.length;
+  const pts = gcps.map((g) => {
+    const [mx, my] = lonLatToMercator(g.lon, g.lat);
+    return { px: g.px, py: g.py, mx, my };
+  });
+
+  let meanPx = 0,
+    meanPy = 0,
+    meanMx = 0,
+    meanMy = 0;
+  for (const p of pts) {
+    meanPx += p.px;
+    meanPy += p.py;
+    meanMx += p.mx;
+    meanMy += p.my;
+  }
+  meanPx /= n;
+  meanPy /= n;
+  meanMx /= n;
+  meanMy /= n;
+
+  let denom = 0;
+  let numS = 0;
+  for (const p of pts) {
+    const u = p.px - meanPx;
+    const v = -(p.py - meanPy);
+    const dx = p.mx - meanMx;
+    const dy = p.my - meanMy;
+    denom += u * u + v * v;
+    numS += u * dx + v * dy;
+  }
+  if (denom < 1e-9) return null;
+  const s = Math.max(1e-6, numS / denom);
+  const tx = meanMx - s * meanPx;
+  const ty = meanMy + s * meanPy;
+  return [s, 0, tx, 0, -s, ty];
+}
+
+/**
+ * Compute initial auto-fit North-Up matrix & corners from the bounding box of GPS tracks
+ * so a newly uploaded Google Maps screenshot immediately lands right on top of the runners' tracks.
+ */
+export function autoPlaceScreenshotOnBounds(
+  width: number,
+  height: number,
+  bounds: { minLon: number; maxLon: number; minLat: number; maxLat: number }
+): {
+  matrix: [number, number, number, number, number, number];
+  cornersLonLat: [
+    [number, number],
+    [number, number],
+    [number, number],
+    [number, number],
+  ];
+  gcps: GCP[];
+} {
+  const [minX, minY] = lonLatToMercator(bounds.minLon, bounds.minLat);
+  const [maxX, maxY] = lonLatToMercator(bounds.maxLon, bounds.maxLat);
+  const centerX = (minX + maxX) / 2;
+  const centerY = (minY + maxY) / 2;
+  const spanX = Math.max(300, (maxX - minX) * 1.35);
+  const spanY = Math.max(300, (maxY - minY) * 1.35);
+
+  const s = Math.max(spanX / width, spanY / height);
+  const tx = centerX - (s * width) / 2;
+  const ty = centerY + (s * height) / 2;
+  const matrix: [number, number, number, number, number, number] = [
+    s,
+    0,
+    tx,
+    0,
+    -s,
+    ty,
+  ];
+
+  const cornersLonLat: [
+    [number, number],
+    [number, number],
+    [number, number],
+    [number, number],
+  ] = [
+    pixelToLonLat(matrix, 0, 0),
+    pixelToLonLat(matrix, width, 0),
+    pixelToLonLat(matrix, width, height),
+    pixelToLonLat(matrix, 0, height),
+  ];
+
+  // Create 2 convenient control points (20% top-left & 80% bottom-right)
+  const p1x = Math.round(width * 0.2);
+  const p1y = Math.round(height * 0.2);
+  const p2x = Math.round(width * 0.8);
+  const p2y = Math.round(height * 0.8);
+  const [lon1, lat1] = pixelToLonLat(matrix, p1x, p1y);
+  const [lon2, lat2] = pixelToLonLat(matrix, p2x, p2y);
+
+  return {
+    matrix,
+    cornersLonLat,
+    gcps: [
+      {
+        id: 'gcp-auto-1',
+        label: 'Точка 1 (СЗ)',
+        px: p1x,
+        py: p1y,
+        lon: Number(lon1.toFixed(6)),
+        lat: Number(lat1.toFixed(6)),
+        residualM: 0,
+      },
+      {
+        id: 'gcp-auto-2',
+        label: 'Точка 2 (ЮВ)',
+        px: p2x,
+        py: p2y,
+        lon: Number(lon2.toFixed(6)),
+        lat: Number(lat2.toFixed(6)),
+        residualM: 0,
+      },
+    ],
+  };
+}
+
+/**
+ * Fit 2D Similarity transform (4 DOF: scale, rotation, tx, ty) in Web Mercator:
+ *   X = a * px - b * py + tx
+ *   Y = b * px + a * py + ty
+ * Returned as 2x3 affine matrix [a, -b, tx, b, a, ty].
+ */
+export function fitSimilarityTransform(
+  gcps: GCP[]
+): [number, number, number, number, number, number] | null {
+  if (gcps.length < 2) return null;
+  const n = gcps.length;
+  const pts = gcps.map((g) => {
+    const [mx, my] = lonLatToMercator(g.lon, g.lat);
+    return { px: g.px, py: g.py, mx, my };
+  });
+
+  let meanPx = 0,
+    meanPy = 0,
+    meanMx = 0,
+    meanMy = 0;
+  for (const p of pts) {
+    meanPx += p.px;
+    meanPy += p.py;
+    meanMx += p.mx;
+    meanMy += p.my;
+  }
+  meanPx /= n;
+  meanPy /= n;
+  meanMx /= n;
+  meanMy /= n;
+
+  // Image Y axis points down, Mercator Y points up -> flip py sign in similarity model
+  // X - meanMx = a * u - b * v
+  // Y - meanMy = b * u + a * v   where u = px - meanPx, v = -(py - meanPy)
+  let denom = 0;
+  let numA = 0;
+  let numB = 0;
+  for (const p of pts) {
+    const u = p.px - meanPx;
+    const v = -(p.py - meanPy);
+    const dx = p.mx - meanMx;
+    const dy = p.my - meanMy;
+    denom += u * u + v * v;
+    numA += u * dx + v * dy;
+    numB += u * dy - v * dx;
+  }
+  if (denom < 1e-9) return null;
+  const a = numA / denom;
+  const b = numB / denom;
+  // Since u = px - meanPx and v = -py + meanPy:
+  // X = a*(px - meanPx) - b*(-py + meanPy) + meanMx = a*px + b*py + (meanMx - a*meanPx - b*meanPy)
+  // Y = b*(px - meanPx) + a*(-py + meanPy) + meanMy = b*px - a*py + (meanMy - b*meanPx + a*meanPy)
+  const m00 = a;
+  const m01 = b;
+  const tx = meanMx - a * meanPx - b * meanPy;
+  const m10 = b;
+  const m11 = -a;
+  const ty = meanMy - b * meanPx + a * meanPy;
+  return [m00, m01, tx, m10, m11, ty];
+}
+
+/**
+ * Fit 2D Affine transform (6 DOF) via Ordinary Least Squares in Web Mercator:
+ *   X = a * px + b * py + tx
+ *   Y = c * px + d * py + ty
+ */
+export function fitAffineTransform(
+  gcps: GCP[]
+): [number, number, number, number, number, number] | null {
+  if (gcps.length < 3) return null;
+
+  let sxx = 0,
+    sxy = 0,
+    sx1 = 0,
+    syy = 0,
+    sy1 = 0;
+  let sxX = 0,
+    syX = 0,
+    s1X = 0;
+  let sxY = 0,
+    syY = 0,
+    s1Y = 0;
+  const n = gcps.length;
+
+  for (const g of gcps) {
+    const [X, Y] = lonLatToMercator(g.lon, g.lat);
+    const x = g.px;
+    const y = g.py;
+    sxx += x * x;
+    sxy += x * y;
+    sx1 += x;
+    syy += y * y;
+    sy1 += y;
+
+    sxX += x * X;
+    syX += y * X;
+    s1X += X;
+
+    sxY += x * Y;
+    syY += y * Y;
+    s1Y += Y;
+  }
+
+  const A = [
+    [sxx, sxy, sx1],
+    [sxy, syy, sy1],
+    [sx1, sy1, n],
+  ];
+  const rowX = solve3x3(A, [sxX, syX, s1X]);
+  const rowY = solve3x3(A, [sxY, syY, s1Y]);
+  if (!rowX || !rowY) return null;
+
+  return [rowX[0], rowX[1], rowX[2], rowY[0], rowY[1], rowY[2]];
+}
+
+/** Apply affine matrix [a, b, tx, c, d, ty] to image pixel (px, py) -> [lon, lat] */
+export function pixelToLonLat(
+  matrix: [number, number, number, number, number, number],
+  px: number,
+  py: number
+): [number, number] {
+  const [a, b, tx, c, d, ty] = matrix;
+  const mx = a * px + b * py + tx;
+  const my = c * px + d * py + ty;
+  return mercatorToLonLat(mx, my);
+}
+
+/** Inverse transform: [lon, lat] -> image pixel [px, py] */
+export function lonLatToPixel(
+  matrix: [number, number, number, number, number, number],
+  lon: number,
+  lat: number
+): [number, number] | null {
+  const [a, b, tx, c, d, ty] = matrix;
+  const det = a * d - b * c;
+  if (Math.abs(det) < 1e-12) return null;
+  const [mx, my] = lonLatToMercator(lon, lat);
+  const dx = mx - tx;
+  const dy = my - ty;
+  const px = (d * dx - b * dy) / det;
+  const py = (-c * dx + a * dy) / det;
+  return [px, py];
+}
+
+export interface GeorefSolution {
+  matrix: [number, number, number, number, number, number];
+  cornersLonLat: [
+    [number, number],
+    [number, number],
+    [number, number],
+    [number, number],
+  ];
+  rmsErrorM: number;
+  rotationDeg: number;
+  gcpsWithResiduals: GCP[];
+}
+
+/**
+ * Compute full georeferencing solution (matrix, 4 corners for MapLibre, RMS error in meters, rotation angle).
+ */
+export function solveGeoref(
+  gcps: GCP[],
+  width: number,
+  height: number,
+  preferredMode: TransformType = 'north_up'
+): GeorefSolution | null {
+  if (gcps.length < 2) return null;
+
+  let matrix: [number, number, number, number, number, number] | null = null;
+  if (preferredMode === 'north_up') {
+    matrix = fitNorthUpTransform(gcps);
+  } else if (preferredMode === 'affine' && gcps.length >= 3) {
+    matrix = fitAffineTransform(gcps) ?? fitSimilarityTransform(gcps);
+  } else {
+    matrix = fitSimilarityTransform(gcps);
+  }
+
+  if (!matrix) return null;
+
+  // MapLibre image source expects [topLeft, topRight, bottomRight, bottomLeft]
+  const cornersLonLat: [
+    [number, number],
+    [number, number],
+    [number, number],
+    [number, number],
+  ] = [
+    pixelToLonLat(matrix, 0, 0),
+    pixelToLonLat(matrix, width, 0),
+    pixelToLonLat(matrix, width, height),
+    pixelToLonLat(matrix, 0, height),
+  ];
+
+  let sumSq = 0;
+  const gcpsWithResiduals: GCP[] = gcps.map((g) => {
+    const [predLon, predLat] = pixelToLonLat(matrix, g.px, g.py);
+    const errM = haversineDistanceM(g.lon, g.lat, predLon, predLat);
+    sumSq += errM * errM;
+    return { ...g, residualM: Math.round(errM * 10) / 10 };
+  });
+
+  const rmsErrorM = Math.round(Math.sqrt(sumSq / gcps.length) * 10) / 10;
+  // Angle of image X-axis relative to East (counter-clockwise deg)
+  const rotationDeg =
+    Math.round(((Math.atan2(matrix[3], matrix[0]) * 180) / Math.PI) * 10) / 10;
+
+  return {
+    matrix,
+    cornersLonLat,
+    rmsErrorM,
+    rotationDeg,
+    gcpsWithResiduals,
+  };
+}
+
