@@ -49,6 +49,31 @@ async function loadAllEvents(): Promise<Map<string, RaceEvent>> {
       const raw = await fs.readFile(path.join(EVENTS_DIR, f), 'utf8');
       const evt = JSON.parse(raw) as RaceEvent;
       if (evt.id === 'demo-bitza-2026') continue;
+
+      // Clean up any legacy auto-generated GCPs that may have polluted manual georeferencing
+      if (evt.map?.gcps?.some((g) => g.id.startsWith('gcp-auto-'))) {
+        const manualGcps = evt.map.gcps.filter(
+          (g) => !g.id.startsWith('gcp-auto-')
+        );
+        evt.map.gcps = manualGcps;
+        if (manualGcps.length >= 2) {
+          const sol = solveGeoref(
+            manualGcps,
+            evt.map.width,
+            evt.map.height,
+            evt.map.transformType ?? 'similarity'
+          );
+          if (sol) {
+            evt.map.gcps = sol.gcpsWithResiduals;
+            evt.map.matrix = sol.matrix;
+            evt.map.cornersLonLat = sol.cornersLonLat;
+            evt.map.rmsErrorM = sol.rmsErrorM;
+            evt.map.rotationDeg = sol.rotationDeg;
+          }
+        }
+        await saveEventToDisk(evt);
+      }
+
       map.set(evt.id, evt);
     }
   } catch {
@@ -210,11 +235,11 @@ async function startServer() {
         imageUrl: `/uploads/${fileId}`,
         width,
         height,
-        gcps: autoPlaced.gcps,
+        gcps: [],
         transformType: 'similarity',
         matrix: autoPlaced.matrix,
         cornersLonLat: autoPlaced.cornersLonLat,
-        rmsErrorM: 0,
+        rmsErrorM: undefined,
         rotationDeg: 0,
       };
 
@@ -241,8 +266,11 @@ async function startServer() {
         .send({ error: 'Событие или карта ещё не загружены' });
     }
 
-    const gcps = req.body.gcps ?? [];
-    const transformType: TransformType = req.body.transformType ?? 'affine';
+    const gcps = (req.body.gcps ?? []).filter(
+      (g) => !g.id.startsWith('gcp-auto-')
+    );
+    const transformType: TransformType =
+      req.body.transformType ?? 'similarity';
     if (req.body.width) evt.map.width = req.body.width;
     if (req.body.height) evt.map.height = req.body.height;
     evt.map.transformType = transformType;
@@ -262,8 +290,6 @@ async function startServer() {
       evt.map.rotationDeg = solution.rotationDeg;
     } else {
       evt.map.gcps = gcps;
-      evt.map.matrix = undefined;
-      evt.map.cornersLonLat = undefined;
       evt.map.rmsErrorM = undefined;
     }
 
@@ -393,7 +419,7 @@ async function startServer() {
         evt.participants.push(participant);
         syncAllParticipantsToCommonStartSpot(evt.participants);
 
-        // If map was uploaded before any tracks existed (still on auto-placed default bounds), move it onto the tracks!
+        // If map was uploaded before any tracks existed and was not manually georeferenced yet, move it onto the tracks!
         if (
           evt.map &&
           (!evt.map.matrix ||
@@ -407,7 +433,6 @@ async function startServer() {
               evt.map.height,
               trackBounds
             );
-            evt.map.gcps = autoPlaced.gcps;
             evt.map.matrix = autoPlaced.matrix;
             evt.map.cornersLonLat = autoPlaced.cornersLonLat;
           }

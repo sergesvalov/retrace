@@ -41,6 +41,7 @@ import type {
 interface Props {
   event: RaceEvent;
   onEventUpdated: (evt: RaceEvent) => void;
+  onSwitchToGeoref?: () => void;
 }
 
 const SPEED_OPTIONS = [1, 2, 5, 10, 20, 40, 60];
@@ -51,7 +52,11 @@ const TAIL_OPTIONS = [
   { label: 'Весь путь', value: 999999 },
 ];
 
-export const ReplayWorkspace: React.FC<Props> = ({ event, onEventUpdated }) => {
+export const ReplayWorkspace: React.FC<Props> = ({
+  event,
+  onEventUpdated,
+  onSwitchToGeoref,
+}) => {
   const [isPlaying, setIsPlaying] = useState<boolean>(false);
   const [playbackRate, setPlaybackRate] = useState<number>(10);
   const [raceTimeSec, setRaceTimeSec] = useState<number>(0); // Start right at 00:00 at the common start spot
@@ -83,6 +88,7 @@ export const ReplayWorkspace: React.FC<Props> = ({ event, onEventUpdated }) => {
 
   const mapContainerRef = useRef<HTMLDivElement | null>(null);
   const mapRef = useRef<maplibregl.Map | null>(null);
+  const mapReadyRef = useRef<boolean>(false);
   const runnerMarkersRef = useRef<Map<string, maplibregl.Marker>>(new Map());
   const rafRef = useRef<number | null>(null);
   const lastFrameMsRef = useRef<number | null>(null);
@@ -197,8 +203,10 @@ export const ReplayWorkspace: React.FC<Props> = ({ event, onEventUpdated }) => {
 
     map.addControl(new maplibregl.NavigationControl(), 'top-right');
     mapRef.current = map;
+    mapReadyRef.current = false;
 
     map.on('load', () => {
+      mapReadyRef.current = true;
       // 1. Georeferenced custom map overlay
       if (event.map?.cornersLonLat) {
         map.addSource('custom-map', {
@@ -270,9 +278,44 @@ export const ReplayWorkspace: React.FC<Props> = ({ event, onEventUpdated }) => {
           'circle-stroke-color': '#ffffff',
         },
       });
+
+      // Fit camera to georeferenced map or tracks so both maps are visible immediately
+      let minLon = Infinity,
+        maxLon = -Infinity,
+        minLat = Infinity,
+        maxLat = -Infinity;
+      let count = 0;
+      if (event.map?.cornersLonLat) {
+        for (const [lon, lat] of event.map.cornersLonLat) {
+          if (lon < minLon) minLon = lon;
+          if (lon > maxLon) maxLon = lon;
+          if (lat < minLat) minLat = lat;
+          if (lat > maxLat) maxLat = lat;
+          count++;
+        }
+      }
+      for (const p of event.participants) {
+        for (const pt of p.points) {
+          if (pt.lon < minLon) minLon = pt.lon;
+          if (pt.lon > maxLon) maxLon = pt.lon;
+          if (pt.lat < minLat) minLat = pt.lat;
+          if (pt.lat > maxLat) maxLat = pt.lat;
+          count++;
+        }
+      }
+      if (count >= 2) {
+        map.fitBounds(
+          [
+            [minLon, minLat],
+            [maxLon, maxLat],
+          ],
+          { padding: 50, maxZoom: 16, duration: 400 }
+        );
+      }
     });
 
     return () => {
+      mapReadyRef.current = false;
       for (const m of runnerMarkersRef.current.values()) m.remove();
       runnerMarkersRef.current.clear();
       map.remove();
@@ -283,7 +326,7 @@ export const ReplayWorkspace: React.FC<Props> = ({ event, onEventUpdated }) => {
   // Update raster opacities when sliders change
   useEffect(() => {
     const map = mapRef.current;
-    if (!map || !map.isStyleLoaded()) return;
+    if (!map || !mapReadyRef.current) return;
     if (map.getLayer('osm-base')) {
       map.setPaintProperty('osm-base', 'raster-opacity', osmOpacity);
     }
@@ -295,7 +338,7 @@ export const ReplayWorkspace: React.FC<Props> = ({ event, onEventUpdated }) => {
   // Update custom map if georef or uploaded screenshot changed
   useEffect(() => {
     const map = mapRef.current;
-    if (!map || !map.isStyleLoaded() || !event.map?.cornersLonLat) return;
+    if (!map || !mapReadyRef.current || !event.map?.cornersLonLat) return;
     const src = map.getSource('custom-map') as
       | maplibregl.ImageSource
       | undefined;
@@ -320,12 +363,40 @@ export const ReplayWorkspace: React.FC<Props> = ({ event, onEventUpdated }) => {
         'ghost-tracks-layer'
       );
     }
+
+    // If the georeferenced map is outside the current camera view, fly to it automatically
+    const corners = event.map.cornersLonLat;
+    const mapCenterLon = (corners[0][0] + corners[2][0]) / 2;
+    const mapCenterLat = (corners[0][1] + corners[2][1]) / 2;
+    const viewCenter = map.getCenter();
+    if (
+      Math.abs(viewCenter.lng - mapCenterLon) > 0.03 ||
+      Math.abs(viewCenter.lat - mapCenterLat) > 0.03
+    ) {
+      let minLon = Infinity,
+        maxLon = -Infinity,
+        minLat = Infinity,
+        maxLat = -Infinity;
+      for (const [lon, lat] of corners) {
+        if (lon < minLon) minLon = lon;
+        if (lon > maxLon) maxLon = lon;
+        if (lat < minLat) minLat = lat;
+        if (lat > maxLat) maxLat = lat;
+      }
+      map.fitBounds(
+        [
+          [minLon, minLat],
+          [maxLon, maxLat],
+        ],
+        { padding: 50, maxZoom: 16, duration: 500 }
+      );
+    }
   }, [event.map]);
 
   // Update ghost tracks & common start marker when participants list changes
   useEffect(() => {
     const map = mapRef.current;
-    if (!map || !map.isStyleLoaded()) return;
+    if (!map || !mapReadyRef.current) return;
     const src = map.getSource('ghost-tracks') as
       | maplibregl.GeoJSONSource
       | undefined;
@@ -744,6 +815,17 @@ export const ReplayWorkspace: React.FC<Props> = ({ event, onEventUpdated }) => {
               <Flame className="w-3.5 h-3.5" />
               Темп-хитмап
             </button>
+
+            {onSwitchToGeoref && (
+              <button
+                onClick={onSwitchToGeoref}
+                className="inline-flex items-center gap-1 px-2.5 py-1 rounded-lg bg-sky-600/25 hover:bg-sky-600/35 border border-sky-400/50 text-sky-200 font-medium transition"
+                title="Открыть двухпанельный режим: слева скан карты, справа OpenStreetMap"
+              >
+                <Crosshair className="w-3.5 h-3.5" />
+                Привязка к OSM (2 карты)
+              </button>
+            )}
 
             {event.map && (
               <button

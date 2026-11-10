@@ -299,6 +299,7 @@ export const App: React.FC = () => {
               setCurrentEvent(evt);
               void refreshEventsList();
             }}
+            onSwitchToGeoref={() => setActiveTab('georef')}
           />
         ) : (
           <GeorefWorkspace
@@ -307,6 +308,7 @@ export const App: React.FC = () => {
               setCurrentEvent(evt);
               void refreshEventsList();
             }}
+            onSwitchToReplay={() => setActiveTab('replay')}
           />
         )}
       </main>
