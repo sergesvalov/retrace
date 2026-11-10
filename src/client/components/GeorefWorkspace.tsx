@@ -97,13 +97,13 @@ export const GeorefWorkspace: React.FC<Props> = ({ event, onEventUpdated }) => {
         ? [gcps[0].lon, gcps[0].lat]
         : firstRunnerPt
           ? [firstRunnerPt.lon, firstRunnerPt.lat]
-          : [33.4135, 34.9535];
+          : [32.4245, 34.772];
 
     const map = new maplibregl.Map({
       container: mapContainerRef.current,
       style: OSM_STYLE,
       center: initialCenter,
-      zoom: 15,
+      zoom: 13.5,
     });
 
     map.addControl(new maplibregl.NavigationControl(), 'top-right');

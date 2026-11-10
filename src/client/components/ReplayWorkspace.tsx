@@ -139,7 +139,7 @@ export const ReplayWorkspace: React.FC<Props> = ({ event, onEventUpdated }) => {
             event.participants[0].points[0].lon,
             event.participants[0].points[0].lat,
           ]
-        : [33.4135, 34.9535];
+        : [32.4245, 34.772];
 
     const map = new maplibregl.Map({
       container: mapContainerRef.current,
