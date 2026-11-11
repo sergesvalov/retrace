@@ -6,6 +6,11 @@ import multipart from '@fastify/multipart';
 import {
   addPinMapToTrack,
   autoPlaceScreenshotOnBounds,
+  boundsForViewShare,
+  boundsOverlap,
+  matrixBounds,
+  translateMatrixCenterTo,
+  type LonLatBounds,
   lonLatToMercator,
   matrixToCorners,
   nudgeMapMatrix,
@@ -135,6 +140,45 @@ function isUsableMatrix(m: number[] | undefined): boolean {
   }
   const [a, b, , c, d] = m;
   return Math.abs(a * d - b * c) > 1e-6;
+}
+
+/** Screen bounds sent by the client (JSON string in multipart, object in JSON bodies) */
+function parseViewBounds(raw: unknown): LonLatBounds | null {
+  let v: unknown = raw;
+  if (typeof raw === 'string') {
+    try {
+      v = JSON.parse(raw);
+    } catch {
+      return null;
+    }
+  }
+  if (!v || typeof v !== 'object') return null;
+  const b = v as Partial<LonLatBounds>;
+  const ok =
+    [b.minLon, b.maxLon, b.minLat, b.maxLat].every(
+      (n) => typeof n === 'number' && Number.isFinite(n)
+    ) &&
+    b.minLon! < b.maxLon! &&
+    b.minLat! < b.maxLat! &&
+    Math.abs(b.minLat!) <= 85 &&
+    Math.abs(b.maxLat!) <= 85;
+  return ok ? (b as LonLatBounds) : null;
+}
+
+/**
+ * Where an auto-placed map goes: over the tracks if there are any, otherwise in the middle
+ * of the user's screen. Only an old client sending neither lands on the fallback spot.
+ */
+function placementBounds(evt: RaceEvent, view: LonLatBounds | null): LonLatBounds {
+  return (
+    computeTracksBoundingBox(evt.participants) ??
+    (view ? boundsForViewShare(view) : null) ?? {
+      minLon: 32.415,
+      maxLon: 32.435,
+      minLat: 34.765,
+      maxLat: 34.78,
+    }
+  );
 }
 
 /** Validate and copy client-editable map metadata; returns an error message or null */
@@ -343,15 +387,15 @@ async function startServer() {
           ? Math.round(dpiField)
           : undefined;
 
-      const trackBounds = computeTracksBoundingBox(evt.participants) ?? {
-        minLon: 32.415,
-        maxLon: 32.435,
-        minLat: 34.765,
-        maxLat: 34.78,
-        startLon: 32.4245,
-        startLat: 34.772,
-      };
-      const autoPlaced = autoPlaceScreenshotOnBounds(width, height, trackBounds);
+      // No tracks yet: put the map in the middle of what the user is looking at
+      const viewBounds = parseViewBounds(
+        (data.fields?.view as { value?: string } | undefined)?.value
+      );
+      const autoPlaced = autoPlaceScreenshotOnBounds(
+        width,
+        height,
+        placementBounds(evt, viewBounds)
+      );
 
       const mapOverlay: MapOverlay = {
         id: makeId(8),
@@ -463,6 +507,8 @@ async function startServer() {
       undoLastPin?: boolean;
       clearPins?: boolean;
       meta?: MapOverlayMeta;
+      /** Current screen bounds: where "reset" puts the map when there are no tracks */
+      view?: LonLatBounds;
     };
   }>('/api/events/:id/map-nudge', async (req, reply) => {
     const evt = eventsStore.get(req.params.id);
@@ -472,21 +518,11 @@ async function startServer() {
 
     const previousMap = structuredClone(evt.map);
 
-    const defaultBounds = () =>
-      computeTracksBoundingBox(evt.participants) ?? {
-        minLon: 32.415,
-        maxLon: 32.435,
-        minLat: 34.765,
-        maxLat: 34.78,
-        startLon: 32.4245,
-        startLat: 34.772,
-      };
-
     if (!evt.map.matrix || req.body.resetAutoFit) {
       const init = autoPlaceScreenshotOnBounds(
         evt.map.width,
         evt.map.height,
-        defaultBounds()
+        placementBounds(evt, parseViewBounds(req.body.view))
       );
       evt.map.matrix = init.matrix;
       evt.map.cornersLonLat = init.cornersLonLat;
@@ -651,6 +687,22 @@ async function startServer() {
             );
             evt.map.matrix = autoPlaced.matrix;
             evt.map.cornersLonLat = autoPlaced.cornersLonLat;
+          }
+        } else if (evt.map?.matrix) {
+          // A hand-placed map nowhere near the tracks (e.g. placed before any track was
+          // loaded) is moved onto them; its scale and rotation are kept
+          const trackBounds = computeTracksBoundingBox(evt.participants);
+          const mapB = matrixBounds(evt.map.matrix, evt.map.width, evt.map.height);
+          if (trackBounds && !boundsOverlap(trackBounds, mapB)) {
+            const m = translateMatrixCenterTo(
+              evt.map.matrix,
+              evt.map.width,
+              evt.map.height,
+              (trackBounds.minLon + trackBounds.maxLon) / 2,
+              (trackBounds.minLat + trackBounds.maxLat) / 2
+            );
+            evt.map.matrix = m;
+            evt.map.cornersLonLat = matrixToCorners(m, evt.map.width, evt.map.height);
           }
         }
 

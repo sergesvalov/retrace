@@ -377,6 +377,72 @@ export function nudgeMapMatrix(
   return { matrix: nextMatrix, cornersLonLat };
 }
 
+export interface LonLatBounds {
+  minLon: number;
+  maxLon: number;
+  minLat: number;
+  maxLat: number;
+}
+
+/** Shift a placement (scale and rotation unchanged) so the image centre lands on `lon`,`lat` */
+export function translateMatrixCenterTo(
+  matrix: [number, number, number, number, number, number],
+  width: number,
+  height: number,
+  lon: number,
+  lat: number
+): [number, number, number, number, number, number] {
+  const [a, b, , c, d] = matrix;
+  const [mx, my] = lonLatToMercator(lon, lat);
+  const cx = width / 2;
+  const cy = height / 2;
+  return [a, b, mx - (a * cx + b * cy), c, d, my - (c * cx + d * cy)];
+}
+
+/** Lon/lat bounding box of the four image corners under a placement */
+export function matrixBounds(
+  matrix: [number, number, number, number, number, number],
+  width: number,
+  height: number
+): LonLatBounds {
+  const corners = matrixToCorners(matrix, width, height);
+  const lons = corners.map((c) => c[0]);
+  const lats = corners.map((c) => c[1]);
+  return {
+    minLon: Math.min(...lons),
+    maxLon: Math.max(...lons),
+    minLat: Math.min(...lats),
+    maxLat: Math.max(...lats),
+  };
+}
+
+export function boundsOverlap(a: LonLatBounds, b: LonLatBounds): boolean {
+  return (
+    a.minLon <= b.maxLon &&
+    b.minLon <= a.maxLon &&
+    a.minLat <= b.maxLat &&
+    b.minLat <= a.maxLat
+  );
+}
+
+/**
+ * Bounds for `autoPlaceScreenshotOnBounds` that make the image cover about `share` of the
+ * given view (that function pads its input by 1.75×).
+ */
+export function boundsForViewShare(view: LonLatBounds, share = 0.7): LonLatBounds {
+  const k = share / 1.75 / 2;
+  const cLon = (view.minLon + view.maxLon) / 2;
+  const cLat = (view.minLat + view.maxLat) / 2;
+  const hLon = (view.maxLon - view.minLon) * k;
+  const hLat = (view.maxLat - view.minLat) * k;
+  return {
+    minLon: cLon - hLon,
+    maxLon: cLon + hLon,
+    minLat: cLat - hLat,
+    maxLat: cLat + hLat,
+  };
+}
+
 /** Ground metres per image pixel of a scan printed at 1:`printScale` and scanned at `dpi` */
 export function groundMetersPerPixelFromPrint(
   printScale: number,

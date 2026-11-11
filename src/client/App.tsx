@@ -3,9 +3,7 @@ import {
   Check,
   Compass,
   FolderPlus,
-  Move,
   Pencil,
-  PlayCircle,
   Share2,
   Trash2,
 } from 'lucide-react';
@@ -35,8 +33,8 @@ export const App: React.FC = () => {
   const [copiedSlug, setCopiedSlug] = useState(false);
   const [creatingEvent, setCreatingEvent] = useState(false);
   const [dialog, setDialog] = useState<'create' | 'edit' | null>(null);
-  const isOrienteering =
-    currentEvent !== null && eventKindOf(currentEvent) === 'orienteering';
+  const [listLoaded, setListLoaded] = useState(false);
+  const [newEventKind, setNewEventKind] = useState<EventKind>('orienteering');
 
   // StrictMode runs effects twice in dev: without the guard two "Тренировка" events get created
   const initStartedRef = useRef(false);
@@ -59,31 +57,10 @@ export const App: React.FC = () => {
 
     const listRes = await fetch('/api/events');
     const listData = await listRes.json();
-    let summaries: EventSummary[] = listData.events ?? [];
-
-    if (summaries.length === 0) {
-      const createRes = await fetch('/api/events', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ title: 'Тренировка' }),
-      });
-      if (createRes.ok) {
-        const created = await createRes.json();
-        const evt: RaceEvent = created.event;
-        summaries = [
-          {
-            id: evt.id,
-            slug: evt.slug,
-            title: evt.title,
-            description: evt.description,
-            participantCount: 0,
-            hasMap: false,
-          },
-        ];
-      }
-    }
-
+    const summaries: EventSummary[] = listData.events ?? [];
     setEventsList(summaries);
+    setListLoaded(true);
+    // No events: the start screen offers to create one (nothing is created behind the user's back)
     const targetId =
       eventParam &&
       summaries.some((s) => s.id === eventParam || s.slug === eventParam)
@@ -165,11 +142,11 @@ export const App: React.FC = () => {
       const listRes = await fetch('/api/events');
       const listData = await listRes.json();
       const remaining: EventSummary[] = listData.events ?? [];
+      setEventsList(remaining);
       if (remaining.length > 0) {
-        setEventsList(remaining);
         await loadEvent(remaining[0].id);
       } else {
-        await initApp();
+        setCurrentEvent(null);
       }
     }
   }
@@ -185,7 +162,7 @@ export const App: React.FC = () => {
   return (
     <div className="flex flex-col h-screen w-screen overflow-hidden bg-slate-950 text-slate-100">
       {/* Top Application Header */}
-      <header className="h-14 px-4 bg-slate-900 border-b border-slate-800 flex items-center justify-between gap-4 shrink-0 z-20">
+      <header className="h-12 px-3 bg-slate-900 border-b border-slate-800 flex items-center justify-between gap-4 shrink-0 z-20">
         <div className="flex items-center gap-2.5 min-w-0">
           <div className="flex items-center gap-2">
             <div className="w-8 h-8 rounded-xl bg-emerald-500/15 border border-emerald-500/40 flex items-center justify-center text-emerald-400">
@@ -236,7 +213,10 @@ export const App: React.FC = () => {
           </button>
 
           <button
-            onClick={() => setDialog('create')}
+            onClick={() => {
+              setNewEventKind('orienteering');
+              setDialog('create');
+            }}
             disabled={creatingEvent}
             className="inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 border border-slate-700 text-xs text-slate-200 transition"
             title="Создать новое мероприятие"
@@ -245,36 +225,6 @@ export const App: React.FC = () => {
             <span className="hidden md:inline">Новое событие</span>
           </button>
         </div>
-
-        {/* Center Mode Switch: Replay vs Interactive Map Fit (orienteering maps only) */}
-        {isOrienteering && (
-        <div className="flex items-center bg-slate-950 p-1 rounded-xl border border-slate-800">
-          <button
-            onClick={() => setFitMapMode(false)}
-            className={`inline-flex items-center gap-1.5 px-3.5 py-1.5 rounded-lg text-xs font-medium transition ${
-              !fitMapMode
-                ? 'bg-emerald-600 text-white shadow'
-                : 'text-slate-400 hover:text-slate-200'
-            }`}
-          >
-            <PlayCircle className="w-4 h-4" />
-            Реплей и анализ
-          </button>
-
-          <button
-            onClick={() => setFitMapMode(true)}
-            className={`inline-flex items-center gap-1.5 px-3.5 py-1.5 rounded-lg text-xs font-medium transition ${
-              fitMapMode
-                ? 'bg-amber-500 text-slate-950 font-semibold shadow'
-                : 'text-slate-400 hover:text-slate-200'
-            }`}
-            title="Перетаскивай карту мышкой прямо под GPS-трек и крути ползунки масштаба/поворота вокруг Старта"
-          >
-            <Move className="w-4 h-4" />
-            ✋ Подогнать карту мышкой
-          </button>
-        </div>
-        )}
 
         {/* Share event button */}
         <div className="flex items-center gap-2">
@@ -300,9 +250,32 @@ export const App: React.FC = () => {
       {/* Main Workspace Body */}
       <main className="flex-1 min-h-0">
         {!currentEvent ? (
-          <div className="flex items-center justify-center h-full text-sm text-slate-400">
-            Загрузка события...
-          </div>
+          listLoaded && eventsList.length === 0 ? (
+            <div className="flex flex-col items-center justify-center h-full gap-4 p-6 text-center">
+              <div className="text-lg font-semibold text-white">Создайте первое событие</div>
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 max-w-xl w-full">
+                {(Object.keys(EVENT_KIND_INFO) as EventKind[]).map((k) => (
+                  <button
+                    key={k}
+                    onClick={() => {
+                      setNewEventKind(k);
+                      setDialog('create');
+                    }}
+                    className="text-left p-4 rounded-2xl bg-slate-900 border border-slate-700 hover:border-emerald-500 transition"
+                  >
+                    <div className="text-base font-semibold text-white">
+                      {EVENT_KIND_INFO[k].icon} {EVENT_KIND_INFO[k].label}
+                    </div>
+                    <div className="mt-1 text-xs text-slate-400">{EVENT_KIND_INFO[k].hint}</div>
+                  </button>
+                ))}
+              </div>
+            </div>
+          ) : (
+            <div className="flex items-center justify-center h-full text-sm text-slate-400">
+              Загрузка события...
+            </div>
+          )
         ) : (
           <ReplayWorkspace
             event={currentEvent}
@@ -319,6 +292,7 @@ export const App: React.FC = () => {
       {dialog === 'create' && (
         <EventDialog
           mode="create"
+          initialKind={newEventKind}
           busy={creatingEvent}
           onSubmit={(v) => void handleCreateNewEvent(v)}
           onCancel={() => setDialog(null)}

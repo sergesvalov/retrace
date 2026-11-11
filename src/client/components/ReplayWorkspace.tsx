@@ -2,11 +2,6 @@ import React, { useEffect, useMemo, useRef, useState } from 'react';
 import maplibregl from 'maplibre-gl';
 import {
   Activity,
-  Anchor,
-  ArrowDown,
-  ArrowLeft,
-  ArrowRight,
-  ArrowUp,
   Check,
   Clock,
   Eye,
@@ -14,17 +9,16 @@ import {
   Flag,
   Flame,
   Gauge,
-  Globe,
   Heart,
   ImagePlus,
   Layers,
+  LocateFixed,
   Move,
   Navigation,
   Pause,
   Play,
   Plus,
   RotateCcw,
-  RotateCw,
   Trash2,
   Zap,
 } from 'lucide-react';
@@ -34,6 +28,9 @@ import {
   groundMetersPerPixelFromScaleBar,
   lonLatToMercator,
   lonLatToPixel,
+  matrixBounds,
+  translateMatrixCenterTo,
+  type LonLatBounds,
   matrixGroundMetersPerPixel,
   matrixToCorners,
   matrixUpBearingDeg,
@@ -68,6 +65,7 @@ import {
 import { readImageDpi } from '../imageDpi.js';
 import { useCourseOverlay } from './useCourseOverlay.js';
 import { SplitsPanel } from './SplitsPanel.js';
+import { FitPanel } from './FitPanel.js';
 
 const BASE_LAYERS: readonly BaseLayer[] = ['topo', 'osm', 'satellite'];
 const BASE_LAYER_LABELS: Record<BaseLayer, string> = {
@@ -78,12 +76,6 @@ const BASE_LAYER_LABELS: Record<BaseLayer, string> = {
 /** Runs/hikes live on the base map, so default to the one with contours and trails */
 function defaultBaseLayerFor(kind: EventKind): BaseLayer {
   return kind === 'run' ? 'topo' : 'osm';
-}
-const PRINT_SCALES = [4000, 5000, 7500, 10000, 15000];
-
-function formatSignedDeg(deg: number): string {
-  const r = Math.round(deg * 10) / 10;
-  return `${r > 0 ? '+' : ''}${r}°`;
 }
 
 interface Props {
@@ -126,6 +118,7 @@ export const ReplayWorkspace: React.FC<Props> = ({
   const [uploadingScreenshot, setUploadingScreenshot] =
     useState<boolean>(false);
   const [uploadError, setUploadError] = useState<string | null>(null);
+  const [dropActive, setDropActive] = useState<boolean>(false);
 
   // Interactive Map Fitting state (drag map directly with mouse + sliders around Start anchor)
   const [dragMovesMap, setDragMovesMap] = useState<boolean>(true);
@@ -1146,11 +1139,55 @@ export const ReplayWorkspace: React.FC<Props> = ({
     applyScaleAndNorth(mpp);
   }
 
+  /** What the user is looking at: where a map without tracks should appear */
+  function currentViewBounds(): LonLatBounds | null {
+    const b = mapRef.current?.getBounds();
+    if (!b) return null;
+    return {
+      minLon: b.getWest(),
+      maxLon: b.getEast(),
+      minLat: Math.max(-85, b.getSouth()),
+      maxLat: Math.min(85, b.getNorth()),
+    };
+  }
+
+  /** Fly to the uploaded map wherever it is */
+  function showUploadedMap() {
+    const map = mapRef.current;
+    const m = eventRef.current.map;
+    if (!map || !m?.matrix) return;
+    const b = matrixBounds(liveMatrixRef.current ?? m.matrix, m.width, m.height);
+    map.fitBounds(
+      [
+        [b.minLon, b.minLat],
+        [b.maxLon, b.maxLat],
+      ],
+      { padding: 40, duration: 600 }
+    );
+  }
+
+  /** Bring a map that ended up elsewhere into the middle of the screen (scale/rotation kept) */
+  function moveMapToViewCenter() {
+    const map = mapRef.current;
+    const meta = eventRef.current.map;
+    const current = liveMatrixRef.current ?? meta?.matrix;
+    if (!map || !meta || !current) return;
+    const c = map.getCenter();
+    const next = translateMatrixCenterTo(current, meta.width, meta.height, c.lng, c.lat);
+    liveMatrixRef.current = next;
+    (map.getSource('custom-map') as maplibregl.ImageSource | undefined)?.setCoordinates(
+      matrixToCorners(next, meta.width, meta.height)
+    );
+    syncCourseToMatrix(next);
+    setAnchorLonLat(null);
+    void saveMatrixToServer(next);
+  }
+
   async function handleResetMapAutoFit() {
     const res = await fetch(`/api/events/${event.id}/map-nudge`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ resetAutoFit: true }),
+      body: JSON.stringify({ resetAutoFit: true, view: currentViewBounds() }),
     });
     if (res.ok) {
       const data = await res.json();
@@ -1388,14 +1425,19 @@ export const ReplayWorkspace: React.FC<Props> = ({
   }
 
   async function handleTrackUpload(e: React.ChangeEvent<HTMLInputElement>) {
-    const files = e.target.files;
-    if (!files || files.length === 0) return;
+    const files = Array.from(e.target.files ?? []);
+    e.target.value = '';
+    await uploadTrackFiles(files);
+  }
+
+  async function uploadTrackFiles(files: File[]) {
+    if (files.length === 0) return;
     setUploadingTrack(true);
     setUploadError(null);
 
     try {
       let latestEvent = event;
-      for (const file of Array.from(files)) {
+      for (const file of files) {
         const form = new FormData();
         form.append('file', file);
         const res = await fetch(`/api/events/${event.id}/tracks`, {
@@ -1413,9 +1455,10 @@ export const ReplayWorkspace: React.FC<Props> = ({
       if (mapRef.current) {
         fitMapToTracksOrMap(mapRef.current, latestEvent);
       }
+    } catch {
+      setUploadError('Не удалось загрузить трек (нет связи с сервером)');
     } finally {
       setUploadingTrack(false);
-      e.target.value = '';
     }
   }
 
@@ -1423,7 +1466,26 @@ export const ReplayWorkspace: React.FC<Props> = ({
     e: React.ChangeEvent<HTMLInputElement>
   ) {
     const file = e.target.files?.[0];
-    if (!file) return;
+    e.target.value = '';
+    if (file) await uploadMapFile(file);
+  }
+
+  /** Files dropped anywhere on the workspace: tracks by extension, an image as the map */
+  async function handleDroppedFiles(files: File[]) {
+    const tracks = files.filter((f) => /\.(gpx|fit|tcx)$/i.test(f.name));
+    const image = files.find((f) => f.type.startsWith('image/'));
+    const ignored = files.length - tracks.length - (image ? 1 : 0);
+    if (tracks.length > 0) await uploadTrackFiles(tracks);
+    if (image) {
+      if (isOrienteering) await uploadMapFile(image);
+      else setUploadError('Карту можно добавить только в событие «Ориентирование»');
+    }
+    if (ignored > 0 && tracks.length === 0 && !image) {
+      setUploadError('Поддерживаются треки .fit / .gpx / .tcx и картинки карты');
+    }
+  }
+
+  async function uploadMapFile(file: File) {
     setUploadingScreenshot(true);
     setUploadError(null);
     try {
@@ -1450,6 +1512,9 @@ export const ReplayWorkspace: React.FC<Props> = ({
       form.append('width', String(dims.width));
       form.append('height', String(dims.height));
       if (dpi) form.append('dpi', String(dpi));
+      // Without tracks the map is placed in the middle of the current screen
+      const view = currentViewBounds();
+      if (view) form.append('view', JSON.stringify(view));
       form.append('file', file);
 
       const res = await fetch(`/api/events/${event.id}/map`, {
@@ -1474,7 +1539,6 @@ export const ReplayWorkspace: React.FC<Props> = ({
       setUploadError('Не удалось загрузить карту (нет связи с сервером)');
     } finally {
       setUploadingScreenshot(false);
-      e.target.value = '';
     }
   }
 
@@ -1654,14 +1718,40 @@ export const ReplayWorkspace: React.FC<Props> = ({
   }
 
   return (
-    <div className="flex flex-col h-full bg-slate-950 text-slate-100">
-      {/* Main workspace: [Unified Map Pane] + [Right Analytics Sidebar] */}
-      <div className="grid grid-cols-1 lg:grid-cols-12 flex-1 min-h-0">
+    <div
+      className="flex flex-col h-full bg-slate-950 text-slate-100 relative"
+      onDragOver={(e) => {
+        if (e.dataTransfer.types.includes('Files')) {
+          e.preventDefault();
+          setDropActive(true);
+        }
+      }}
+      onDragLeave={(e) => {
+        if (e.currentTarget === e.target) setDropActive(false);
+      }}
+      onDrop={(e) => {
+        e.preventDefault();
+        setDropActive(false);
+        void handleDroppedFiles(Array.from(e.dataTransfer.files));
+      }}
+    >
+      {dropActive && (
+        <div className="absolute inset-0 z-40 flex items-center justify-center bg-emerald-950/70 border-4 border-dashed border-emerald-400 pointer-events-none">
+          <div className="text-lg font-semibold text-emerald-100 text-center">
+            Отпустите файлы
+            <div className="text-sm font-normal text-emerald-200/80">
+              треки .fit / .gpx / .tcx{isOrienteering ? ' и скан карты (картинка)' : ''}
+            </div>
+          </div>
+        </div>
+      )}
+      {/* Main workspace: [Map] + [fixed-width right column] */}
+      <div className="flex flex-1 min-h-0">
         {/* MAIN MAP PANE */}
-        <div className="lg:col-span-8 xl:col-span-9 flex flex-col min-h-[420px] relative overflow-hidden">
+        <div className="flex-1 min-w-0 flex flex-col relative overflow-hidden">
           {/* Docked Top Map Toolbar */}
-          <div className="relative z-10 px-3 py-2 bg-slate-900 border-b border-slate-800 flex flex-wrap items-center justify-between gap-2 text-xs shrink-0">
-            <div className="flex flex-wrap items-center gap-2">
+          <div className="relative z-10 px-2 py-1.5 bg-slate-900 border-b border-slate-800 flex flex-wrap items-center justify-between gap-x-2 gap-y-1 text-xs shrink-0">
+            <div className="flex flex-wrap items-center gap-1.5">
               {isOrienteering && (
                 <label
                   className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white font-medium cursor-pointer transition"
@@ -1693,7 +1783,15 @@ export const ReplayWorkspace: React.FC<Props> = ({
                     }`}
                   >
                     <Move className="w-3.5 h-3.5" />
-                    {fitMapMode ? 'Подгонка включена' : '✋ Подогнать карту'}
+                    {fitMapMode ? 'Подгонка…' : 'Подогнать'}
+                  </button>
+
+                  <button
+                    onClick={showUploadedMap}
+                    className="p-1 rounded-lg bg-slate-800 hover:bg-slate-700 border border-slate-700 text-slate-300 hover:text-white transition"
+                    title="Показать карту: перелететь к ней"
+                  >
+                    <LocateFixed className="w-3.5 h-3.5" />
                   </button>
 
                   <button
@@ -1713,7 +1811,7 @@ export const ReplayWorkspace: React.FC<Props> = ({
                     }`}
                     title="Отметить старт, КП и финиш на карте — получатся сплиты по перегонам"
                   >
-                    ◎ КП дистанции
+                    ◎ КП
                     {courseControls.length > 0 && (
                       <span className="text-[10px] opacity-80">
                         ({courseControls.filter((c) => c.kind === 'control').length})
@@ -1723,7 +1821,7 @@ export const ReplayWorkspace: React.FC<Props> = ({
 
                   <div className="flex items-center gap-1.5">
                     <Layers className="w-3.5 h-3.5 text-emerald-400" />
-                    <span className="text-slate-300">Карта:</span>
+                    <span className="text-slate-300 hidden xl:inline">Карта</span>
                     <input
                       type="range"
                       min={0}
@@ -1731,7 +1829,8 @@ export const ReplayWorkspace: React.FC<Props> = ({
                       step={0.05}
                       value={mapOpacity}
                       onChange={(e) => setMapOpacity(parseFloat(e.target.value))}
-                      className="w-16 accent-emerald-500"
+                      className="w-14 accent-emerald-500"
+                      title="Прозрачность карты"
                     />
                   </div>
                 </>
@@ -1755,7 +1854,7 @@ export const ReplayWorkspace: React.FC<Props> = ({
               </div>
 
               <div className="flex items-center gap-1.5" title="Прозрачность подложки">
-                <span className="text-slate-300">Подложка:</span>
+                <span className="text-slate-300 hidden xl:inline">Подложка</span>
                 <input
                   type="range"
                   min={0}
@@ -1763,28 +1862,26 @@ export const ReplayWorkspace: React.FC<Props> = ({
                   step={0.05}
                   value={osmOpacity}
                   onChange={(e) => setOsmOpacity(parseFloat(e.target.value))}
-                  className="w-16 accent-sky-500"
+                  className="w-14 accent-sky-500"
                 />
               </div>
             </div>
 
             <div className="flex flex-wrap items-center gap-2">
-              <div className="flex items-center gap-1">
-                <span className="text-slate-400">Хвост:</span>
-                {TAIL_OPTIONS.map((opt) => (
-                  <button
-                    key={opt.value}
-                    onClick={() => setTailLengthSec(opt.value)}
-                    className={`px-1.5 py-0.5 rounded transition ${
-                      tailLengthSec === opt.value
-                        ? 'bg-emerald-600 text-white font-medium'
-                        : 'bg-slate-800 text-slate-400 hover:text-slate-200'
-                    }`}
-                  >
-                    {opt.label}
-                  </button>
-                ))}
-              </div>
+              <label className="flex items-center gap-1 text-slate-400" title="Длина следа за бегуном">
+                Хвост
+                <select
+                  value={tailLengthSec}
+                  onChange={(e) => setTailLengthSec(Number(e.target.value))}
+                  className="bg-slate-800 border border-slate-700 rounded px-1 py-0.5 text-slate-200"
+                >
+                  {TAIL_OPTIONS.map((opt) => (
+                    <option key={opt.value} value={opt.value}>
+                      {opt.label}
+                    </option>
+                  ))}
+                </select>
+              </label>
 
               <button
                 onClick={() => setSpeedHeatmap((v) => !v)}
@@ -1800,358 +1897,6 @@ export const ReplayWorkspace: React.FC<Props> = ({
               </button>
             </div>
           </div>
-
-          {/* SIMPLE, DIRECT MAP FITTING PANEL (shown when fitMapMode is active) */}
-          {fitMapMode && isOrienteering && event.map && (
-            <div className="relative z-10 px-3 py-2.5 bg-slate-900/95 border-b border-amber-500/40 space-y-2 text-xs shrink-0 shadow-xl">
-              <div className="flex flex-wrap items-center justify-between gap-2">
-                <div className="flex flex-wrap items-center gap-2">
-                  <span className="font-semibold text-amber-300 flex items-center gap-1.5">
-                    <Anchor className="w-3.5 h-3.5" />
-                    Шаг 1: потяни карту мышкой, совместив Старт △ с зелёной точкой ⚓ СТАРТ. Шаг 2: подгони Масштаб и Поворот ползунками!
-                  </span>
-                </div>
-
-                <div className="flex items-center gap-1.5">
-                  {/* Mouse drag mode switch: move map vs move screen */}
-                  <button
-                    onClick={() => setDragMovesMap((v) => !v)}
-                    className={`inline-flex items-center gap-1 px-2.5 py-1 rounded-lg border font-medium transition ${
-                      dragMovesMap
-                        ? 'bg-amber-500 text-slate-950 border-amber-400'
-                        : 'bg-slate-800 text-sky-300 border-slate-700'
-                    }`}
-                    title="Переключить действие левой кнопки мыши: двигать саму карту под треком или двигать камеру"
-                  >
-                    {dragMovesMap ? (
-                      <>
-                        <Move className="w-3.5 h-3.5" />
-                        Мышь: двигает КАРТУ
-                      </>
-                    ) : (
-                      <>
-                        <Globe className="w-3.5 h-3.5" />
-                        Мышь: двигает ЭКРАН
-                      </>
-                    )}
-                  </button>
-
-                  <button
-                    onClick={() => void handleResetMapAutoFit()}
-                    className="px-2 py-1 rounded-lg bg-slate-800 hover:bg-slate-700 border border-slate-700 text-slate-300 hover:text-white transition"
-                    title="Сбросить карту в исходное положение над треком"
-                  >
-                    ↺ Сбросить
-                  </button>
-
-                  <button
-                    onClick={() => onToggleFitMap?.(false)}
-                    className="inline-flex items-center gap-1 px-3 py-1 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white font-semibold transition"
-                  >
-                    <Check className="w-3.5 h-3.5" />
-                    Готово
-                  </button>
-                </div>
-              </div>
-
-              {/* Sliders row: Scale + Rotation + Stretch X/Y + Fine shift arrows (all pivot around ⚓ СТАРТ!) */}
-              <div className="grid grid-cols-1 md:grid-cols-12 gap-2.5 items-center bg-slate-950/90 p-2 rounded-xl border border-slate-800">
-                {/* 1. Scale Slider */}
-                <div className="md:col-span-4 flex items-center gap-1.5">
-                  <span className="text-slate-300 font-medium w-20 shrink-0">
-                    Масштаб: <strong className="text-emerald-400">{scalePct}%</strong>
-                  </span>
-                  <button
-                    onClick={() => handleScaleSliderChange(scalePct - 1, true)}
-                    className="px-1.5 py-0.5 rounded bg-slate-800 hover:bg-slate-700 text-slate-200 font-mono"
-                    title="Уменьшить на 1% вокруг ⚓ СТАРТ"
-                  >
-                    -
-                  </button>
-                  <input
-                    type="range"
-                    min={40}
-                    max={260}
-                    step={1}
-                    value={scalePct}
-                    onChange={(e) =>
-                      handleScaleSliderChange(parseFloat(e.target.value), false)
-                    }
-                    onMouseUp={() =>
-                      liveMatrixRef.current &&
-                      void saveMatrixToServer(liveMatrixRef.current)
-                    }
-                    onTouchEnd={() =>
-                      liveMatrixRef.current &&
-                      void saveMatrixToServer(liveMatrixRef.current)
-                    }
-                    className="flex-1 accent-emerald-500 cursor-pointer"
-                  />
-                  <button
-                    onClick={() => handleScaleSliderChange(scalePct + 1, true)}
-                    className="px-1.5 py-0.5 rounded bg-slate-800 hover:bg-slate-700 text-slate-200 font-mono"
-                    title="Увеличить на 1% вокруг ⚓ СТАРТ"
-                  >
-                    +
-                  </button>
-                </div>
-
-                {/* 2. Rotation Slider */}
-                <div className="md:col-span-4 flex items-center gap-1.5">
-                  <span className="text-slate-300 font-medium w-20 shrink-0">
-                    Поворот:{' '}
-                    <strong className="text-amber-400">
-                      {angleDeg > 0 ? `+${angleDeg}°` : `${angleDeg}°`}
-                    </strong>
-                  </span>
-                  <button
-                    onClick={() =>
-                      handleAngleSliderChange(
-                        Math.round((angleDeg - 0.5) * 10) / 10,
-                        true
-                      )
-                    }
-                    className="p-1 rounded bg-slate-800 hover:bg-slate-700 text-slate-200"
-                    title="Повернуть на -0.5° вокруг ⚓ СТАРТ"
-                  >
-                    <RotateCw className="w-3 h-3" />
-                  </button>
-                  <input
-                    type="range"
-                    min={-45}
-                    max={45}
-                    step={0.5}
-                    value={angleDeg}
-                    onChange={(e) =>
-                      handleAngleSliderChange(parseFloat(e.target.value), false)
-                    }
-                    onMouseUp={() =>
-                      liveMatrixRef.current &&
-                      void saveMatrixToServer(liveMatrixRef.current)
-                    }
-                    onTouchEnd={() =>
-                      liveMatrixRef.current &&
-                      void saveMatrixToServer(liveMatrixRef.current)
-                    }
-                    className="flex-1 accent-amber-500 cursor-pointer"
-                  />
-                  <button
-                    onClick={() =>
-                      handleAngleSliderChange(
-                        Math.round((angleDeg + 0.5) * 10) / 10,
-                        true
-                      )
-                    }
-                    className="p-1 rounded bg-slate-800 hover:bg-slate-700 text-slate-200"
-                    title="Повернуть на +0.5° вокруг ⚓ СТАРТ"
-                  >
-                    <RotateCcw className="w-3 h-3" />
-                  </button>
-                </div>
-
-                {/* 3. Stretch X/Y Slider + Fine Nudge Arrows */}
-                <div className="md:col-span-4 flex items-center justify-between gap-2">
-                  <div className="flex items-center gap-1.5 flex-1">
-                    <span
-                      className="text-slate-300 font-medium shrink-0"
-                      title="Растяжение по ширине/высоте (если фото карты снято телефоном чуть под углом)"
-                    >
-                      Ш/В:{' '}
-                      <strong className="text-sky-400">
-                        {stretchPct > 0 ? `+${stretchPct}%` : `${stretchPct}%`}
-                      </strong>
-                    </span>
-                    <input
-                      type="range"
-                      min={-25}
-                      max={25}
-                      step={1}
-                      value={stretchPct}
-                      onChange={(e) =>
-                        handleStretchSliderChange(
-                          parseFloat(e.target.value),
-                          false
-                        )
-                      }
-                      onMouseUp={() =>
-                        liveMatrixRef.current &&
-                        void saveMatrixToServer(liveMatrixRef.current)
-                      }
-                      onTouchEnd={() =>
-                        liveMatrixRef.current &&
-                        void saveMatrixToServer(liveMatrixRef.current)
-                      }
-                      className="flex-1 accent-sky-500 cursor-pointer"
-                    />
-                  </div>
-
-                  <div className="flex items-center gap-0.5 shrink-0">
-                    <button
-                      onClick={() =>
-                        applyLiveNudge({ dEastM: -5, commitToServer: true })
-                      }
-                      className="p-1 rounded bg-slate-800 hover:bg-slate-700"
-                      title="Сдвинуть карту на 5м влево"
-                    >
-                      <ArrowLeft className="w-3 h-3" />
-                    </button>
-                    <button
-                      onClick={() =>
-                        applyLiveNudge({ dNorthM: 5, commitToServer: true })
-                      }
-                      className="p-1 rounded bg-slate-800 hover:bg-slate-700"
-                      title="Сдвинуть карту на 5м вверх"
-                    >
-                      <ArrowUp className="w-3 h-3" />
-                    </button>
-                    <button
-                      onClick={() =>
-                        applyLiveNudge({ dNorthM: -5, commitToServer: true })
-                      }
-                      className="p-1 rounded bg-slate-800 hover:bg-slate-700"
-                      title="Сдвинуть карту на 5м вниз"
-                    >
-                      <ArrowDown className="w-3 h-3" />
-                    </button>
-                    <button
-                      onClick={() =>
-                        applyLiveNudge({ dEastM: 5, commitToServer: true })
-                      }
-                      className="p-1 rounded bg-slate-800 hover:bg-slate-700"
-                      title="Сдвинуть карту на 5м вправо"
-                    >
-                      <ArrowRight className="w-3 h-3" />
-                    </button>
-                  </div>
-                </div>
-              </div>
-
-              {/* Scale & north: exact size from print scale/DPI or a scale bar, O-map turned to magnetic north */}
-              <div className="flex flex-wrap items-center gap-x-3 gap-y-1.5 bg-slate-950/90 p-2 rounded-xl border border-slate-800">
-                <div className="flex items-center gap-0.5 bg-slate-900 p-0.5 rounded-lg border border-slate-800">
-                  {(
-                    [
-                      ['orienteering', '🧭 Карта О'],
-                      ['screenshot', '🗺 Скриншот Google'],
-                    ] as const
-                  ).map(([k, label]) => (
-                    <button
-                      key={k}
-                      onClick={() => setMapImageKind(k)}
-                      className={`px-2 py-0.5 rounded-md transition ${
-                        mapImageKind === k
-                          ? 'bg-emerald-600 text-white font-medium'
-                          : 'text-slate-400 hover:text-slate-200'
-                      }`}
-                      title={
-                        k === 'orienteering'
-                          ? 'Карта ориентирования: нарисована на магнитный север, масштаб печати известен'
-                          : 'Скриншот Google Maps: истинный север, масштаб — по линейке на скриншоте'
-                      }
-                    >
-                      {label}
-                    </button>
-                  ))}
-                </div>
-
-                {mapImageKind === 'orienteering' && (
-                  <>
-                    <label className="flex items-center gap-1 text-slate-300">
-                      1:
-                      <input
-                        list="retrace-print-scales"
-                        type="number"
-                        min={500}
-                        max={200000}
-                        step={500}
-                        value={printScale}
-                        onChange={(e) => setPrintScale(Number(e.target.value))}
-                        className="w-20 px-1.5 py-0.5 rounded bg-slate-900 border border-slate-700 text-slate-100"
-                        title="Масштаб печати карты (указан на карте: 1:4000, 1:10000...)"
-                      />
-                      <datalist id="retrace-print-scales">
-                        {PRINT_SCALES.map((s) => (
-                          <option key={s} value={s} />
-                        ))}
-                      </datalist>
-                    </label>
-                    <label
-                      className="flex items-center gap-1 text-slate-300"
-                      title="Разрешение скана. Для фото с телефона DPI неизвестен — используйте линейку"
-                    >
-                      DPI
-                      <input
-                        type="number"
-                        min={30}
-                        max={2400}
-                        step={10}
-                        value={scanDpi}
-                        onChange={(e) => setScanDpi(Number(e.target.value))}
-                        className="w-16 px-1.5 py-0.5 rounded bg-slate-900 border border-slate-700 text-slate-100"
-                      />
-                    </label>
-                    <label
-                      className="flex items-center gap-1 text-slate-300"
-                      title="Магнитное склонение: карты ориентирования рисуются на магнитный север, а подложка — на истинный"
-                    >
-                      Склонение
-                      <input
-                        type="number"
-                        min={-60}
-                        max={60}
-                        step={0.1}
-                        value={declinationDeg}
-                        onChange={(e) => setDeclinationDeg(Number(e.target.value))}
-                        className="w-16 px-1.5 py-0.5 rounded bg-slate-900 border border-slate-700 text-slate-100"
-                      />
-                      °
-                      <button
-                        onClick={() => setDeclinationDeg(autoDeclinationDeg)}
-                        className="px-1.5 py-0.5 rounded bg-slate-800 hover:bg-slate-700 text-sky-300"
-                        title="Склонение по модели WMM2025 для места старта и даты забега"
-                      >
-                        авто {formatSignedDeg(autoDeclinationDeg)}
-                      </button>
-                    </label>
-                  </>
-                )}
-
-                <button
-                  onClick={() => applyScaleAndNorth(null)}
-                  className="px-2.5 py-1 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white font-medium"
-                  title={
-                    mapImageKind === 'orienteering'
-                      ? 'Выставить точный размер по масштабу и DPI и повернуть на магнитный север. ⚓ СТАРТ не сдвигается'
-                      : 'Повернуть скриншот строго на север (масштаб не меняется). ⚓ СТАРТ не сдвигается'
-                  }
-                >
-                  {mapImageKind === 'orienteering'
-                    ? 'Применить масштаб и север'
-                    : 'Выровнять на север'}
-                </button>
-                <button
-                  onClick={() => {
-                    setPickedFeatureLonLat(null);
-                    setSnapStage('scalebar_start');
-                  }}
-                  className="px-2.5 py-1 rounded-lg bg-slate-800 hover:bg-slate-700 border border-slate-700 text-amber-300"
-                  title="Кликнуть два конца масштабной линейки на карте и ввести её длину в метрах — для фото и скриншотов"
-                >
-                  📏 По линейке
-                </button>
-
-                {placementReadout && (
-                  <span className="text-[11px] text-slate-400 font-mono">
-                    сейчас: {placementReadout.metersPerPixel.toFixed(3)} м/пикс
-                    {placementReadout.impliedScale
-                      ? ` (≈1:${placementReadout.impliedScale})`
-                      : ''}
-                    , север карты {formatSignedDeg(placementReadout.upBearingDeg)}
-                  </span>
-                )}
-              </div>
-            </div>
-          )}
 
           {/* Course editing: click the map to place start → controls → finish */}
           {courseEdit && isOrienteering && event.map && (
@@ -2258,8 +2003,57 @@ export const ReplayWorkspace: React.FC<Props> = ({
           />
         </div>
 
-        {/* Right sidebar: Participants, Route-Choice Leg Analysis, Livelox Speed Normalization */}
-        <div className="lg:col-span-4 xl:col-span-3 flex flex-col border-l border-slate-800 bg-slate-900/80 overflow-hidden">
+        {/* Right column (fixed width so its controls never get clipped):
+            map fitting while fitting, otherwise participants, splits and analysis */}
+        <div className="w-[340px] xl:w-[380px] shrink-0 flex flex-col border-l border-slate-800 bg-slate-900/80 overflow-hidden">
+          {fitMapMode && isOrienteering && event.map ? (
+            <>
+              {uploadError && (
+                <div className="m-3 mb-0 p-2 rounded bg-rose-500/20 border border-rose-500/40 text-xs text-rose-300">
+                  {uploadError}
+                </div>
+              )}
+              <FitPanel
+                hasTracks={event.participants.length > 0}
+                onTrackFiles={handleTrackUpload}
+                uploadingTrack={uploadingTrack}
+                onDone={() => onToggleFitMap?.(false)}
+                onShowMap={showUploadedMap}
+                onMoveMapHere={moveMapToViewCenter}
+                onResetPlacement={() => void handleResetMapAutoFit()}
+                dragMovesMap={dragMovesMap}
+                onToggleDragMovesMap={() => setDragMovesMap((v) => !v)}
+                mapImageKind={mapImageKind}
+                onMapImageKind={setMapImageKind}
+                printScale={printScale}
+                onPrintScale={setPrintScale}
+                scanDpi={scanDpi}
+                onScanDpi={setScanDpi}
+                declinationDeg={declinationDeg}
+                onDeclinationDeg={setDeclinationDeg}
+                autoDeclinationDeg={autoDeclinationDeg}
+                onApplyScaleAndNorth={() => applyScaleAndNorth(null)}
+                onStartScaleBar={() => {
+                  setPickedFeatureLonLat(null);
+                  setSnapStage('scalebar_start');
+                }}
+                readout={placementReadout}
+                scalePct={scalePct}
+                angleDeg={angleDeg}
+                stretchPct={stretchPct}
+                onScale={handleScaleSliderChange}
+                onAngle={handleAngleSliderChange}
+                onStretch={handleStretchSliderChange}
+                onCommitSlider={() => {
+                  if (liveMatrixRef.current) void saveMatrixToServer(liveMatrixRef.current);
+                }}
+                onNudge={(dEastM, dNorthM) =>
+                  applyLiveNudge({ dEastM, dNorthM, commitToServer: true })
+                }
+              />
+            </>
+          ) : (
+          <>
           <div className="p-3 border-b border-slate-800 space-y-2">
             <div className="flex items-center justify-between">
               <span className="text-xs font-semibold uppercase tracking-wider text-slate-400">
@@ -2267,7 +2061,7 @@ export const ReplayWorkspace: React.FC<Props> = ({
               </span>
               <label className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-medium cursor-pointer transition">
                 <Plus className="w-3.5 h-3.5" />
-                {uploadingTrack ? 'Парсинг...' : 'Загрузить Garmin (FIT/GPX)'}
+                {uploadingTrack ? 'Загрузка…' : 'Треки'}
                 <input
                   type="file"
                   multiple
@@ -2522,6 +2316,25 @@ export const ReplayWorkspace: React.FC<Props> = ({
 
           {/* Live leaderboard cards */}
           <div className="flex-1 overflow-y-auto p-3 space-y-2.5">
+            {event.participants.length === 0 && (
+              <label className="flex flex-col items-center justify-center gap-2 h-full min-h-[160px] p-4 rounded-xl border-2 border-dashed border-slate-700 hover:border-emerald-500 text-center text-slate-400 cursor-pointer transition">
+                <Plus className="w-6 h-6 text-emerald-400" />
+                <span className="text-sm text-slate-200 font-medium">
+                  Добавьте треки участников
+                </span>
+                <span className="text-xs">
+                  Перетащите сюда файлы .fit / .gpx / .tcx с часов
+                  {isOrienteering ? ' (и скан карты)' : ''} или нажмите, чтобы выбрать
+                </span>
+                <input
+                  type="file"
+                  multiple
+                  accept=".gpx,.fit,.tcx"
+                  className="hidden"
+                  onChange={handleTrackUpload}
+                />
+              </label>
+            )}
             {leaderboard.map(
               ({ participant: p, state, rank, gapMeters }) => (
                 <div
@@ -2659,7 +2472,8 @@ export const ReplayWorkspace: React.FC<Props> = ({
             )}
           </div>
 
-          <div className="h-36 border-t border-slate-800 bg-slate-950 p-3 flex flex-col">
+          {event.participants.length > 0 && (
+          <div className="h-32 border-t border-slate-800 bg-slate-950 p-3 flex flex-col">
             <div className="flex items-center justify-between text-[11px] text-slate-400 mb-1">
               <span>График скорости участников (км/ч)</span>
               <span className="font-mono text-emerald-400">
@@ -2677,11 +2491,14 @@ export const ReplayWorkspace: React.FC<Props> = ({
               onSeek={(sec) => setRaceTimeSec(sec)}
             />
           </div>
+          )}
+          </>
+          )}
         </div>
       </div>
 
       {/* Bottom Playback Transport Bar */}
-      <div className="px-4 py-3 bg-slate-900 border-t border-slate-800 flex flex-wrap items-center gap-4 shrink-0 z-10">
+      <div className="px-3 py-2 bg-slate-900 border-t border-slate-800 flex flex-wrap items-center gap-3 shrink-0 z-10">
         <div className="flex items-center gap-2">
           <button
             onClick={() => setIsPlaying((p) => !p)}

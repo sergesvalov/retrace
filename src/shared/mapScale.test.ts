@@ -1,14 +1,18 @@
 import { describe, expect, it } from 'vitest';
 import {
   autoPlaceScreenshotOnBounds,
+  boundsForViewShare,
+  boundsOverlap,
   buildScaledOrientedMatrix,
   groundMetersPerPixelFromPrint,
   groundMetersPerPixelFromScaleBar,
   haversineDistanceM,
   lonLatToPixel,
+  matrixBounds,
   matrixGroundMetersPerPixel,
   matrixUpBearingDeg,
   pixelToLonLat,
+  translateMatrixCenterTo,
 } from './georef.js';
 import { magneticDeclinationDeg } from './declination.js';
 
@@ -61,5 +65,28 @@ describe('map scale & north', () => {
     expect(magneticDeclinationDeg(32.42, 34.77, when)).toBeLessThan(7);
     expect(magneticDeclinationDeg(37.55, 55.6, when)).toBeGreaterThan(10);
     expect(magneticDeclinationDeg(37.55, 55.6, when)).toBeLessThan(14);
+  });
+});
+
+describe('map placement helpers', () => {
+  it('moves the map centre to a point keeping scale and rotation', () => {
+    const m0 = buildScaledOrientedMatrix(initialMatrix(), START, 0.5, 5.3)!;
+    const mosfiloti: [number, number] = [33.42, 34.95];
+    const m = translateMatrixCenterTo(m0, 3504, 2544, mosfiloti[0], mosfiloti[1]);
+    const [lon, lat] = pixelToLonLat(m, 1752, 1272);
+    expect(haversineDistanceM(lon, lat, mosfiloti[0], mosfiloti[1])).toBeLessThan(0.01);
+    expect(m.slice(0, 2)).toEqual(m0.slice(0, 2));
+    expect(m.slice(3, 5)).toEqual(m0.slice(3, 5));
+  });
+
+  it('places a map without tracks inside the current view', () => {
+    const view = { minLon: 33.38, maxLon: 33.46, minLat: 34.93, maxLat: 34.97 };
+    const { matrix } = autoPlaceScreenshotOnBounds(3504, 2544, boundsForViewShare(view));
+    const b = matrixBounds(matrix, 3504, 2544);
+    expect(boundsOverlap(b, view)).toBe(true);
+    expect(b.minLon).toBeGreaterThanOrEqual(view.minLon);
+    expect(b.maxLon).toBeLessThanOrEqual(view.maxLon);
+    // Paphos (the old hard-coded default) is nowhere near
+    expect(boundsOverlap(b, { minLon: 32.4, maxLon: 32.45, minLat: 34.76, maxLat: 34.79 })).toBe(false);
   });
 });
