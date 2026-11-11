@@ -99,21 +99,31 @@ npm run build        # vite + esbuild
 ```
 src/
   client/                     React + MapLibre GL (фронтенд)
-    App.tsx                   шапка: выбор события, создание/настройки, режим подгонки, «Поделиться»
+    App.tsx                   шапка: выбор события, создание/настройки, «Поделиться»
     components/
-      ReplayWorkspace.tsx     карта, плеер, участники, анализ (состояние подгонки и КП)
-      FitPanel.tsx            панель подгонки карты в правой колонке
-      EventDialog.tsx         окно создания/настроек события (название + тип)
+      ReplayWorkspace.tsx     рабочая область: состояние события, подгонки, КП, плеера
+      FitPanel.tsx            панель подгонки карты (грузится по требованию)
+      MapBanners.tsx          подсказки режимов над картой (расстановка КП, клики)
+      ParticipantCard.tsx     карточка участника в правой колонке
+      SpeedComparisonChart.tsx график скорости участников
       SplitsPanel.tsx         таблица сплитов по КП
+      EventDialog.tsx         окно создания/настроек события (название + тип)
       useCourseOverlay.ts     отрисовка и редактирование КП на карте
-    imageDpi.ts               чтение DPI из заголовка скана (JPEG JFIF/EXIF, PNG pHYs)
+    map/
+      mapStyle.ts             подложки (Топо/OSM/Спутник) и слои повтора
+      mapLayers.ts            GeoJSON треков, хвостов, общего старта; подгонка вида
+      runnerMarkers.ts        кадр повтора: маркеры бегунов и хвосты (60 к/с, без React)
     detectCircles.ts          поиск кружков КП (фиолетовая надпечатка) на скане
+    autoGeoref.worker.ts      автоподгонка в фоновом потоке (Web Worker)
+    autoGeorefClient.ts       запуск автоподгонки: воркер или основной поток
+    imageDpi.ts               чтение DPI из заголовка скана (JPEG JFIF/EXIF, PNG pHYs)
   server/
-    index.ts                  Fastify: REST API, хранение событий, загрузка файлов
+    index.ts                  Fastify: REST API, хранение, загрузка файлов, gzip, кэш
   shared/                     общий код клиента и сервера (покрыт тестами)
     types.ts                  модель данных: событие, карта, КП, участник, точки трека
+    pointsCodec.ts            компактный формат точек (сеть и диск), «лёгкие» ответы
     trackParser.ts            разбор GPX/FIT/TCX, чистка GPS, интерполяция для плеера, выравнивание скорости
-    georef.ts                 Web Mercator, матрица положения карты, масштаб/север, линейка
+    georef.ts                 Web Mercator, матрица положения карты, масштаб/север, линейка, точки привязки
     course.ts                 отметки на КП, сплиты, доводка трека до КП, подгонка по КП
     autoGeoref.ts             автоподгонка: кружки на скане ↔ треки (масштаб, поворот, сдвиг)
     declination.ts            магнитное склонение (WMM2025, пакет magvar)

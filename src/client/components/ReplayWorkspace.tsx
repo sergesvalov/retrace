@@ -1,15 +1,8 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import maplibregl from 'maplibre-gl';
 import {
-  Activity,
-  Check,
-  Clock,
-  Eye,
-  EyeOff,
   Flag,
   Flame,
-  Gauge,
-  Heart,
   ImagePlus,
   Layers,
   LocateFixed,
@@ -48,7 +41,6 @@ import {
   eventKindOf,
   type BaseLayer,
   type CourseControl,
-  type EventKind,
   type MapImageKind,
   type MapOverlayMeta,
   type ParticipantTrack,
@@ -71,21 +63,26 @@ import {
 import { readImageDpi } from '../imageDpi.js';
 import { useCourseOverlay } from './useCourseOverlay.js';
 import { SplitsPanel } from './SplitsPanel.js';
+import { SpeedComparisonChart } from './SpeedComparisonChart.js';
+import { ParticipantCard } from './ParticipantCard.js';
+import { MapBanners, type SnapStage } from './MapBanners.js';
+import { drawRunnersFrame } from '../map/runnerMarkers.js';
+import {
+  addReplayLayers,
+  BASE_LAYER_LABELS,
+  BASE_LAYERS,
+  baseMapStyle,
+  defaultBaseLayerFor,
+} from '../map/mapStyle.js';
+import {
+  buildCommonStartGeoJson,
+  buildGhostTracksGeoJson,
+  fitMapToTracksOrMap,
+} from '../map/mapLayers.js';
 // Map fitting UI is only needed for orienteering maps: loaded on first use
 const FitPanel = React.lazy(() =>
   import('./FitPanel.js').then((m) => ({ default: m.FitPanel }))
 );
-
-const BASE_LAYERS: readonly BaseLayer[] = ['topo', 'osm', 'satellite'];
-const BASE_LAYER_LABELS: Record<BaseLayer, string> = {
-  topo: 'Топо',
-  osm: 'OSM',
-  satellite: 'Спутник',
-};
-/** Runs/hikes live on the base map, so default to the one with contours and trails */
-function defaultBaseLayerFor(kind: EventKind): BaseLayer {
-  return kind === 'run' ? 'topo' : 'osm';
-}
 
 interface Props {
   event: RaceEvent;
@@ -162,16 +159,7 @@ export const ReplayWorkspace: React.FC<Props> = ({
   >(event.map?.matrix ?? null);
 
   // Map click interaction stages for Spot Start & Leg Route-Choice Analysis
-  const [snapStage, setSnapStage] = useState<
-    | 'idle'
-    | 'spot_start'
-    | 'leg_start'
-    | 'leg_end'
-    | 'scalebar_start'
-    | 'scalebar_end'
-    | 'pin_map'
-    | 'pin_base'
-  >('idle');
+  const [snapStage, setSnapStage] = useState<SnapStage>('idle');
   // Landmark pin being placed: the scan pixel clicked first, then the same place on the base map
   const [pinDraftPx, setPinDraftPx] = useState<[number, number] | null>(null);
   const [pickedFeatureLonLat, setPickedFeatureLonLat] = useState<
@@ -654,53 +642,7 @@ export const ReplayWorkspace: React.FC<Props> = ({
 
     const map = new maplibregl.Map({
       container: mapContainerRef.current,
-      style: {
-        version: 8,
-        sources: {
-          osm: {
-            type: 'raster',
-            tiles: ['https://tile.openstreetmap.org/{z}/{x}/{y}.png'],
-            tileSize: 256,
-            maxzoom: 19,
-            attribution: '© OpenStreetMap contributors',
-          },
-          topo: {
-            type: 'raster',
-            tiles: [
-              'https://a.tile.opentopomap.org/{z}/{x}/{y}.png',
-              'https://b.tile.opentopomap.org/{z}/{x}/{y}.png',
-              'https://c.tile.opentopomap.org/{z}/{x}/{y}.png',
-            ],
-            tileSize: 256,
-            // OpenTopoMap has no tiles past z17: MapLibre over-zooms z17 instead of showing blanks
-            maxzoom: 17,
-            attribution:
-              '© OpenStreetMap contributors, SRTM | © OpenTopoMap (CC-BY-SA)',
-          },
-          satellite: {
-            type: 'raster',
-            tiles: [
-              'https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}',
-            ],
-            tileSize: 256,
-            maxzoom: 19,
-            attribution: '© Esri World Imagery',
-          },
-        },
-        // Hidden base layers use `visibility: none` so their tiles are not downloaded at all
-        layers: BASE_LAYERS.map((layer) => ({
-          id: `${layer}-base`,
-          type: 'raster' as const,
-          source: layer,
-          layout: {
-            visibility:
-              layer === baseLayerRef.current
-                ? ('visible' as const)
-                : ('none' as const),
-          },
-          paint: { 'raster-opacity': osmOpacity },
-        })),
-      },
+      style: baseMapStyle(baseLayerRef.current, osmOpacity),
       center: initialCenter,
       zoom: 14.3,
     });
@@ -741,87 +683,8 @@ export const ReplayWorkspace: React.FC<Props> = ({
         });
       }
 
-      // 2. Full GPS tracks (white halo + clear colored line)
-      map.addSource('ghost-tracks', {
-        type: 'geojson',
-        data: buildGhostTracksGeoJson(displayParticipantsRef.current),
-      });
-      map.addLayer({
-        id: 'ghost-tracks-casing',
-        type: 'line',
-        source: 'ghost-tracks',
-        layout: { 'line-cap': 'round', 'line-join': 'round' },
-        paint: {
-          'line-color': '#ffffff',
-          'line-width': 4.5,
-          'line-opacity': 0.6,
-        },
-      });
-      map.addLayer({
-        id: 'ghost-tracks-layer',
-        type: 'line',
-        source: 'ghost-tracks',
-        layout: { 'line-cap': 'round', 'line-join': 'round' },
-        paint: {
-          'line-color': ['get', 'color'],
-          'line-width': 2.75,
-          'line-opacity': 0.78,
-        },
-      });
-
-      // 3. Selected Orienteering Leg Line (CP A -> CP B)
-      map.addSource('selected-leg', {
-        type: 'geojson',
-        data: { type: 'FeatureCollection', features: [] },
-      });
-      map.addLayer({
-        id: 'selected-leg-line',
-        type: 'line',
-        source: 'selected-leg',
-        paint: {
-          'line-color': '#d946ef',
-          'line-width': 3.5,
-          'line-dasharray': [3, 2],
-          'line-opacity': 0.9,
-        },
-      });
-
-      // 4. Active animated tails (colored by runner or speed heatmap)
-      map.addSource('active-tails', {
-        type: 'geojson',
-        data: { type: 'FeatureCollection', features: [] },
-      });
-      map.addLayer({
-        id: 'active-tails-layer',
-        type: 'line',
-        source: 'active-tails',
-        layout: {
-          'line-cap': 'round',
-          'line-join': 'round',
-        },
-        paint: {
-          'line-color': ['get', 'color'],
-          'line-width': 5,
-          'line-opacity': 0.95,
-        },
-      });
-
-      // 5. Common Start Spot Circle
-      map.addSource('common-start', {
-        type: 'geojson',
-        data: buildCommonStartGeoJson(displayParticipantsRef.current),
-      });
-      map.addLayer({
-        id: 'common-start-circle',
-        type: 'circle',
-        source: 'common-start',
-        paint: {
-          'circle-radius': 8,
-          'circle-color': '#10b981',
-          'circle-stroke-width': 2.5,
-          'circle-stroke-color': '#ffffff',
-        },
-      });
+      // 2–5. Tracks, selected leg, tails, common start
+      addReplayLayers(map, displayParticipantsRef.current);
 
       fitMapToTracksOrMap(map, event);
       setMapLoadCount((c) => c + 1);
@@ -1576,98 +1439,23 @@ export const ReplayWorkspace: React.FC<Props> = ({
     groupReferenceSpeedMs,
   ]);
 
-  // Runner markers + tails for clock time `t`. Called by the animation loop every frame
+  // One replay frame drawn straight onto the map. Called by the animation loop every frame
   // (through a ref, so it always sees the latest data) and when inputs change while paused.
   const drawFrameRef = useRef<(t: number) => void>(() => {});
   drawFrameRef.current = (t: number) => {
     const map = mapRef.current;
     if (!map || !mapReadyRef.current) return;
-    const states = displayParticipants.map((p) => ({
-      participant: p,
-      state: interpolateTrackAt(
-        p,
-        t,
-        event.timeMode,
-        eventEpochZeroMs,
-        speedNormMode,
-        groupReferenceSpeedMs
-      ),
-    }));
-    drawDynamicElements(map, t, states);
+    drawRunnersFrame(map, runnerMarkersRef.current, {
+      participants: displayParticipants,
+      raceTimeSec: t,
+      tailLengthSec,
+      timeMode: event.timeMode,
+      eventEpochZeroMs,
+      speedHeatmap,
+      speedNormMode,
+      referenceSpeedMs: groupReferenceSpeedMs,
+    });
   };
-
-  function drawDynamicElements(
-    map: maplibregl.Map,
-    raceTimeSec: number,
-    runnerStates: { participant: ParticipantTrack; state: ReturnType<typeof interpolateTrackAt> }[]
-  ) {
-    {
-      const tailSrc = map.getSource('active-tails') as
-        | maplibregl.GeoJSONSource
-        | undefined;
-      if (tailSrc) {
-        tailSrc.setData(
-          buildActiveTailsGeoJson(
-            displayParticipants,
-            raceTimeSec,
-            tailLengthSec,
-            event.timeMode,
-            eventEpochZeroMs,
-            speedHeatmap,
-            speedNormMode,
-            groupReferenceSpeedMs
-          )
-        );
-      }
-
-      const activeIds = new Set<string>();
-      for (const { participant: p, state } of runnerStates) {
-        if (!p.visible || !state) continue;
-        activeIds.add(p.id);
-
-        let marker = runnerMarkersRef.current.get(p.id);
-        if (!marker) {
-          // Built with DOM APIs, not innerHTML: name/color come from shared event data
-          const el = document.createElement('div');
-          el.className = 'flex items-center gap-1.5 pointer-events-none';
-          const dot = document.createElement('div');
-          dot.className =
-            'runner-dot w-4 h-4 rounded-full border-2 border-white shadow-lg';
-          const box = document.createElement('div');
-          box.className =
-            'px-1.5 py-0.5 rounded bg-slate-900/90 border border-slate-700 text-[11px] font-semibold text-white whitespace-nowrap shadow';
-          const label = document.createElement('span');
-          label.className = 'runner-label';
-          box.appendChild(label);
-          el.append(dot, box);
-          marker = new maplibregl.Marker({ element: el, anchor: 'left' })
-            .setLngLat([state.lon, state.lat])
-            .addTo(map);
-          runnerMarkersRef.current.set(p.id, marker);
-        } else {
-          marker.setLngLat([state.lon, state.lat]);
-        }
-
-        const markerEl = marker.getElement();
-        const dotEl = markerEl.querySelector('.runner-dot') as HTMLElement | null;
-        if (dotEl) dotEl.style.background = p.color;
-        const labelSpan = markerEl.querySelector(
-          '.runner-label'
-        ) as HTMLElement | null;
-        if (labelSpan) {
-          const paceStr = formatPaceMinKm(state.speedMs);
-          labelSpan.textContent = `${p.name} • ${paceStr}`;
-        }
-      }
-
-      for (const [id, marker] of runnerMarkersRef.current.entries()) {
-        if (!activeIds.has(id)) {
-          marker.remove();
-          runnerMarkersRef.current.delete(id);
-        }
-      }
-    }
-  }
 
   // Redraw when something other than the running clock changes (or after a seek / map load)
   useEffect(() => {
@@ -2218,118 +2006,28 @@ export const ReplayWorkspace: React.FC<Props> = ({
             </div>
           </div>
 
-          {/* Course editing: click the map to place start → controls → finish */}
-          {courseEdit && isOrienteering && event.map && (
-            <div className="relative z-10 px-3 py-1.5 bg-fuchsia-950/80 border-b border-fuchsia-500/40 text-xs text-fuchsia-100 flex flex-wrap items-center justify-between gap-2 shrink-0">
-              <span>
-                {courseControls.length === 0 || nextIsStart
-                  ? '▲ Кликните СТАРТ (треугольник) на карте'
-                  : nextIsFinish
-                    ? '◎ Кликните ФИНИШ на карте'
-                    : `Кликните КП ${
-                        courseControls.filter((c) => c.kind === 'control').length + 1
-                      } по порядку. Маркеры можно перетаскивать, правый клик — удалить`}
-              </span>
-              <div className="flex items-center gap-1.5">
-                <button
-                  onClick={() => {
-                    setNextIsStart((v) => !v);
-                    setNextIsFinish(false);
-                  }}
-                  className={`px-2 py-0.5 rounded border transition ${
-                    nextIsStart
-                      ? 'bg-fuchsia-500 border-fuchsia-300 text-white'
-                      : 'bg-slate-900 border-slate-700 text-fuchsia-200 hover:text-white'
-                  }`}
-                  title="Поставить или передвинуть старт (треугольник): он всегда первый"
-                >
-                  {courseControls.some((c) => c.kind === 'start') ? '▲ Переставить старт' : '▲ Следующий клик — старт'}
-                </button>
-                <button
-                  onClick={() => {
-                    setNextIsFinish((v) => !v);
-                    setNextIsStart(false);
-                  }}
-                  disabled={courseControls.length === 0}
-                  className={`px-2 py-0.5 rounded border transition disabled:opacity-40 ${
-                    nextIsFinish
-                      ? 'bg-fuchsia-500 border-fuchsia-300 text-white'
-                      : 'bg-slate-900 border-slate-700 text-fuchsia-200 hover:text-white'
-                  }`}
-                >
-                  ◎ Следующий клик — финиш
-                </button>
-                <button
-                  onClick={() => void saveCourse(courseControls.slice(0, -1))}
-                  disabled={courseControls.length === 0}
-                  className="px-2 py-0.5 rounded bg-slate-900 border border-slate-700 text-slate-200 hover:text-white disabled:opacity-40"
-                >
-                  ↶ Убрать последний
-                </button>
-                <button
-                  onClick={() => {
-                    if (window.confirm('Удалить все КП дистанции?')) void saveCourse([]);
-                  }}
-                  disabled={courseControls.length === 0}
-                  className="px-2 py-0.5 rounded bg-slate-900 border border-slate-700 text-slate-400 hover:text-rose-300 disabled:opacity-40"
-                >
-                  Очистить
-                </button>
-                {courseControls.length >= 3 && event.participants.length > 0 && (
-                  <button
-                    onClick={() => {
-                      autoFitMapToCourse();
-                      setCourseEdit(false);
-                      onToggleFitMap?.(true);
-                    }}
-                    className="px-2 py-0.5 rounded bg-fuchsia-600 hover:bg-fuchsia-500 text-white font-semibold"
-                    title="Подогнать карту так, чтобы КП совпали с отметками участников"
-                  >
-                    🎯 Подогнать карту по КП
-                  </button>
-                )}
-                <button
-                  onClick={() => setCourseEdit(false)}
-                  className="inline-flex items-center gap-1 px-2.5 py-0.5 rounded bg-emerald-600 hover:bg-emerald-500 text-white font-semibold"
-                >
-                  <Check className="w-3.5 h-3.5" />
-                  Готово
-                </button>
-              </div>
-            </div>
-          )}
-
-          {/* Active Map Click Prompt Banner (for Spot Start, Leg Selection or Scale Bar) */}
-          {snapStage !== 'idle' && (
-            <div className="relative z-10 px-3 py-1.5 bg-fuchsia-600/25 border-b border-fuchsia-400/50 text-fuchsia-200 text-xs font-medium flex items-center justify-between animate-pulse shrink-0">
-              <span>
-                {snapStage === 'pin_map' &&
-                  '📍 Шаг 1/2: кликните приметное место НА СКАНЕ (перекрёсток, угол здания или забора, мост)'}
-                {snapStage === 'pin_base' &&
-                  '📍 Шаг 2/2: скан скрыт — кликните то же место на подложке'}
-                {snapStage === 'scalebar_start' &&
-                  '📏 Шаг 1/2: кликните ЛЕВЫЙ конец масштабной линейки на карте'}
-                {snapStage === 'scalebar_end' &&
-                  '📏 Шаг 2/2: кликните ПРАВЫЙ конец линейки, затем введите её длину в метрах'}
-                {snapStage === 'spot_start' &&
-                  '🏁 Кликните любую точку на карте (КП / развилку), чтобы запустить все треки одновременно из этого места!'}
-                {snapStage === 'leg_start' &&
-                  '🧭 Шаг 1/2: Кликните НАЧАЛО перегона (КП А) на карте'}
-                {snapStage === 'leg_end' &&
-                  '🧭 Шаг 2/2: Теперь кликните КОНЕЦ перегона (КП Б) на карте'}
-              </span>
-              <button
-                onClick={() => {
-                  setSnapStage('idle');
-                  setPickedFeatureLonLat(null);
-                  setPinDraftPx(null);
-                }}
-                className="px-2 py-0.5 rounded bg-slate-900/80 text-slate-200 hover:text-white"
-              >
-                Отмена
-              </button>
-            </div>
-          )}
+          <MapBanners
+            courseEdit={courseEdit && isOrienteering && Boolean(event.map)}
+            courseControls={courseControls}
+            hasTracks={event.participants.length > 0}
+            nextIsStart={nextIsStart}
+            nextIsFinish={nextIsFinish}
+            onNextIsStart={setNextIsStart}
+            onNextIsFinish={setNextIsFinish}
+            onSaveCourse={(controls) => void saveCourse(controls)}
+            onAutoFitCourse={() => {
+              autoFitMapToCourse();
+              setCourseEdit(false);
+              onToggleFitMap?.(true);
+            }}
+            onCourseEditDone={() => setCourseEdit(false)}
+            snapStage={snapStage}
+            onCancelSnap={() => {
+              setSnapStage('idle');
+              setPickedFeatureLonLat(null);
+              setPinDraftPx(null);
+            }}
+          />
 
           {/* Speed heatmap legend */}
           {speedHeatmap && (
@@ -2720,137 +2418,15 @@ export const ReplayWorkspace: React.FC<Props> = ({
             )}
             {leaderboard.map(
               ({ participant: p, state, rank, gapMeters }) => (
-                <div
+                <ParticipantCard
                   key={p.id}
-                  className={`p-3 rounded-xl border transition ${
-                    p.visible
-                      ? 'bg-slate-900 border-slate-800'
-                      : 'bg-slate-950/50 border-slate-900 opacity-50'
-                  }`}
-                >
-                  <div className="flex items-center justify-between gap-2 mb-2">
-                    <div className="flex items-center gap-2 min-w-0">
-                      <span className="text-xs font-bold text-slate-500">
-                        #{rank}
-                      </span>
-                      <input
-                        type="color"
-                        value={p.color}
-                        onChange={(e) =>
-                          updateParticipant(p.id, { color: e.target.value })
-                        }
-                        className="w-4 h-4 rounded cursor-pointer bg-transparent border-0"
-                        title="Изменить цвет трека"
-                      />
-                      <span className="text-sm font-semibold text-slate-100 truncate">
-                        {p.name}
-                      </span>
-                    </div>
-
-                    <div className="flex items-center gap-1">
-                      <button
-                        onClick={() =>
-                          updateParticipant(p.id, { visible: !p.visible })
-                        }
-                        className="p-1 text-slate-400 hover:text-white"
-                        title={p.visible ? 'Скрыть трек' : 'Показать трек'}
-                      >
-                        {p.visible ? (
-                          <Eye className="w-3.5 h-3.5" />
-                        ) : (
-                          <EyeOff className="w-3.5 h-3.5" />
-                        )}
-                      </button>
-                      <button
-                        onClick={() => deleteParticipant(p.id)}
-                        className="p-1 text-slate-500 hover:text-rose-400"
-                        title="Удалить участника"
-                      >
-                        <Trash2 className="w-3.5 h-3.5" />
-                      </button>
-                    </div>
-                  </div>
-
-                  {state && (
-                    <div className="grid grid-cols-3 gap-2 text-xs bg-slate-950/70 p-2 rounded-lg border border-slate-800/80">
-                      <div>
-                        <div className="text-[10px] text-slate-400 flex items-center gap-1">
-                          <Gauge className="w-3 h-3 text-emerald-400" />
-                          Темп / Скор.
-                        </div>
-                        <div className="font-mono font-semibold text-slate-100">
-                          {formatPaceMinKm(state.speedMs)}
-                        </div>
-                        <div className="text-[10px] font-mono text-slate-400">
-                          {(state.speedMs * 3.6).toFixed(1)} км/ч
-                        </div>
-                      </div>
-
-                      <div>
-                        <div className="text-[10px] text-slate-400 flex items-center gap-1">
-                          <Activity className="w-3 h-3 text-sky-400" />
-                          Дистанция
-                        </div>
-                        <div className="font-mono font-semibold text-slate-100">
-                          {(state.distM / 1000).toFixed(2)} км
-                        </div>
-                        <div className="text-[10px] font-mono text-amber-400">
-                          {rank === 1 ? 'Лидер' : `-${gapMeters} м`}
-                        </div>
-                      </div>
-
-                      <div>
-                        <div className="text-[10px] text-slate-400 flex items-center gap-1">
-                          <Heart className="w-3 h-3 text-rose-400" />
-                          Пульс / Выс.
-                        </div>
-                        <div className="font-mono font-semibold text-slate-100">
-                          {state.hr ? `${state.hr} уд/м` : '—'}
-                        </div>
-                        <div className="text-[10px] font-mono text-slate-400">
-                          {state.ele ? `${Math.round(state.ele)} м` : '—'}
-                        </div>
-                      </div>
-                    </div>
-                  )}
-
-                  <div className="mt-2 flex items-center justify-between text-[11px] text-slate-400">
-                    <span className="flex items-center gap-1">
-                      <Clock className="w-3 h-3" />
-                      Сдвиг: {p.offsetSec > 0 ? `+${p.offsetSec}` : p.offsetSec}с (старт: {formatDuration(p.trimStartSec)})
-                    </span>
-                    <div className="flex items-center gap-1">
-                      <button
-                        onClick={() =>
-                          updateParticipant(p.id, {
-                            offsetSec: p.offsetSec - 5,
-                          })
-                        }
-                        className="px-1.5 py-0.5 rounded bg-slate-800 hover:bg-slate-700 text-slate-300"
-                      >
-                        -5с
-                      </button>
-                      <button
-                        onClick={() =>
-                          updateParticipant(p.id, { offsetSec: 0 })
-                        }
-                        className="px-1.5 py-0.5 rounded bg-slate-800 hover:bg-slate-700 text-slate-400"
-                      >
-                        0
-                      </button>
-                      <button
-                        onClick={() =>
-                          updateParticipant(p.id, {
-                            offsetSec: p.offsetSec + 5,
-                          })
-                        }
-                        className="px-1.5 py-0.5 rounded bg-slate-800 hover:bg-slate-700 text-slate-300"
-                      >
-                        +5с
-                      </button>
-                    </div>
-                  </div>
-                </div>
+                  participant={p}
+                  state={state}
+                  rank={rank}
+                  gapMeters={gapMeters}
+                  onUpdate={(patch) => void updateParticipant(p.id, patch)}
+                  onDelete={() => void deleteParticipant(p.id)}
+                />
               )
             )}
           </div>
@@ -2946,288 +2522,5 @@ export const ReplayWorkspace: React.FC<Props> = ({
         </div>
       </div>
     </div>
-  );
-};
-
-function fitMapToTracksOrMap(map: maplibregl.Map, event: RaceEvent) {
-  let minLon = Infinity,
-    maxLon = -Infinity,
-    minLat = Infinity,
-    maxLat = -Infinity;
-  let count = 0;
-
-  for (const p of event.participants) {
-    for (const pt of p.points) {
-      if (pt.lon < minLon) minLon = pt.lon;
-      if (pt.lon > maxLon) maxLon = pt.lon;
-      if (pt.lat < minLat) minLat = pt.lat;
-      if (pt.lat > maxLat) maxLat = pt.lat;
-      count++;
-    }
-  }
-  if (count === 0 && event.map?.cornersLonLat) {
-    for (const [lon, lat] of event.map.cornersLonLat) {
-      if (lon < minLon) minLon = lon;
-      if (lon > maxLon) maxLon = lon;
-      if (lat < minLat) minLat = lat;
-      if (lat > maxLat) maxLat = lat;
-      count++;
-    }
-  }
-  if (count >= 2) {
-    map.fitBounds(
-      [
-        [minLon, minLat],
-        [maxLon, maxLat],
-      ],
-      { padding: 50, maxZoom: 16, duration: 400 }
-    );
-  }
-}
-
-function buildCommonStartGeoJson(
-  participants: ParticipantTrack[]
-): GeoJSON.FeatureCollection {
-  const valid = participants.filter((p) => p.visible && p.points.length > 0);
-  if (valid.length === 0) {
-    return { type: 'FeatureCollection', features: [] };
-  }
-  let sumLon = 0;
-  let sumLat = 0;
-  for (const p of valid) {
-    const startPt =
-      p.points.find((pt) => pt.t >= p.trimStartSec) ?? p.points[0];
-    sumLon += startPt.lon;
-    sumLat += startPt.lat;
-  }
-  return {
-    type: 'FeatureCollection',
-    features: [
-      {
-        type: 'Feature',
-        properties: { label: 'ОБЩИЙ СТАРТ' },
-        geometry: {
-          type: 'Point',
-          coordinates: [sumLon / valid.length, sumLat / valid.length],
-        },
-      },
-    ],
-  };
-}
-
-function buildGhostTracksGeoJson(
-  participants: ParticipantTrack[]
-): GeoJSON.FeatureCollection {
-  return {
-    type: 'FeatureCollection',
-    features: participants
-      .filter((p) => p.visible && p.points.length >= 2)
-      .map((p) => ({
-        type: 'Feature',
-        properties: { id: p.id, color: p.color },
-        geometry: {
-          type: 'LineString',
-          coordinates: p.points.map((pt) => [pt.lon, pt.lat]),
-        },
-      })),
-  };
-}
-
-function speedToColorHex(speedMs: number): string {
-  if (speedMs < 2.7) return '#f43f5e';
-  if (speedMs < 3.6) return '#f59e0b';
-  return '#10b981';
-}
-
-/** Index of the first point with t ≥ `t` (points sorted by t) */
-function firstIndexAtOrAfter(points: { t: number }[], t: number): number {
-  let lo = 0;
-  let hi = points.length;
-  while (lo < hi) {
-    const mid = (lo + hi) >> 1;
-    if (points[mid].t < t) lo = mid + 1;
-    else hi = mid;
-  }
-  return lo;
-}
-
-function buildActiveTailsGeoJson(
-  participants: ParticipantTrack[],
-  raceTimeSec: number,
-  tailLengthSec: number,
-  timeMode: TimeMode,
-  eventEpochZeroMs: number,
-  speedHeatmap: boolean,
-  speedNormMode: SpeedNormMode = 'real',
-  referenceSpeedMs = 2.8
-): GeoJSON.FeatureCollection {
-  const features: GeoJSON.Feature[] = [];
-
-  for (const p of participants) {
-    if (!p.visible || p.points.length < 2) continue;
-
-    const headState = interpolateTrackAt(
-      p,
-      raceTimeSec,
-      timeMode,
-      eventEpochZeroMs,
-      speedNormMode,
-      referenceSpeedMs
-    );
-    if (!headState || headState.notStarted) continue;
-
-    // Track-local time of the head, consistent with every speed mode (incl. equal speed)
-    const headLocalT = headState.localT;
-
-    const tailStartT = Math.max(p.trimStartSec, headLocalT - tailLengthSec);
-    const tailEndT = Math.min(p.trimEndSec, p.durationSec, headLocalT);
-    // Points are sorted by t: binary-search the window instead of scanning the whole track
-    // every frame
-    const windowPts = p.points.slice(
-      firstIndexAtOrAfter(p.points, tailStartT),
-      firstIndexAtOrAfter(p.points, tailEndT + 1e-9)
-    );
-
-    const coords: Array<[number, number, number]> = windowPts.map((pt) => [
-      pt.lon,
-      pt.lat,
-      pt.speedMs,
-    ]);
-    coords.push([headState.lon, headState.lat, headState.speedMs]);
-
-    if (coords.length < 2) continue;
-
-    if (!speedHeatmap) {
-      features.push({
-        type: 'Feature',
-        properties: { color: p.color },
-        geometry: {
-          type: 'LineString',
-          coordinates: coords.map(([lon, lat]) => [lon, lat]),
-        },
-      });
-    } else {
-      for (let i = 0; i < coords.length - 1; i++) {
-        const c0 = coords[i];
-        const c1 = coords[i + 1];
-        features.push({
-          type: 'Feature',
-          properties: { color: speedToColorHex((c0[2] + c1[2]) / 2) },
-          geometry: {
-            type: 'LineString',
-            coordinates: [
-              [c0[0], c0[1]],
-              [c1[0], c1[1]],
-            ],
-          },
-        });
-      }
-    }
-  }
-
-  return { type: 'FeatureCollection', features };
-}
-
-const SpeedComparisonChart: React.FC<{
-  participants: ParticipantTrack[];
-  currentTimeSec: number;
-  totalDurationSec: number;
-  timeMode: TimeMode;
-  eventEpochZeroMs: number;
-  speedNormMode: SpeedNormMode;
-  referenceSpeedMs: number;
-  onSeek: (sec: number) => void;
-}> = ({
-  participants,
-  currentTimeSec,
-  totalDurationSec,
-  timeMode,
-  eventEpochZeroMs,
-  speedNormMode,
-  referenceSpeedMs,
-  onSeek,
-}) => {
-  const width = 320;
-  const height = 84;
-  const maxKmh = 22;
-
-  const cursorX =
-    totalDurationSec > 0
-      ? Math.min(width, Math.max(0, (currentTimeSec / totalDurationSec) * width))
-      : 0;
-
-  // The lines depend on the tracks and modes, not on the clock: only the cursor moves
-  const lines = useMemo(
-    () =>
-      participants
-        .filter((p) => p.visible && p.points.length >= 2)
-        .map((p) => {
-          const step = Math.max(1, Math.floor(p.points.length / 80));
-          const pts: string[] = [];
-          for (let i = 0; i < p.points.length; i += step) {
-            const pt = p.points[i];
-            if (pt.t < p.trimStartSec || pt.t > p.trimEndSec) continue;
-            // Same race clock as the map replay, in every time/speed mode
-            const activeT = raceTimeOfTrackPoint(
-              p,
-              pt,
-              timeMode,
-              eventEpochZeroMs,
-              speedNormMode,
-              referenceSpeedMs
-            );
-            if (activeT < 0 || activeT > totalDurationSec) continue;
-            const x = (activeT / totalDurationSec) * width;
-            const kmh = Math.min(maxKmh, pt.speedMs * 3.6);
-            const y = height - (kmh / maxKmh) * (height - 8) - 4;
-            pts.push(`${x.toFixed(1)},${y.toFixed(1)}`);
-          }
-          return { id: p.id, color: p.color, points: pts.join(' ') };
-        }),
-    [participants, totalDurationSec, timeMode, eventEpochZeroMs, speedNormMode, referenceSpeedMs]
-  );
-
-  return (
-    <svg
-      viewBox={`0 0 ${width} ${height}`}
-      className="w-full flex-1 bg-slate-900/60 rounded-lg border border-slate-800/80 cursor-pointer overflow-visible"
-      onClick={(e) => {
-        const rect = e.currentTarget.getBoundingClientRect();
-        const rel = Math.max(
-          0,
-          Math.min(1, (e.clientX - rect.left) / rect.width)
-        );
-        onSeek(rel * totalDurationSec);
-      }}
-    >
-      <line
-        x1={0}
-        y1={height / 2}
-        x2={width}
-        y2={height / 2}
-        stroke="#1e293b"
-        strokeDasharray="3 3"
-      />
-
-      {lines.map((l) => (
-        <polyline
-          key={l.id}
-          fill="none"
-          stroke={l.color}
-          strokeWidth={1.6}
-          strokeOpacity={0.85}
-          points={l.points}
-        />
-      ))}
-
-      <line
-        x1={cursorX}
-        y1={0}
-        x2={cursorX}
-        y2={height}
-        stroke="#10b981"
-        strokeWidth={1.5}
-      />
-    </svg>
   );
 };
