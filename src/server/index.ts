@@ -49,6 +49,7 @@ import {
 } from '../shared/types.js';
 
 const gzipAsync = promisify(zlib.gzip);
+const IMMUTABLE_CACHE = 'public, max-age=31536000, immutable';
 
 const DATA_DIR = path.resolve(process.cwd(), 'data');
 const EVENTS_DIR = path.join(DATA_DIR, 'events');
@@ -288,6 +289,8 @@ async function startServer() {
           'Content-Type',
           MIME_BY_EXT[ext] ?? 'application/octet-stream'
         );
+        // Every upload gets a new random name (a replaced map is a new file): cache forever
+        reply.header('Cache-Control', IMMUTABLE_CACHE);
         return reply.send(buf);
       } catch {
         return reply.code(404).send({ error: 'File not found' });
@@ -986,6 +989,8 @@ async function startServer() {
           'Content-Type',
           MIME_BY_EXT[ext] ?? 'application/octet-stream'
         );
+        // Vite build assets carry a content hash in their name
+        if (relPath.startsWith('assets/')) reply.header('Cache-Control', IMMUTABLE_CACHE);
         return reply.send(await fs.readFile(resolved));
       }
     } catch {

@@ -18,6 +18,16 @@ export default defineConfig({
   },
   build: {
     outDir: 'dist/client',
+    // maplibre-gl alone is ~800 kB minified and cannot be split further
+    chunkSizeWarningLimit: 900,
+    rollupOptions: {
+      output: {
+        // Big libraries in their own files: an app deploy does not re-download them
+        manualChunks: {
+          maplibre: ['maplibre-gl'],
+          react: ['react', 'react-dom'],
+        },
+      },
+    },
   },
 });
-

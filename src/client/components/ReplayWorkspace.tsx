@@ -69,11 +69,12 @@ import {
   correctTrackToControls,
 } from '../../shared/course.js';
 import { readImageDpi } from '../imageDpi.js';
-import { detectCirclesOnScan } from '../detectCircles.js';
-import { autoGeoref } from '../../shared/autoGeoref.js';
 import { useCourseOverlay } from './useCourseOverlay.js';
 import { SplitsPanel } from './SplitsPanel.js';
-import { FitPanel } from './FitPanel.js';
+// Map fitting UI is only needed for orienteering maps: loaded on first use
+const FitPanel = React.lazy(() =>
+  import('./FitPanel.js').then((m) => ({ default: m.FitPanel }))
+);
 
 const BASE_LAYERS: readonly BaseLayer[] = ['topo', 'osm', 'satellite'];
 const BASE_LAYER_LABELS: Record<BaseLayer, string> = {
@@ -1275,6 +1276,11 @@ export const ReplayWorkspace: React.FC<Props> = ({
     // let the status paint before the CPU-heavy part
     await new Promise((r) => setTimeout(r, 30));
     try {
+      // Loaded on first use (keeps the main bundle small)
+      const [{ detectCirclesOnScan }, { autoGeoref }] = await Promise.all([
+        import('../detectCircles.js'),
+        import('../../shared/autoGeoref.js'),
+      ]);
       const scan = await detectCirclesOnScan(meta.imageUrl, meta.width, meta.scanDpi);
       const circles = scan.circles;
       if (circles.length < 3) {
@@ -2365,6 +2371,9 @@ export const ReplayWorkspace: React.FC<Props> = ({
                   {uploadError}
                 </div>
               )}
+              <React.Suspense
+                fallback={<div className="p-3 text-xs text-slate-400">Загрузка…</div>}
+              >
               <FitPanel
                 hasTracks={event.participants.length > 0}
                 onTrackFiles={handleTrackUpload}
@@ -2427,6 +2436,7 @@ export const ReplayWorkspace: React.FC<Props> = ({
                   });
                 }}
               />
+              </React.Suspense>
             </>
           ) : (
           <>
