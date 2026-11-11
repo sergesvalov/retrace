@@ -111,7 +111,7 @@ export function detectControlPassages(
 }
 
 /**
- * Livelox-style route adjustment: shift the track so it passes exactly through every
+ * Route adjustment: shift the track so it passes exactly through every
  * punched control. The shift measured at each punch is blended linearly in time between
  * punches, which removes the slowly drifting GPS offset typical for forest running.
  * Punches farther than `maxShiftM` are treated as unreliable and ignored.

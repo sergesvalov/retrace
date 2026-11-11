@@ -166,7 +166,7 @@ describe('Georeferencing math (Web Mercator similarity & affine)', () => {
   });
 });
 
-describe('Track parsing, Livelox speed normalization & leg route-choice analysis', () => {
+describe('Track parsing, speed normalisation & leg route-choice analysis', () => {
   it('parses GPX with Garmin heart-rate extensions and interpolates runner telemetry', () => {
     const sampleGpx = `<?xml version="1.0" encoding="UTF-8"?>
       <gpx version="1.1" creator="Garmin Connect">

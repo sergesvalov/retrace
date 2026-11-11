@@ -29,13 +29,13 @@ function makeRunner(id: string, speedMs: number, points = 31) {
 }
 
 describe('replay timing', () => {
-  it('Livelox handicap brings fast and slow runners to the reference speed', () => {
+  it('fitness handicap brings fast and slow runners to the reference speed', () => {
     const fast = makeRunner('fast', 4);
     const slow = makeRunner('slow', 2);
     const ref = 3;
     const at = 100;
-    const f = interpolateTrackAt(fast, at, 'from_start', 0, 'livelox_handicap', ref)!;
-    const s = interpolateTrackAt(slow, at, 'from_start', 0, 'livelox_handicap', ref)!;
+    const f = interpolateTrackAt(fast, at, 'from_start', 0, 'fitness_handicap', ref)!;
+    const s = interpolateTrackAt(slow, at, 'from_start', 0, 'fitness_handicap', ref)!;
     // Both cover ~ref * t metres, instead of the fast runner pulling further ahead
     expect(f.distM).toBeGreaterThan(ref * at * 0.95);
     expect(f.distM).toBeLessThan(ref * at * 1.05);
@@ -56,7 +56,7 @@ describe('replay timing', () => {
     const r = makeRunner('r', 4);
     r.offsetSec = 7;
     const pt = r.points[12];
-    for (const mode of ['real', 'livelox_handicap', 'equal_speed'] as const) {
+    for (const mode of ['real', 'fitness_handicap', 'equal_speed'] as const) {
       const raceT = raceTimeOfTrackPoint(r, pt, 'from_start', 0, mode, 3);
       const st = interpolateTrackAt(r, raceT, 'from_start', 0, mode, 3)!;
       expect(st.localT).toBeCloseTo(pt.t, 3);

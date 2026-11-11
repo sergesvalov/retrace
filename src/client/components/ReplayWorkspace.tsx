@@ -195,7 +195,7 @@ export const ReplayWorkspace: React.FC<Props> = ({
   const [nextIsFinish, setNextIsFinish] = useState<boolean>(false);
   // Start/finish are placed by hand (tracks are switched on late / off late)
   const [nextIsStart, setNextIsStart] = useState<boolean>(false);
-  // Livelox-style adjustment of the tracks onto the punched controls
+  // Adjustment of the tracks onto the punched controls
   const [trackCorrection, setTrackCorrection] = useState<boolean>(true);
 
   const mapContainerRef = useRef<HTMLDivElement | null>(null);
@@ -368,7 +368,7 @@ export const ReplayWorkspace: React.FC<Props> = ({
     if (!event.map) setCourseEdit(false);
   }, [Boolean(event.map)]);
 
-  // Compute group mean speed (m/s) for Livelox speed normalization
+  // Group mean speed (m/s) for the speed normalisation modes
   const groupReferenceSpeedMs = useMemo(() => {
     const visible = event.participants.filter(
       (p) => p.visible && p.durationSec > 0
@@ -400,7 +400,7 @@ export const ReplayWorkspace: React.FC<Props> = ({
         : [],
     [event.participants, courseControls, event.map?.matrix]
   );
-  // Tracks as drawn and replayed: with the Livelox-style adjustment when it is on
+  // Tracks as drawn and replayed: with the adjustment to the controls when it is on
   const displayParticipants = useMemo<ParticipantTrack[]>(() => {
     if (!trackCorrection || splits.length === 0) return event.participants;
     const byId = new Map(splits.map((s) => [s.participantId, s]));
@@ -2523,20 +2523,20 @@ export const ReplayWorkspace: React.FC<Props> = ({
                     ? 'bg-fuchsia-500/30 border-fuchsia-400 text-fuchsia-200 animate-pulse'
                     : 'bg-fuchsia-500/15 hover:bg-fuchsia-500/25 border-fuchsia-500/30 text-fuchsia-300'
                 }`}
-                title="Выбрать 2 точки на карте (КП А → КП Б) для анализа вариантов пути и выравнивания скорости (как в Livelox)"
+                title="Выбрать 2 точки на карте (КП А → КП Б) для анализа вариантов пути и выравнивания скорости"
               >
                 <Navigation className="w-3.5 h-3.5 shrink-0" />
                 Перегон A → B
               </button>
             </div>
 
-            {/* Livelox Speed Normalization Switch (orienteering route-choice tool) */}
+            {/* Speed normalisation switch (orienteering route-choice tool) */}
             {isOrienteering && (
             <div className="bg-slate-950 p-1.5 rounded-lg border border-slate-800 space-y-1">
               <div className="flex items-center justify-between text-[10px] text-slate-400 px-1">
                 <span className="flex items-center gap-1">
                   <Zap className="w-3 h-3 text-amber-400" />
-                  Режим скорости (Livelox):
+                  Выравнивание скорости:
                 </span>
                 {(customStartSpot || selectedLeg) && (
                   <button
@@ -2560,13 +2560,13 @@ export const ReplayWorkspace: React.FC<Props> = ({
                   Реальная
                 </button>
                 <button
-                  onClick={() => setSpeedNormMode('livelox_handicap')}
+                  onClick={() => setSpeedNormMode('fitness_handicap')}
                   className={`py-1 rounded text-center transition ${
-                    speedNormMode === 'livelox_handicap'
+                    speedNormMode === 'fitness_handicap'
                       ? 'bg-amber-500 text-slate-950 font-semibold'
                       : 'text-slate-400 hover:text-slate-200'
                   }`}
-                  title="Как в Livelox: выравнивает базовую физподготовку участников по их среднему темпу за гонку, чтобы понять какой вариант на перегоне (по прямой, по оврагу или вокруг по дороге) выгоднее!"
+                  title="Выравнивает базовую физподготовку участников по их среднему темпу за гонку, чтобы понять какой вариант на перегоне (по прямой, по оврагу или вокруг по дороге) выгоднее!"
                 >
                   ⚡ По силам
                 </button>
@@ -2648,7 +2648,7 @@ export const ReplayWorkspace: React.FC<Props> = ({
                         )}
                         <span
                           className="text-amber-300 ml-1.5 text-[11px]"
-                          title="Выровненное время Livelox (при равной физподготовке)"
+                          title="Время с поправкой на физподготовку (как если бы все бежали в одном темпе)"
                         >
                           (⚡{formatDuration(st.normalizedLegTimeSec)})
                         </span>

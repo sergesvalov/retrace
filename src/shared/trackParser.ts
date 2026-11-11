@@ -441,7 +441,7 @@ export function computeTracksBoundingBox(participants: ParticipantTrack[]): {
   return { minLon, maxLon, minLat, maxLat, startLon, startLat };
 }
 
-export type SpeedNormMode = 'real' | 'livelox_handicap' | 'equal_speed';
+export type SpeedNormMode = 'real' | 'fitness_handicap' | 'equal_speed';
 
 export interface LegParticipantStats {
   participantId: string;
@@ -526,7 +526,7 @@ export function syncAllParticipantsToSpot(
 
 /**
  * Analyze a leg between two arbitrary map points `startLonLat` (КП A) and `endLonLat` (КП B)
- * for route-choice comparison (straight vs road vs contour, elevation gain/loss, and Livelox speed normalization).
+ * for route-choice comparison (straight vs road vs contour, elevation gain/loss, and speed normalisation).
  */
 export function analyzeLegBetweenSpots(
   participants: ParticipantTrack[],
@@ -598,7 +598,7 @@ export function analyzeLegBetweenSpots(
         ? Math.round((avgSpeedMs / overallSpeedMs - 1) * 100)
         : 0;
 
-    // Livelox handicap-normalized leg time: removes physical fitness difference between runners
+    // Handicap-normalised leg time: removes the physical fitness difference between runners
     const normalizedLegTimeSec = Math.round(
       legTimeSec * (overallSpeedMs / Math.max(0.5, groupMeanSpeedMs))
     );
@@ -659,7 +659,7 @@ function overallSpeedOf(track: ParticipantTrack, fallbackMs: number): number {
 
 /**
  * Track seconds that elapse per race-clock second in 'from_start' mode.
- * Livelox handicap: every runner is replayed at the group reference speed on average,
+ * Fitness handicap: every runner is replayed at the group reference speed on average,
  * so a faster-than-average runner is slowed down (rate < 1) and a slower one sped up.
  */
 function trackRateFactor(
@@ -667,7 +667,7 @@ function trackRateFactor(
   speedNormMode: SpeedNormMode,
   referenceSpeedMs: number
 ): number {
-  if (speedNormMode !== 'livelox_handicap' || referenceSpeedMs <= 0.3) return 1;
+  if (speedNormMode !== 'fitness_handicap' || referenceSpeedMs <= 0.3) return 1;
   const overall = overallSpeedOf(track, referenceSpeedMs);
   return overall > 0.3 ? referenceSpeedMs / overall : 1;
 }
@@ -700,7 +700,7 @@ export function raceTimeOfTrackPoint(
 
 /**
  * Interpolate participant position & metrics at race clock `raceTimeSec`.
- * Supports Livelox speed normalization (`livelox_handicap` and `equal_speed`).
+ * Supports speed normalisation (`fitness_handicap` and `equal_speed`).
  */
 export function interpolateTrackAt(
   track: ParticipantTrack,
@@ -831,7 +831,7 @@ export function interpolateTrackAt(
   return {
     lat: p0.lat + (p1.lat - p0.lat) * alpha,
     lon: p0.lon + (p1.lon - p0.lon) * alpha,
-    // Replayed speed: the Livelox handicap slows down / speeds up the whole track by `rateFactor`
+    // Replayed speed: the fitness handicap slows down / speeds up the whole track by `rateFactor`
     speedMs: (p0.speedMs + (p1.speedMs - p0.speedMs) * alpha) * rateFactor,
     distM: Math.max(
       0,

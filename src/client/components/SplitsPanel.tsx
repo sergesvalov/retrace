@@ -60,7 +60,7 @@ export const SplitsPanel: React.FC<Props> = ({
         <div className="flex items-center gap-2">
           <label
             className="inline-flex items-center gap-1 text-[11px] text-slate-300 cursor-pointer"
-            title="Сдвинуть треки так, чтобы они проходили точно через отметки на КП (снос GPS поперёк хода). Как корректировка маршрута в Livelox"
+            title="Сдвинуть треки так, чтобы они проходили точно через отметки на КП (снос GPS поперёк хода)"
           >
             <input
               type="checkbox"
