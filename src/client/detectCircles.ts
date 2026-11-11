@@ -206,6 +206,47 @@ export interface ScanAnalysis {
   circles: DetectedCircle[];
 }
 
+/**
+ * How much to shrink the scan before detection, and which ring radii to search there.
+ * Known DPI: 5–6 mm circles → shrink so the radius is ~10 px, search ±25 %.
+ * Unknown DPI (screenshots, re-saved copies): keep up to 1600 px so thin rings survive;
+ * a whole A4…A3 sheet across 1600 px puts a 5–6 mm circle at r ≈ 9…16 px (allow crops).
+ */
+export function planDownscale(
+  natW: number,
+  natH: number,
+  scanDpi?: number | null
+): { factor: number; range: { rMin: number; rMax: number } } {
+  const knownDpi = scanDpi && scanDpi >= 30 ? scanDpi : null;
+  if (knownDpi) {
+    const rMidFull = (5.5 / 2 / 25.4) * knownDpi;
+    return {
+      factor: Math.min(1, 10 / rMidFull),
+      range: { rMin: 10 * (5 / 5.5) * 0.8, rMax: 10 * (6 / 5.5) * 1.25 },
+    };
+  }
+  return {
+    factor: Math.min(1, 1600 / Math.max(natW, natH || 1)),
+    range: { rMin: 6, rMax: 32 },
+  };
+}
+
+/** Detect on the shrunken image and map the circles back to full-resolution pixels */
+export function circlesOnShrunkScan(
+  small: RgbaImage,
+  range: { rMin: number; rMax: number },
+  fullWidth: number
+): DetectedCircle[] {
+  const toFull = fullWidth / small.width;
+  return detectOverprintCircles(small, range).map((c) => ({
+    ...c,
+    px: c.px * toFull,
+    py: c.py * toFull,
+    r: c.r * toFull,
+  }));
+}
+
+/** Main-thread version (fallback when Web Workers / OffscreenCanvas are unavailable) */
 export async function detectCirclesOnScan(
   url: string,
   fullWidth: number,
@@ -219,21 +260,7 @@ export async function detectCirclesOnScan(
   });
   const natW = img.naturalWidth || fullWidth;
   const natH = img.naturalHeight;
-
-  const knownDpi = scanDpi && scanDpi >= 30 ? scanDpi : null;
-  let factor: number;
-  let range: { rMin: number; rMax: number };
-  if (knownDpi) {
-    // 5–6 mm circles at a known DPI: downscale so the radius is ~10 px, search ±25 %
-    const rMidFull = (5.5 / 2 / 25.4) * knownDpi;
-    factor = Math.min(1, 10 / rMidFull);
-    range = { rMin: 10 * (5 / 5.5) * 0.8, rMax: 10 * (6 / 5.5) * 1.25 };
-  } else {
-    // Unknown DPI (screenshots, re-saved copies): keep up to 1600 px so thin rings survive.
-    // A whole A4…A3 sheet across 1600 px puts a 5–6 mm circle at r ≈ 9…16 px; allow crops.
-    factor = Math.min(1, 1600 / Math.max(natW, natH || 1));
-    range = { rMin: 6, rMax: 32 };
-  }
+  const { factor, range } = planDownscale(natW, natH, scanDpi);
   const w = Math.max(1, Math.round(natW * factor));
   const h = Math.max(1, Math.round(natH * factor));
 
@@ -244,17 +271,5 @@ export async function detectCirclesOnScan(
   if (!ctx) throw new Error('Canvas недоступен');
   ctx.drawImage(img, 0, 0, w, h);
   const data = ctx.getImageData(0, 0, w, h);
-
-  const small: RgbaImage = { width: w, height: h, data: data.data };
-  const found = detectOverprintCircles(small, range);
-  // Back to the full-resolution pixel grid the map placement uses
-  const toFull = fullWidth / w;
-  const circles = found.map((c) => ({
-    ...c,
-    px: c.px * toFull,
-    py: c.py * toFull,
-    r: c.r * toFull,
-  }));
-  return { circles };
+  return { circles: circlesOnShrunkScan({ width: w, height: h, data: data.data }, range, fullWidth) };
 }
-

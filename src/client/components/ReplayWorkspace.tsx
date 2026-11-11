@@ -1273,16 +1273,30 @@ export const ReplayWorkspace: React.FC<Props> = ({
     }
     autoGeorefRunningRef.current = true;
     setAutoGeorefState({ busy: true, ok: null, text: 'Ищу кружки КП на скане…' });
-    // let the status paint before the CPU-heavy part
-    await new Promise((r) => setTimeout(r, 30));
     try {
-      // Loaded on first use (keeps the main bundle small)
-      const [{ detectCirclesOnScan }, { autoGeoref }] = await Promise.all([
-        import('../detectCircles.js'),
-        import('../../shared/autoGeoref.js'),
-      ]);
-      const scan = await detectCirclesOnScan(meta.imageUrl, meta.width, meta.scanDpi);
-      const circles = scan.circles;
+      // Detection + matching run in a background thread (loaded on first use)
+      const { runAutoGeorefTask } = await import('../autoGeorefClient.js');
+      const hint =
+        meta.printScale && meta.scanDpi
+          ? groundMetersPerPixelFromPrint(meta.printScale, meta.scanDpi)
+          : null;
+      const { circles, result: res } = await runAutoGeorefTask(
+        {
+          url: meta.imageUrl,
+          fullWidth: meta.width,
+          scanDpi: meta.scanDpi,
+          participants: eventRef.current.participants,
+          declinationDeg: meta.declinationDeg ?? autoDeclinationDeg,
+          groundMPerPxHint: hint,
+        },
+        (count) =>
+          count >= 3 &&
+          setAutoGeorefState({
+            busy: true,
+            ok: null,
+            text: `Найдено кружков: ${count}. Сопоставляю с треками…`,
+          })
+      );
       if (circles.length < 3) {
         setAutoGeorefState({
           busy: false,
@@ -1291,23 +1305,6 @@ export const ReplayWorkspace: React.FC<Props> = ({
         });
         return;
       }
-      setAutoGeorefState({
-        busy: true,
-        ok: null,
-        text: `Найдено кружков: ${circles.length}. Сопоставляю с треками…`,
-      });
-      await new Promise((r) => setTimeout(r, 30));
-
-      const hint =
-        meta.printScale && meta.scanDpi
-          ? groundMetersPerPixelFromPrint(meta.printScale, meta.scanDpi)
-          : null;
-      const res = autoGeoref({
-        circles,
-        participants: eventRef.current.participants,
-        declinationDeg: meta.declinationDeg ?? autoDeclinationDeg,
-        groundMPerPxHint: hint,
-      });
       const matched = res?.matchedCircles.length ?? 0;
       const confident =
         res !== null &&
