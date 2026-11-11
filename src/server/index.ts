@@ -1,6 +1,8 @@
 import crypto from 'node:crypto';
 import fs from 'node:fs/promises';
 import path from 'node:path';
+import { promisify } from 'node:util';
+import zlib from 'node:zlib';
 import Fastify from 'fastify';
 import multipart from '@fastify/multipart';
 import {
@@ -29,6 +31,7 @@ import {
   syncAllParticipantsToCommonStartSpot,
   syncAllParticipantsToSpot,
 } from '../shared/trackParser.js';
+import { toLiteEvent, toWireEvent, toWireParticipant } from '../shared/pointsCodec.js';
 import {
   CONTROL_KINDS,
   EVENT_KINDS,
@@ -44,6 +47,8 @@ import {
   type TimeMode,
   type TransformType,
 } from '../shared/types.js';
+
+const gzipAsync = promisify(zlib.gzip);
 
 const DATA_DIR = path.resolve(process.cwd(), 'data');
 const EVENTS_DIR = path.join(DATA_DIR, 'events');
@@ -249,6 +254,21 @@ async function startServer() {
     }
   });
 
+  // gzip text responses (JSON with track points shrinks ~4×, JS/CSS bundles ~3.5×)
+  app.addHook('onSend', async (req, reply, payload) => {
+    const type = String(reply.getHeader('content-type') ?? '');
+    const compressible = /json|javascript|css|html|svg|text\//.test(type);
+    const accepts = /\bgzip\b/.test(String(req.headers['accept-encoding'] ?? ''));
+    if (!compressible || !accepts || reply.getHeader('content-encoding')) return payload;
+    const body =
+      typeof payload === 'string' ? Buffer.from(payload) : Buffer.isBuffer(payload) ? payload : null;
+    if (!body || body.length < 1024) return payload;
+    reply.header('Content-Encoding', 'gzip');
+    reply.header('Vary', 'Accept-Encoding');
+    reply.removeHeader('content-length');
+    return gzipAsync(body);
+  });
+
   await app.register(multipart, {
     limits: {
       fileSize: 40 * 1024 * 1024,
@@ -304,7 +324,8 @@ async function startServer() {
       if (!found) {
         return reply.code(404).send({ error: 'Событие не найдено' });
       }
-      return { event: found };
+      // The only response with track points (packed); changes answer without them
+      return { event: toWireEvent(found) };
     }
   );
 
@@ -329,7 +350,7 @@ async function startServer() {
       };
       eventsStore.set(evt.id, evt);
       await saveEventToDisk(evt);
-      return { event: evt };
+      return { event: toLiteEvent(evt) };
     }
   );
 
@@ -358,7 +379,7 @@ async function startServer() {
     if (typeof description === 'string') evt.description = description;
     if (timeMode !== undefined) evt.timeMode = timeMode;
     await saveEventToDisk(evt);
-    return { event: evt };
+    return { event: toLiteEvent(evt) };
   });
 
   // Upload or set raster map metadata
@@ -431,7 +452,7 @@ async function startServer() {
       await saveEventToDisk(evt);
       // The replaced scan is no longer referenced by anything
       await removeUploadedMapFile(previousImageUrl);
-      return { event: evt };
+      return { event: toLiteEvent(evt) };
     }
   );
 
@@ -499,7 +520,7 @@ async function startServer() {
     if (gcps.length > 0) evt.map.manuallyPlaced = true;
 
     await saveEventToDisk(evt);
-    return { event: evt };
+    return { event: toLiteEvent(evt) };
   });
 
   // Nudge map overlay directly (shift in meters, rotate in deg, scale, or set matrix directly)
@@ -545,7 +566,7 @@ async function startServer() {
       evt.map.manuallyPlaced = false;
       if (req.body.resetAutoFit) {
         await saveEventToDisk(evt);
-        return { event: evt };
+        return { event: toLiteEvent(evt) };
       }
     }
 
@@ -630,7 +651,7 @@ async function startServer() {
 
     evt.map.manuallyPlaced = true;
     await saveEventToDisk(evt);
-    return { event: evt };
+    return { event: toLiteEvent(evt) };
   });
 
   // Upload GPS track file (GPX, FIT, TCX)
@@ -719,7 +740,7 @@ async function startServer() {
         }
 
         await saveEventToDisk(evt);
-        return { event: evt, participant };
+        return { event: toLiteEvent(evt), participant: toWireParticipant(participant) };
       } catch (err: unknown) {
         const message =
           err instanceof Error
@@ -775,7 +796,7 @@ async function startServer() {
       p.trimEndSec = Math.max(0, Math.min(p.durationSec, body.trimEndSec));
 
     await saveEventToDisk(evt);
-    return { event: evt };
+    return { event: toLiteEvent(evt) };
   });
 
   // Delete participant
@@ -788,7 +809,7 @@ async function startServer() {
         (p) => p.id !== req.params.participantId
       );
       await saveEventToDisk(evt);
-      return { event: evt };
+      return { event: toLiteEvent(evt) };
     }
   );
 
@@ -839,7 +860,7 @@ async function startServer() {
 
     evt.timeMode = 'from_start';
     await saveEventToDisk(evt);
-    return { event: evt };
+    return { event: toLiteEvent(evt) };
   });
 
   // Replace the course (controls drawn on the map image, in course order)
@@ -877,7 +898,7 @@ async function startServer() {
       }
       evt.map.controls = clean;
       await saveEventToDisk(evt);
-      return { event: evt };
+      return { event: toLiteEvent(evt) };
     }
   );
 
@@ -906,7 +927,7 @@ async function startServer() {
     }
     evt.timeMode = 'from_start';
     await saveEventToDisk(evt);
-    return { event: evt };
+    return { event: toLiteEvent(evt) };
   });
 
   // Delete map from an event
@@ -918,7 +939,7 @@ async function startServer() {
       await removeUploadedMapFile(evt.map?.imageUrl);
       evt.map = undefined;
       await saveEventToDisk(evt);
-      return { event: evt };
+      return { event: toLiteEvent(evt) };
     }
   );
 

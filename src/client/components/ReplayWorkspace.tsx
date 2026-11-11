@@ -57,6 +57,11 @@ import {
 } from '../../shared/types.js';
 import { magneticDeclinationDeg } from '../../shared/declination.js';
 import {
+  fromWireParticipant,
+  mergeLiteEvent,
+  type LiteEvent,
+} from '../../shared/pointsCodec.js';
+import {
   computeSplits,
   controlLabels,
   fitMapToCourse,
@@ -201,6 +206,17 @@ export const ReplayWorkspace: React.FC<Props> = ({
 
   const eventRef = useRef(event);
   eventRef.current = event;
+
+  /**
+   * Change responses carry the event without track points (they never change after upload):
+   * merge them into the event we hold, so nothing re-downloads megabytes per click.
+   */
+  function applyServerEvent(lite: LiteEvent): RaceEvent {
+    const merged = mergeLiteEvent(eventRef.current, lite);
+    eventRef.current = merged;
+    onEventUpdated(merged);
+    return merged;
+  }
   const anchorLonLatRef = useRef(anchorLonLat);
   anchorLonLatRef.current = anchorLonLat;
 
@@ -420,7 +436,7 @@ export const ReplayWorkspace: React.FC<Props> = ({
       setUploadError(data.error || 'Не удалось сохранить КП');
       return;
     }
-    if (eventRef.current.id === eventId) onEventUpdated(data.event);
+    if (eventRef.current.id === eventId) applyServerEvent(data.event);
   }
 
   /** Map click while editing the course: start first, then controls in order, finish last */
@@ -472,7 +488,7 @@ export const ReplayWorkspace: React.FC<Props> = ({
     });
     if (res.ok) {
       const data = await res.json();
-      onEventUpdated(data.event);
+      applyServerEvent(data.event);
       setRaceTimeSec(0);
       setIsPlaying(false);
     }
@@ -1101,7 +1117,7 @@ export const ReplayWorkspace: React.FC<Props> = ({
         if (seq !== matrixSaveSeqRef.current || eventRef.current.id !== eventId) {
           return;
         }
-        onEventUpdated(data.event);
+        applyServerEvent(data.event);
       } catch {
         // network error: the next save carries the full matrix anyway
       }
@@ -1349,7 +1365,7 @@ export const ReplayWorkspace: React.FC<Props> = ({
     if (eventRef.current.id !== eventId) return;
     resetRelativeSliders();
     setAnchorLonLat(null);
-    onEventUpdated(data.event);
+    applyServerEvent(data.event);
   }
 
   /** What the user is looking at: where a map without tracks should appear */
@@ -1411,7 +1427,7 @@ export const ReplayWorkspace: React.FC<Props> = ({
       prevAngleDegRef.current = 0;
       prevStretchPctRef.current = 0;
       setAnchorLonLat(null);
-      onEventUpdated(data.event);
+      applyServerEvent(data.event);
     }
   }
 
@@ -1654,7 +1670,7 @@ export const ReplayWorkspace: React.FC<Props> = ({
     });
     if (res.ok) {
       const data = await res.json();
-      onEventUpdated(data.event);
+      applyServerEvent(data.event);
       onToggleFitMap?.(false);
     }
   }
@@ -1683,9 +1699,13 @@ export const ReplayWorkspace: React.FC<Props> = ({
         if (!res.ok) {
           setUploadError(data.error || 'Ошибка загрузки трека');
         } else {
-          latestEvent = data.event;
+          // the response carries no track points except the new participant's (packed)
+          latestEvent = mergeLiteEvent(latestEvent, data.event, [
+            fromWireParticipant(data.participant),
+          ]);
         }
       }
+      eventRef.current = latestEvent;
       onEventUpdated(latestEvent);
       if (mapRef.current) {
         fitMapToTracksOrMap(mapRef.current, latestEvent);
@@ -1774,12 +1794,9 @@ export const ReplayWorkspace: React.FC<Props> = ({
         prevScalePctRef.current = 100;
         prevAngleDegRef.current = 0;
         prevStretchPctRef.current = 0;
-        onEventUpdated(data.event);
+        const merged = applyServerEvent(data.event);
         onToggleFitMap?.(true);
-        if (data.event?.participants?.length > 0) {
-          eventRef.current = data.event;
-          void runAutoGeoref(true);
-        }
+        if (merged.participants.length > 0) void runAutoGeoref(true);
       } else {
         const data = await res.json().catch(() => ({}));
         setUploadError(data.error || 'Не удалось загрузить карту');
@@ -1805,7 +1822,7 @@ export const ReplayWorkspace: React.FC<Props> = ({
     );
     if (res.ok) {
       const data = await res.json();
-      onEventUpdated(data.event);
+      applyServerEvent(data.event);
     }
   }
 
@@ -1818,7 +1835,7 @@ export const ReplayWorkspace: React.FC<Props> = ({
     );
     if (res.ok) {
       const data = await res.json();
-      onEventUpdated(data.event);
+      applyServerEvent(data.event);
     }
   }
 
@@ -1830,7 +1847,7 @@ export const ReplayWorkspace: React.FC<Props> = ({
     });
     if (res.ok) {
       const data = await res.json();
-      onEventUpdated(data.event);
+      applyServerEvent(data.event);
       setRaceTimeSec(0);
     }
   }
@@ -1943,7 +1960,7 @@ export const ReplayWorkspace: React.FC<Props> = ({
     });
     if (res.ok) {
       const data = await res.json();
-      onEventUpdated(data.event);
+      applyServerEvent(data.event);
       setRaceTimeSec(0);
     }
   }

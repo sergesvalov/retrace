@@ -13,6 +13,7 @@ import {
   type RaceEvent,
 } from '../shared/types.js';
 import { ReplayWorkspace } from './components/ReplayWorkspace.js';
+import { fromWireEvent, mergeLiteEvent } from '../shared/pointsCodec.js';
 import { EVENT_KIND_INFO, EventDialog } from './components/EventDialog.js';
 
 interface EventSummary {
@@ -75,7 +76,8 @@ export const App: React.FC = () => {
     const res = await fetch(`/api/events/${idOrSlug}`);
     if (res.ok) {
       const data = await res.json();
-      setCurrentEvent(data.event);
+      // the full event: track points come packed
+      setCurrentEvent(fromWireEvent(data.event));
       setEventInUrl(data.event.slug);
     }
   }
@@ -90,7 +92,7 @@ export const App: React.FC = () => {
       });
       if (res.ok) {
         const data = await res.json();
-        const evt: RaceEvent = data.event;
+        const evt: RaceEvent = mergeLiteEvent(null, data.event);
         setCurrentEvent(evt);
         setEventInUrl(evt.slug);
         setFitMapMode(false);
@@ -119,7 +121,7 @@ export const App: React.FC = () => {
     });
     if (res.ok) {
       const data = await res.json();
-      setCurrentEvent(data.event);
+      setCurrentEvent((prev) => mergeLiteEvent(prev, data.event));
       if (value.kind === 'run') setFitMapMode(false);
       setDialog(null);
       await refreshEventsList();
