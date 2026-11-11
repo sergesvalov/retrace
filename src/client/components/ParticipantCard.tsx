@@ -1,5 +1,5 @@
-import React from 'react';
-import { Activity, Clock, Eye, EyeOff, Gauge, Heart, Trash2 } from 'lucide-react';
+import React, { useRef, useState } from 'react';
+import { Activity, Clock, Eye, EyeOff, Gauge, Heart, Pencil, Trash2 } from 'lucide-react';
 import {
   formatDuration,
   formatPaceMinKm,
@@ -16,7 +16,63 @@ interface Props {
   onDelete: () => void;
 }
 
-/** One runner in the live list: colour, visibility, pace / distance / HR now, start shift */
+/** Longest runner name (the server cuts it to the same length) */
+const MAX_NAME_LENGTH = 40;
+
+/**
+ * Runner name in the card. It comes from the track file ("Sia Running", "Morning Run"…):
+ * click it to sign the runner; Enter or clicking away saves, Esc cancels.
+ */
+const RunnerName: React.FC<{ name: string; onRename: (name: string) => void }> = ({
+  name,
+  onRename,
+}) => {
+  const [draft, setDraft] = useState<string | null>(null);
+  // Esc closes the field: the blur that follows must not save
+  const cancelledRef = useRef(false);
+  if (draft === null) {
+    return (
+      <button
+        onClick={() => {
+          cancelledRef.current = false;
+          setDraft(name);
+        }}
+        className="group flex items-center gap-1 min-w-0 text-left"
+        title="Подписать бегуна: имя на карте, в сплитах и в видео"
+      >
+        <span className="text-sm font-semibold text-slate-100 truncate">{name}</span>
+        <Pencil className="w-3 h-3 shrink-0 text-slate-500 opacity-0 group-hover:opacity-100 transition" />
+      </button>
+    );
+  }
+  const commit = () => {
+    if (cancelledRef.current) return;
+    const next = draft.trim().slice(0, MAX_NAME_LENGTH);
+    setDraft(null);
+    if (next && next !== name) onRename(next);
+  };
+  return (
+    <input
+      autoFocus
+      value={draft}
+      maxLength={MAX_NAME_LENGTH}
+      onChange={(e) => setDraft(e.target.value)}
+      onFocus={(e) => e.target.select()}
+      onBlur={commit}
+      onKeyDown={(e) => {
+        if (e.key === 'Enter') e.currentTarget.blur();
+        if (e.key === 'Escape') {
+          cancelledRef.current = true;
+          setDraft(null);
+        }
+      }}
+      placeholder="Имя бегуна"
+      className="min-w-0 flex-1 bg-slate-950 border border-sky-500/60 rounded px-1.5 py-0.5 text-sm font-semibold text-slate-100 outline-none"
+    />
+  );
+};
+
+/** One runner in the live list: name, colour, visibility, pace / distance / HR now, start shift */
 export const ParticipantCard: React.FC<Props> = ({
   participant: p,
   state,
@@ -33,7 +89,7 @@ export const ParticipantCard: React.FC<Props> = ({
       }`}
     >
       <div className="flex items-center justify-between gap-2 mb-2">
-        <div className="flex items-center gap-2 min-w-0">
+        <div className="flex items-center gap-2 min-w-0 flex-1">
           <span className="text-xs font-bold text-slate-500">
             #{rank}
           </span>
@@ -43,12 +99,10 @@ export const ParticipantCard: React.FC<Props> = ({
             onChange={(e) =>
               onUpdate({ color: e.target.value })
             }
-            className="w-4 h-4 rounded cursor-pointer bg-transparent border-0"
+            className="w-4 h-4 shrink-0 rounded cursor-pointer bg-transparent border-0"
             title="Изменить цвет трека"
           />
-          <span className="text-sm font-semibold text-slate-100 truncate">
-            {p.name}
-          </span>
+          <RunnerName name={p.name} onRename={(name) => onUpdate({ name })} />
         </div>
 
         <div className="flex items-center gap-1">

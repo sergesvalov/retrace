@@ -839,7 +839,8 @@ async function startServer() {
       }
     }
 
-    if (typeof body.name === 'string' && body.name.trim()) p.name = body.name.trim();
+    // Signed by hand in the runner's card: shown on the map, in splits and videos
+    if (typeof body.name === 'string' && body.name.trim()) p.name = body.name.trim().slice(0, 40);
     if (body.color !== undefined) p.color = body.color;
     if (typeof body.visible === 'boolean') p.visible = body.visible;
     if (body.offsetSec !== undefined) p.offsetSec = body.offsetSec;
