@@ -31,7 +31,12 @@ import {
   syncAllParticipantsToCommonStartSpot,
   syncAllParticipantsToSpot,
 } from '../shared/trackParser.js';
-import { toLiteEvent, toWireEvent, toWireParticipant } from '../shared/pointsCodec.js';
+import {
+  toLiteEvent,
+  toWireEvent,
+  toWireParticipant,
+  unpackPoints,
+} from '../shared/pointsCodec.js';
 import {
   CONTROL_KINDS,
   EVENT_KINDS,
@@ -45,6 +50,7 @@ import {
   type ParticipantTrack,
   type RaceEvent,
   type TimeMode,
+  type TrackPoint,
   type TransformType,
 } from '../shared/types.js';
 
@@ -53,6 +59,8 @@ const IMMUTABLE_CACHE = 'public, max-age=31536000, immutable';
 
 const DATA_DIR = path.resolve(process.cwd(), 'data');
 const EVENTS_DIR = path.join(DATA_DIR, 'events');
+/** data/tracks/<eventId>/<participantId>.json — packed points, written once per upload */
+const TRACKS_DIR = path.join(DATA_DIR, 'tracks');
 const UPLOADS_DIR = path.join(DATA_DIR, 'uploads');
 
 function makeId(len = 8): string {
@@ -79,6 +87,7 @@ const MIME_BY_EXT: Record<string, string> = {
 async function ensureDirs() {
   await fs.mkdir(EVENTS_DIR, { recursive: true });
   await fs.mkdir(UPLOADS_DIR, { recursive: true });
+  await fs.mkdir(TRACKS_DIR, { recursive: true });
 }
 
 async function loadAllEvents(): Promise<Map<string, RaceEvent>> {
@@ -97,6 +106,17 @@ async function loadAllEvents(): Promise<Map<string, RaceEvent>> {
       const raw = await fs.readFile(path.join(EVENTS_DIR, f), 'utf8');
       const evt = JSON.parse(raw) as RaceEvent;
       if (evt.id === 'demo-bitza-2026') continue;
+
+      // Old format kept the points inside the event file: move them to track files once
+      const legacy = evt.participants.some((p) => Array.isArray(p.points));
+      for (const p of evt.participants) {
+        if (Array.isArray(p.points)) {
+          await saveTrackToDisk(evt.id, p);
+        } else {
+          p.points = await loadTrackFromDisk(evt.id, p.id);
+        }
+      }
+      if (legacy) await saveEventToDisk(evt);
 
       if (evt.map?.gcps?.some((g) => g.id.startsWith('gcp-auto-'))) {
         const manualGcps = evt.map.gcps.filter(
@@ -129,12 +149,41 @@ async function loadAllEvents(): Promise<Map<string, RaceEvent>> {
   return map;
 }
 
-async function saveEventToDisk(evt: RaceEvent) {
-  // Write to a temp file and rename, so a crash mid-write never leaves a truncated JSON
-  const target = path.join(EVENTS_DIR, `${evt.id}.json`);
+/** Write to a temp file and rename, so a crash mid-write never leaves a truncated JSON */
+async function writeFileAtomic(target: string, content: string) {
   const tmp = `${target}.${makeId(6)}.tmp`;
-  await fs.writeFile(tmp, JSON.stringify(evt, null, 2), 'utf8');
+  await fs.writeFile(tmp, content, 'utf8');
   await fs.rename(tmp, target);
+}
+
+/**
+ * Event settings only (~1 KB): written on every change. Track points live in their own
+ * files, written once on upload — a slider release no longer rewrites megabytes.
+ */
+async function saveEventToDisk(evt: RaceEvent) {
+  await writeFileAtomic(
+    path.join(EVENTS_DIR, `${evt.id}.json`),
+    JSON.stringify(toLiteEvent(evt), null, 1)
+  );
+}
+
+function trackFile(eventId: string, participantId: string) {
+  return path.join(TRACKS_DIR, path.basename(eventId), `${path.basename(participantId)}.json`);
+}
+
+async function saveTrackToDisk(eventId: string, p: ParticipantTrack) {
+  await fs.mkdir(path.join(TRACKS_DIR, path.basename(eventId)), { recursive: true });
+  await writeFileAtomic(trackFile(eventId, p.id), JSON.stringify(toWireParticipant(p).packed));
+}
+
+async function loadTrackFromDisk(eventId: string, participantId: string): Promise<TrackPoint[]> {
+  try {
+    const packed = JSON.parse(await fs.readFile(trackFile(eventId, participantId), 'utf8'));
+    return unpackPoints(packed);
+  } catch (err) {
+    console.error(`Track ${eventId}/${participantId} unreadable:`, err);
+    return [];
+  }
 }
 
 const MAP_IMAGE_EXTS = new Set(['.png', '.jpg', '.jpeg', '.webp', '.gif']);
@@ -705,6 +754,7 @@ async function startServer() {
         });
 
         evt.participants.push(participant);
+        await saveTrackToDisk(evt.id, participant);
         syncAllParticipantsToCommonStartSpot(evt.participants);
 
         // Auto-fit only a map the user has not placed by hand yet
@@ -808,6 +858,7 @@ async function startServer() {
     async (req, reply) => {
       const evt = eventsStore.get(req.params.id);
       if (!evt) return reply.code(404).send({ error: 'Событие не найдено' });
+      await fs.rm(trackFile(evt.id, req.params.participantId), { force: true });
       evt.participants = evt.participants.filter(
         (p) => p.id !== req.params.participantId
       );
@@ -957,6 +1008,7 @@ async function startServer() {
       }
       await removeUploadedMapFile(evt.map?.imageUrl);
       eventsStore.delete(id);
+      await fs.rm(path.join(TRACKS_DIR, path.basename(id)), { recursive: true, force: true });
       try {
         await fs.unlink(path.join(EVENTS_DIR, `${id}.json`));
       } catch {
