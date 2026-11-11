@@ -43,39 +43,6 @@ export function fitMapToTracksOrMap(map: maplibregl.Map, event: RaceEvent) {
   }
 }
 
-/**
- * Bounds of what a replay shows: each visible runner's track between their trims (the picked
- * leg or the whole course) plus `extra` points such as the leg ends
- */
-export function replayBounds(
-  participants: ParticipantTrack[],
-  extra: [number, number][]
-): [[number, number], [number, number]] | null {
-  let minLon = Infinity,
-    maxLon = -Infinity,
-    minLat = Infinity,
-    maxLat = -Infinity;
-  const add = (lon: number, lat: number) => {
-    if (lon < minLon) minLon = lon;
-    if (lon > maxLon) maxLon = lon;
-    if (lat < minLat) minLat = lat;
-    if (lat > maxLat) maxLat = lat;
-  };
-  for (const p of participants) {
-    if (!p.visible) continue;
-    const end = Math.min(p.trimEndSec, p.durationSec);
-    for (const pt of p.points) {
-      if (pt.t >= p.trimStartSec && pt.t <= end) add(pt.lon, pt.lat);
-    }
-  }
-  for (const [lon, lat] of extra) add(lon, lat);
-  if (!(maxLon > minLon || maxLat > minLat)) return null;
-  return [
-    [minLon, minLat],
-    [maxLon, maxLat],
-  ];
-}
-
 export function buildCommonStartGeoJson(
   participants: ParticipantTrack[]
 ): GeoJSON.FeatureCollection {

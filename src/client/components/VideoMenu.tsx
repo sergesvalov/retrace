@@ -26,6 +26,9 @@ interface Props {
   playbackRate: number;
   fitView: boolean;
   onFitView: (on: boolean) => void;
+  /** Turn the map to fit the frame (a leg: A on the left, B on the right) */
+  rotateMap: boolean;
+  onRotateMap: (on: boolean) => void;
   onRecord: (target: VideoTarget) => void;
   onStop: () => void;
 }
@@ -48,6 +51,8 @@ export const VideoMenu: React.FC<Props> = ({
   playbackRate,
   fitView,
   onFitView,
+  rotateMap,
+  onRotateMap,
   onRecord,
   onStop,
 }) => {
@@ -196,6 +201,26 @@ export const VideoMenu: React.FC<Props> = ({
                     className="accent-rose-500"
                   />
                   Вписать прогон в кадр
+                </label>
+                <label
+                  className={`flex items-start gap-2 cursor-pointer ${
+                    fitView ? 'text-slate-300' : 'text-slate-600'
+                  }`}
+                >
+                  <input
+                    type="checkbox"
+                    checked={rotateMap}
+                    disabled={!fitView}
+                    onChange={(e) => onRotateMap(e.target.checked)}
+                    className="accent-rose-500 mt-0.5"
+                  />
+                  <span>
+                    Повернуть карту под кадр
+                    <span className="block text-[10px] text-slate-500">
+                      перегон: A слева, B справа; вся трасса — как крупнее. В видео будет
+                      стрелка на север
+                    </span>
+                  </span>
                 </label>
 
                 <div className="text-[10px] text-slate-500 leading-snug">

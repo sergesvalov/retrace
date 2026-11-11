@@ -90,8 +90,8 @@ import {
   buildCommonStartGeoJson,
   buildGhostTracksGeoJson,
   fitMapToTracksOrMap,
-  replayBounds,
 } from '../map/mapLayers.js';
+import { courseCamera, legCamera, replayPoints } from '../map/videoCamera.js';
 // Map fitting UI is only needed for orienteering maps: loaded on first use
 const FitPanel = React.lazy(() =>
   import('./FitPanel.js').then((m) => ({ default: m.FitPanel }))
@@ -203,6 +203,9 @@ export const ReplayWorkspace: React.FC<Props> = ({
   const [recordPhase, setRecordPhase] = useState<RecordPhase>('idle');
   const [recordError, setRecordError] = useState<string | null>(null);
   const [recordFitView, setRecordFitView] = useState<boolean>(true);
+  // Videos: turn the map to fit the frame (a leg: A on the left, B on the right)
+  const [recordRotateMap, setRecordRotateMap] = useState<boolean>(true);
+  const recordPrevBearingRef = useRef<number | null>(null);
   // Bumped once the run to record is set up: recording starts on the next render's data
   const [recordArm, setRecordArm] = useState<number>(0);
   const recorderRef = useRef<ReplayVideoRecorder | null>(null);
@@ -1909,18 +1912,36 @@ export const ReplayWorkspace: React.FC<Props> = ({
       setRecordPhase('idle');
       return;
     }
+    recordPrevBearingRef.current = null;
     if (recordFitView) {
-      const extra: [number, number][] = [];
-      if (selectedLeg) extra.push(selectedLeg.startLonLat, selectedLeg.endLonLat);
-      if (customStartSpot) extra.push(customStartSpot);
-      const bounds = replayBounds(displayParticipants, extra);
-      if (bounds) {
-        // Room at the top for the caption, on the right for the runners' labels
-        map.fitBounds(bounds, {
-          padding: { top: 84, bottom: 30, left: 40, right: 120 },
-          maxZoom: 17,
-          duration: 0,
-        });
+      // The run fills the frame: a leg with A near the left edge and B near the right one,
+      // the whole course turned the way it is largest; every runner's path stays in view
+      const container = map.getContainer();
+      const view = { width: container.clientWidth, height: container.clientHeight };
+      const pad = {
+        // caption and clock on top; runners' labels stick out to the right of the dots
+        top: 76,
+        bottom: Math.max(28, view.height * 0.05),
+        left: Math.max(48, view.width * 0.07),
+        right: Math.max(110, view.width * 0.09),
+      };
+      const opts = { rotate: recordRotateMap, maxZoom: 18 };
+      const path = replayPoints(displayParticipants);
+      const cam = selectedLeg
+        ? legCamera(selectedLeg.startLonLat, selectedLeg.endLonLat, path, view, pad, opts)
+        : courseCamera(
+            [
+              ...path,
+              ...(isOrienteering ? courseLL : []),
+              ...(customStartSpot ? [customStartSpot] : []),
+            ],
+            view,
+            pad,
+            opts
+          );
+      if (cam) {
+        if (cam.bearing !== map.getBearing()) recordPrevBearingRef.current = map.getBearing();
+        map.jumpTo({ center: cam.center, zoom: cam.zoom, bearing: cam.bearing, pitch: 0 });
       }
     }
     seekTo(0);
@@ -1983,6 +2004,10 @@ export const ReplayWorkspace: React.FC<Props> = ({
     recorderRef.current = null;
     const blob = await rec.stop();
     setRecordPhase('idle');
+    // The leg was turned A → B for the video: back to how the map was
+    const prevBearing = recordPrevBearingRef.current;
+    recordPrevBearingRef.current = null;
+    if (prevBearing !== null) mapRef.current?.easeTo({ bearing: prevBearing, duration: 600 });
     if (blob.size === 0) {
       setRecordError('Видео получилось пустым — попробуйте ещё раз, не сворачивая вкладку');
       return;
@@ -2747,6 +2772,8 @@ export const ReplayWorkspace: React.FC<Props> = ({
           playbackRate={playbackRate}
           fitView={recordFitView}
           onFitView={setRecordFitView}
+          rotateMap={recordRotateMap}
+          onRotateMap={setRecordRotateMap}
           onRecord={(target) => void recordVideo(target)}
           onStop={() => void finishRecording()}
         />

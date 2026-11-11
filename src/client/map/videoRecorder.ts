@@ -210,7 +210,41 @@ export class ReplayVideoRecorder {
     for (const r of frame.runners) drawRunner(ctx, at([r.lon, r.lat]), r);
 
     drawCaption(ctx, cssW, cssH, this.scene, frame);
+    // A turned map (leg A → B left to right) needs to show where north is
+    const bearing = map.getBearing();
+    if (Math.abs(bearing) > 0.5) drawNorthArrow(ctx, cssW - 12 - 20, 12 + 52 + 8 + 20, bearing);
   }
+}
+
+/** Compass needle under the clock: north is `bearing` degrees counter-clockwise from up */
+function drawNorthArrow(ctx: CanvasRenderingContext2D, x: number, y: number, bearing: number) {
+  ctx.save();
+  ctx.beginPath();
+  ctx.arc(x, y, 20, 0, Math.PI * 2);
+  ctx.fillStyle = 'rgba(15, 23, 42, 0.82)';
+  ctx.fill();
+  ctx.translate(x, y);
+  ctx.rotate((-bearing * Math.PI) / 180);
+  ctx.beginPath();
+  ctx.moveTo(0, -15);
+  ctx.lineTo(6, 2);
+  ctx.lineTo(-6, 2);
+  ctx.closePath();
+  ctx.fillStyle = '#f43f5e';
+  ctx.fill();
+  ctx.beginPath();
+  ctx.moveTo(0, 13);
+  ctx.lineTo(6, 2);
+  ctx.lineTo(-6, 2);
+  ctx.closePath();
+  ctx.fillStyle = '#cbd5e1';
+  ctx.fill();
+  ctx.font = '700 9px system-ui, sans-serif';
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.fillStyle = '#ffffff';
+  ctx.fillText('N', 0, -5);
+  ctx.restore();
 }
 
 type Pt = { x: number; y: number };
