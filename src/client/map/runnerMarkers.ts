@@ -6,6 +6,7 @@ import {
 } from '../../shared/trackParser.js';
 import type { ParticipantTrack, TimeMode } from '../../shared/types.js';
 import { buildActiveTailsGeoJson } from './mapLayers.js';
+import type { RunnerOnMap } from './videoRecorder.js';
 
 export interface RunnersFrame {
   participants: ParticipantTrack[];
@@ -22,12 +23,13 @@ export interface RunnersFrame {
  * Draw one replay frame straight onto the map: runner markers (name + live pace) and their
  * tails. Called every animation frame, so it touches only MapLibre/DOM, never React state.
  * `markers` keeps the marker per participant id between frames.
+ * Returns the runners as drawn (the video recorder paints them itself).
  */
 export function drawRunnersFrame(
   map: maplibregl.Map,
   markers: Map<string, maplibregl.Marker>,
   f: RunnersFrame
-) {
+): RunnerOnMap[] {
   const tailSrc = map.getSource('active-tails') as maplibregl.GeoJSONSource | undefined;
   tailSrc?.setData(
     buildActiveTailsGeoJson(
@@ -55,9 +57,12 @@ export function drawRunnersFrame(
   }));
 
   const activeIds = new Set<string>();
+  const drawn: RunnerOnMap[] = [];
   for (const { participant: p, state } of runnerStates) {
     if (!p.visible || !state) continue;
     activeIds.add(p.id);
+    const paceStr = formatPaceMinKm(state.speedMs);
+    drawn.push({ lon: state.lon, lat: state.lat, color: p.color, name: p.name, pace: paceStr });
 
     let marker = markers.get(p.id);
     if (!marker) {
@@ -89,7 +94,6 @@ export function drawRunnersFrame(
       '.runner-label'
     ) as HTMLElement | null;
     if (labelSpan) {
-      const paceStr = formatPaceMinKm(state.speedMs);
       labelSpan.textContent = `${p.name} • ${paceStr}`;
     }
   }
@@ -100,4 +104,5 @@ export function drawRunnersFrame(
       markers.delete(id);
     }
   }
+  return drawn;
 }

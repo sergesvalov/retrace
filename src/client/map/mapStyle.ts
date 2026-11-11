@@ -9,6 +9,12 @@ export const BASE_LAYER_LABELS: Record<BaseLayer, string> = {
   osm: 'OSM',
   satellite: 'Спутник',
 };
+/** Credits the tile providers require wherever their tiles are shown (videos too) */
+export const BASE_LAYER_ATTRIBUTION: Record<BaseLayer, string> = {
+  osm: '© OpenStreetMap contributors',
+  topo: '© OpenStreetMap contributors, SRTM | © OpenTopoMap (CC-BY-SA)',
+  satellite: '© Esri World Imagery',
+};
 /** Runs/hikes live on the base map, so default to the one with contours and trails */
 export function defaultBaseLayerFor(kind: EventKind): BaseLayer {
   return kind === 'run' ? 'topo' : 'osm';
@@ -24,7 +30,7 @@ export function baseMapStyle(active: BaseLayer, opacity: number): maplibregl.Sty
         tiles: ['https://tile.openstreetmap.org/{z}/{x}/{y}.png'],
         tileSize: 256,
         maxzoom: 19,
-        attribution: '© OpenStreetMap contributors',
+        attribution: BASE_LAYER_ATTRIBUTION.osm,
       },
       topo: {
         type: 'raster',
@@ -36,8 +42,7 @@ export function baseMapStyle(active: BaseLayer, opacity: number): maplibregl.Sty
         tileSize: 256,
         // OpenTopoMap has no tiles past z17: MapLibre over-zooms z17 instead of showing blanks
         maxzoom: 17,
-        attribution:
-          '© OpenStreetMap contributors, SRTM | © OpenTopoMap (CC-BY-SA)',
+        attribution: BASE_LAYER_ATTRIBUTION.topo,
       },
       satellite: {
         type: 'raster',
@@ -46,7 +51,7 @@ export function baseMapStyle(active: BaseLayer, opacity: number): maplibregl.Sty
         ],
         tileSize: 256,
         maxzoom: 19,
-        attribution: '© Esri World Imagery',
+        attribution: BASE_LAYER_ATTRIBUTION.satellite,
       },
     },
     // Hidden base layers use `visibility: none` so their tiles are not downloaded at all

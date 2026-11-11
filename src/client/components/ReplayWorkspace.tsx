@@ -66,9 +66,21 @@ import { SplitsPanel } from './SplitsPanel.js';
 import { SpeedComparisonChart } from './SpeedComparisonChart.js';
 import { ParticipantCard } from './ParticipantCard.js';
 import { MapBanners, type SnapStage } from './MapBanners.js';
+import { VideoMenu, type RecordPhase, type VideoTarget } from './VideoMenu.js';
 import { drawRunnersFrame } from '../map/runnerMarkers.js';
 import {
+  canRecordVideo,
+  downloadBlob,
+  pickVideoFormat,
+  ReplayVideoRecorder,
+  videoFileName,
+  waitForMapIdle,
+  type RunnerOnMap,
+  type VideoScene,
+} from '../map/videoRecorder.js';
+import {
   addReplayLayers,
+  BASE_LAYER_ATTRIBUTION,
   BASE_LAYER_LABELS,
   BASE_LAYERS,
   baseMapStyle,
@@ -78,6 +90,7 @@ import {
   buildCommonStartGeoJson,
   buildGhostTracksGeoJson,
   fitMapToTracksOrMap,
+  replayBounds,
 } from '../map/mapLayers.js';
 // Map fitting UI is only needed for orienteering maps: loaded on first use
 const FitPanel = React.lazy(() =>
@@ -185,6 +198,19 @@ export const ReplayWorkspace: React.FC<Props> = ({
   const [nextIsStart, setNextIsStart] = useState<boolean>(false);
   // Adjustment of the tracks onto the punched controls
   const [trackCorrection, setTrackCorrection] = useState<boolean>(true);
+
+  // Video recording of a replay (see beginRecording)
+  const [recordPhase, setRecordPhase] = useState<RecordPhase>('idle');
+  const [recordError, setRecordError] = useState<string | null>(null);
+  const [recordFitView, setRecordFitView] = useState<boolean>(true);
+  // Bumped once the run to record is set up: recording starts on the next render's data
+  const [recordArm, setRecordArm] = useState<number>(0);
+  const recorderRef = useRef<ReplayVideoRecorder | null>(null);
+  const recordFinishingRef = useRef<boolean>(false);
+  const recordFileNameRef = useRef<string>('');
+  // Runners of the last drawn frame: the recorder paints them onto the video
+  const lastRunnersRef = useRef<RunnerOnMap[]>([]);
+  const videoFormat = useMemo(() => (canRecordVideo() ? pickVideoFormat() : null), []);
 
   const mapContainerRef = useRef<HTMLDivElement | null>(null);
   const mapRef = useRef<maplibregl.Map | null>(null);
@@ -402,6 +428,24 @@ export const ReplayWorkspace: React.FC<Props> = ({
   const displayParticipantsRef = useRef(displayParticipants);
   displayParticipantsRef.current = displayParticipants;
   const courseLabels = useMemo(() => controlLabels(courseControls), [courseControls]);
+  // Course legs offered for a video, with the slowest runner's time (video length estimate)
+  const videoLegNames = useMemo(
+    () =>
+      splits.length > 0 && courseLL.length >= 2
+        ? courseLabels.slice(0, -1).map((l, k) => `${l} → ${courseLabels[k + 1]}`)
+        : [],
+    [splits, courseLL, courseLabels]
+  );
+  const videoLegMaxSec = useMemo(
+    () =>
+      videoLegNames.map((_, k) => {
+        const times = splits
+          .map((s) => s.legTimes[k])
+          .filter((t): t is number => t !== null && t !== undefined);
+        return times.length > 0 ? Math.max(...times) : null;
+      }),
+    [videoLegNames, splits]
+  );
 
   const { syncToMatrix: syncCourseToMatrix } = useCourseOverlay({
     mapRef,
@@ -491,8 +535,8 @@ export const ReplayWorkspace: React.FC<Props> = ({
     }
   }
 
-  function selectCourseLeg(k: number) {
-    if (courseLL.length < k + 2) return;
+  function selectCourseLeg(k: number): Promise<void> {
+    if (courseLL.length < k + 2) return Promise.resolve();
     const knownPassages: Record<string, { startIdx: number; endIdx: number }> = {};
     for (const s of splits) {
       if (s.legTimes[k] !== null) {
@@ -509,7 +553,7 @@ export const ReplayWorkspace: React.FC<Props> = ({
       knownPassages,
       courseLegIdx: k,
     });
-    void applyCourseTrims(k, k + 1);
+    return applyCourseTrims(k, k + 1);
   }
 
   /**
@@ -517,7 +561,7 @@ export const ReplayWorkspace: React.FC<Props> = ({
    * course punched — someone may have started the watch after control 1 or stopped it before
    * the finish. Runners of another course (they punch few of these controls) are left as is.
    */
-  function selectWholeCourse() {
+  function selectWholeCourse(): Promise<void> {
     setSelectedLeg(null);
     setCustomStartSpot(null);
     const n = courseControls.length;
@@ -528,7 +572,7 @@ export const ReplayWorkspace: React.FC<Props> = ({
     while (from < n - 1 && onCourse.some((s) => !s.passages[from].detected)) from++;
     let to = n - 1;
     while (to > from && onCourse.some((s) => !s.passages[to].detected)) to--;
-    void applyCourseTrims(from, to);
+    return applyCourseTrims(from, to);
   }
 
   // Compute detailed route-choice analytics when a leg (A -> B) is selected
@@ -582,6 +626,10 @@ export const ReplayWorkspace: React.FC<Props> = ({
     speedNormMode,
     groupReferenceSpeedMs,
   ]);
+
+  // The recorder reads the clock caption from here every frame
+  const videoClockRef = useRef({ totalSec: totalDurationSec, playbackRate });
+  videoClockRef.current = { totalSec: totalDurationSec, playbackRate };
 
   // Keep the playhead inside the timeline when it shrinks (speed mode, trims, deleted runner)
   useEffect(() => {
@@ -692,6 +740,12 @@ export const ReplayWorkspace: React.FC<Props> = ({
 
     return () => {
       mapReadyRef.current = false;
+      // A recording belongs to this map: another event gets a new one
+      if (recorderRef.current) {
+        recorderRef.current.cancel();
+        recorderRef.current = null;
+        setRecordPhase('idle');
+      }
       for (const m of runnerMarkersRef.current.values()) m.remove();
       runnerMarkersRef.current.clear();
       anchorMarkerRef.current?.remove();
@@ -1445,7 +1499,7 @@ export const ReplayWorkspace: React.FC<Props> = ({
   drawFrameRef.current = (t: number) => {
     const map = mapRef.current;
     if (!map || !mapReadyRef.current) return;
-    drawRunnersFrame(map, runnerMarkersRef.current, {
+    lastRunnersRef.current = drawRunnersFrame(map, runnerMarkersRef.current, {
       participants: displayParticipants,
       raceTimeSec: t,
       tailLengthSec,
@@ -1791,15 +1845,164 @@ export const ReplayWorkspace: React.FC<Props> = ({
 
   async function resetToFullRaceStart() {
     setSpeedNormMode('real');
-    // With a course, "whole race" means start triangle → finish punches
+    await selectWholeRun();
+  }
+
+  /** Everyone from their start to their finish (with a course: start triangle → finish punches) */
+  async function selectWholeRun() {
     if (splits.length > 0 && courseControls.length >= 2) {
-      selectWholeCourse();
+      await selectWholeCourse();
       return;
     }
     setCustomStartSpot(null);
     setSelectedLeg(null);
     await syncStartAtSpot();
   }
+
+  // ---- Video recording: set up the run → frame it → record playback 00:00 → end → file ----
+
+  /** What the player is set to replay, as the video caption says it */
+  function currentRunLabel(): string {
+    const name = (l: string | undefined) =>
+      l === 'S' ? 'Старт' : l === 'F' ? 'Финиш' : `КП ${l ?? '?'}`;
+    let label: string;
+    if (selectedLeg?.courseLegIdx !== undefined) {
+      const k = selectedLeg.courseLegIdx;
+      label = `Перегон ${name(courseLabels[k])} → ${name(courseLabels[k + 1])}`;
+    } else if (selectedLeg) {
+      label = 'Перегон A → B';
+    } else if (customStartSpot) {
+      label = 'Пуск с точки';
+    } else {
+      label = isOrienteering && courseControls.length >= 2 ? 'Вся дистанция' : 'Весь забег';
+    }
+    if (speedNormMode === 'fitness_handicap') label += ' · выравнивание по силам';
+    if (speedNormMode === 'equal_speed') label += ' · равная скорость';
+    return label;
+  }
+
+  async function recordVideo(target: VideoTarget) {
+    if (recordPhase !== 'idle' || recorderRef.current) return;
+    setIsPlaying(false);
+    setRecordError(null);
+    setRecordPhase('preparing');
+    try {
+      if (target.kind === 'leg') await selectCourseLeg(target.legIdx);
+      if (target.kind === 'whole') await selectWholeRun();
+    } catch {
+      setRecordError('Не удалось выбрать прогон для записи');
+      setRecordPhase('idle');
+      return;
+    }
+    // The new trims arrive with this render batch: begin on the next render's data
+    setRecordArm((n) => n + 1);
+  }
+
+  useEffect(() => {
+    if (recordArm > 0) void beginRecording();
+  }, [recordArm]);
+
+  async function beginRecording() {
+    const map = mapRef.current;
+    if (!map || !mapReadyRef.current) {
+      setRecordError('Карта ещё не загрузилась');
+      setRecordPhase('idle');
+      return;
+    }
+    if (recordFitView) {
+      const extra: [number, number][] = [];
+      if (selectedLeg) extra.push(selectedLeg.startLonLat, selectedLeg.endLonLat);
+      if (customStartSpot) extra.push(customStartSpot);
+      const bounds = replayBounds(displayParticipants, extra);
+      if (bounds) {
+        // Room at the top for the caption, on the right for the runners' labels
+        map.fitBounds(bounds, {
+          padding: { top: 84, bottom: 30, left: 40, right: 120 },
+          maxZoom: 17,
+          duration: 0,
+        });
+      }
+    }
+    seekTo(0);
+    drawFrameRef.current(0);
+    await waitForMapIdle(map, 8000);
+    if (mapRef.current !== map) return;
+
+    const label = currentRunLabel();
+    const scene: VideoScene = {
+      title: event.title,
+      subtitle: label,
+      course:
+        isOrienteering && event.map
+          ? courseControls.flatMap((c, i) =>
+              courseLL[i] ? [{ lonLat: courseLL[i], kind: c.kind, label: courseLabels[i] }] : []
+            )
+          : [],
+      legEnds:
+        selectedLeg && selectedLeg.courseLegIdx === undefined
+          ? { a: selectedLeg.startLonLat, b: selectedLeg.endLonLat }
+          : null,
+      startSpot: selectedLeg ? null : customStartSpot,
+      attribution: osmOpacity > 0 ? BASE_LAYER_ATTRIBUTION[baseLayer] : '',
+    };
+    let rec: ReplayVideoRecorder;
+    try {
+      rec = new ReplayVideoRecorder(map, scene, () => ({
+        raceTimeSec: raceTimeRef.current,
+        totalSec: videoClockRef.current.totalSec,
+        playbackRate: videoClockRef.current.playbackRate,
+        runners: lastRunnersRef.current,
+      }));
+      rec.start();
+    } catch (e) {
+      setRecordError(`Не удалось начать запись: ${(e as Error).message}`);
+      setRecordPhase('idle');
+      return;
+    }
+    recorderRef.current = rec;
+    recordFinishingRef.current = false;
+    recordFileNameRef.current = videoFileName([event.title, label], rec.ext);
+    setRecordPhase('intro');
+    // A still opening second: chats use the first frame as the preview
+    await new Promise((r) => setTimeout(r, 1000));
+    if (recorderRef.current !== rec || recordFinishingRef.current) return;
+    seekTo(0);
+    setRecordPhase('recording');
+    setIsPlaying(true);
+  }
+
+  /** End of playback, pause or the stop button: hold the final picture a moment, then save */
+  async function finishRecording() {
+    const rec = recorderRef.current;
+    if (!rec || recordFinishingRef.current) return;
+    recordFinishingRef.current = true;
+    setIsPlaying(false);
+    setRecordPhase('saving');
+    await new Promise((r) => setTimeout(r, 1500));
+    if (recorderRef.current !== rec) return;
+    recorderRef.current = null;
+    const blob = await rec.stop();
+    setRecordPhase('idle');
+    if (blob.size === 0) {
+      setRecordError('Видео получилось пустым — попробуйте ещё раз, не сворачивая вкладку');
+      return;
+    }
+    downloadBlob(blob, recordFileNameRef.current);
+  }
+
+  // Playback stopped (reached the end or paused) while recording → save the video
+  useEffect(() => {
+    if (recordPhase === 'recording' && !isPlaying) void finishRecording();
+  }, [isPlaying, recordPhase]);
+
+  // Leaving the event: drop an unfinished recording
+  useEffect(
+    () => () => {
+      recorderRef.current?.cancel();
+      recorderRef.current = null;
+    },
+    []
+  );
 
   function handleScaleSliderChange(nextPct: number, commit = false) {
     const clamped = Math.max(40, Math.min(260, nextPct));
@@ -2028,6 +2231,17 @@ export const ReplayWorkspace: React.FC<Props> = ({
               setPinDraftPx(null);
             }}
           />
+
+          {recordPhase !== 'idle' && (
+            <div className="absolute bottom-4 left-1/2 -translate-x-1/2 z-10 px-3 py-1.5 rounded-lg bg-rose-950/90 border border-rose-500/50 text-[11px] text-rose-100 flex items-center gap-2 shadow-lg pointer-events-none">
+              <span className="w-2 h-2 rounded-full bg-rose-500 animate-pulse" />
+              {recordPhase === 'preparing'
+                ? 'Готовлю запись: выбираю прогон и загружаю карту…'
+                : recordPhase === 'saving'
+                  ? 'Сохраняю видео…'
+                  : 'Идёт запись видео — не сворачивайте вкладку'}
+            </div>
+          )}
 
           {/* Speed heatmap legend */}
           {speedHeatmap && (
@@ -2520,6 +2734,22 @@ export const ReplayWorkspace: React.FC<Props> = ({
             </button>
           ))}
         </div>
+
+        <VideoMenu
+          format={videoFormat}
+          phase={recordPhase}
+          error={recordError}
+          legNames={videoLegNames}
+          legMaxSec={videoLegMaxSec}
+          selectedLegIdx={selectedLeg?.courseLegIdx ?? null}
+          currentLabel={currentRunLabel()}
+          currentDurationSec={totalDurationSec}
+          playbackRate={playbackRate}
+          fitView={recordFitView}
+          onFitView={setRecordFitView}
+          onRecord={(target) => void recordVideo(target)}
+          onStop={() => void finishRecording()}
+        />
       </div>
     </div>
   );
