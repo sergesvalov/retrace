@@ -59,6 +59,19 @@ export interface MapOverlay {
   scanDpi?: number;
   /** Magnetic declination used for the map's north, degrees (east positive) */
   declinationDeg?: number;
+  /** Course controls in map-image pixels, in course order (start → … → finish) */
+  controls?: CourseControl[];
+}
+
+export type ControlKind = 'start' | 'control' | 'finish';
+export const CONTROL_KINDS: readonly ControlKind[] = ['start', 'control', 'finish'];
+
+/** A control drawn on the map image: it moves together with the map placement */
+export interface CourseControl {
+  id: string;
+  kind: ControlKind;
+  px: number;
+  py: number;
 }
 
 /** Map metadata the client may change together with a placement */

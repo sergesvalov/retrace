@@ -168,6 +168,61 @@ export function parseFitBuffer(buffer: ArrayBuffer | Buffer): Promise<{
   });
 }
 
+const SPIKE_SPEED_MS = 12;
+
+function speedBetween(a: RawTrackSample, b: RawTrackSample): number {
+  const dt = Math.abs(b.timeMs - a.timeMs) / 1000;
+  const d = haversineDistanceM(a.lon, a.lat, b.lon, b.lat);
+  return dt > 0 ? d / dt : d > 0 ? Infinity : 0;
+}
+
+/**
+ * Cold start: the first fixes after switching the watch on are often tens of metres off
+ * before the receiver settles. Drop leading points that jump implausibly fast to the
+ * settled part of the track (judged against the next few points, not just one).
+ */
+function dropColdStartFixes(samples: RawTrackSample[]): RawTrackSample[] {
+  let start = 0;
+  while (start + 3 < samples.length && start < 30) {
+    const s = samples[start];
+    const next = samples.slice(start + 1, start + 4);
+    // The settled points agree with each other, but the leading one is far from all of them
+    const toNext = next.map((n) => speedBetween(s, n));
+    const among = speedBetween(next[0], next[1]);
+    if (toNext.every((v) => v > SPIKE_SPEED_MS) && among <= SPIKE_SPEED_MS) {
+      start++;
+    } else {
+      break;
+    }
+  }
+  return start > 0 ? samples.slice(start) : samples;
+}
+
+/**
+ * Single-point GPS spikes (multipath in forest/between buildings) look like an out-and-back:
+ * too fast in, too fast out, while the neighbours are close to each other. A real fast
+ * straight segment (cycling, downhill) is not touched because the detour test fails.
+ */
+function removeOutAndBackSpikes(samples: RawTrackSample[]): RawTrackSample[] {
+  if (samples.length < 3) return samples;
+  const out: RawTrackSample[] = [samples[0]];
+  for (let i = 1; i < samples.length - 1; i++) {
+    const prev = out[out.length - 1];
+    const cur = samples[i];
+    const next = samples[i + 1];
+    const dIn = haversineDistanceM(prev.lon, prev.lat, cur.lon, cur.lat);
+    const dOut = haversineDistanceM(cur.lon, cur.lat, next.lon, next.lat);
+    const dBypass = haversineDistanceM(prev.lon, prev.lat, next.lon, next.lat);
+    const isSpike =
+      speedBetween(prev, cur) > SPIKE_SPEED_MS &&
+      speedBetween(cur, next) > SPIKE_SPEED_MS &&
+      dBypass < 0.5 * (dIn + dOut);
+    if (!isSpike) out.push(cur);
+  }
+  out.push(samples[samples.length - 1]);
+  return out;
+}
+
 /**
  * Clean, filter outliers, and normalize raw GPS samples into a ParticipantTrack.
  */
@@ -190,9 +245,9 @@ export function normalizeSamplesToTrack(opts: {
     )
     .sort((a, b) => a.timeMs - b.timeMs);
 
-  // Deduplicate identical timestamps & discard GPS spikes (> 18 m/s ~ 65 km/h)
+  // Deduplicate identical timestamps & discard GPS spikes (> 20 m/s ~ 72 km/h)
   const filtered: RawTrackSample[] = [];
-  for (const s of sorted) {
+  for (const s of removeOutAndBackSpikes(dropColdStartFixes(sorted))) {
     if (filtered.length === 0) {
       filtered.push(s);
       continue;
@@ -476,7 +531,12 @@ export function syncAllParticipantsToSpot(
 export function analyzeLegBetweenSpots(
   participants: ParticipantTrack[],
   startLonLat: [number, number],
-  endLonLat: [number, number]
+  endLonLat: [number, number],
+  /**
+   * Known punch indices per participant (from the course splits). Without them the
+   * closest passage is used, which can pick the wrong visit when a course loops back.
+   */
+  knownPassages?: Record<string, { startIdx: number; endIdx: number }>
 ): {
   straightDistM: number;
   groupMeanSpeedMs: number;
@@ -506,20 +566,21 @@ export function analyzeLegBetweenSpots(
   const stats: LegParticipantStats[] = [];
 
   for (const p of visible) {
-    const startHit = findClosestPassagePoint(
-      p.points,
-      startLonLat[0],
-      startLonLat[1],
-      0
-    );
-    if (!startHit) continue;
-    const endHit = findClosestPassagePoint(
-      p.points,
-      endLonLat[0],
-      endLonLat[1],
-      startHit.pt.t + 3
-    );
-    if (!endHit || endHit.idx <= startHit.idx) continue;
+    const known = knownPassages?.[p.id];
+    if (knownPassages && !known) continue; // no valid punches for this leg
+    const startHit = known
+      ? { pt: p.points[known.startIdx], idx: known.startIdx }
+      : findClosestPassagePoint(p.points, startLonLat[0], startLonLat[1], 0);
+    if (!startHit?.pt) continue;
+    const endHit = known
+      ? { pt: p.points[known.endIdx], idx: known.endIdx }
+      : findClosestPassagePoint(
+          p.points,
+          endLonLat[0],
+          endLonLat[1],
+          startHit.pt.t + 3
+        );
+    if (!endHit?.pt || endHit.idx <= startHit.idx) continue;
 
     const tStartSec = Math.round(startHit.pt.t);
     const tEndSec = Math.round(endHit.pt.t);

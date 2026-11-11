@@ -24,8 +24,10 @@ import {
   syncAllParticipantsToSpot,
 } from '../shared/trackParser.js';
 import {
+  CONTROL_KINDS,
   EVENT_KINDS,
   MAP_IMAGE_KINDS,
+  type CourseControl,
   eventKindOf,
   type EventKind,
   type GCP,
@@ -332,6 +334,14 @@ async function startServer() {
         ?.value;
       const width = Number(widthField) || 1200;
       const height = Number(heightField) || 900;
+      // Resolution stored by the scanner in the image header (read by the browser), if any
+      const dpiField = Number(
+        (data.fields?.dpi as { value?: string } | undefined)?.value
+      );
+      const scanDpi =
+        Number.isFinite(dpiField) && dpiField >= 30 && dpiField <= 2400
+          ? Math.round(dpiField)
+          : undefined;
 
       const trackBounds = computeTracksBoundingBox(evt.participants) ?? {
         minLon: 32.415,
@@ -355,6 +365,7 @@ async function startServer() {
         cornersLonLat: autoPlaced.cornersLonLat,
         rmsErrorM: undefined,
         rotationDeg: 0,
+        ...(scanDpi ? { scanDpi } : {}),
       };
 
       const previousImageUrl = evt.map?.imageUrl;
@@ -762,6 +773,73 @@ async function startServer() {
       syncAllParticipantsToCommonStartSpot(evt.participants);
     }
 
+    evt.timeMode = 'from_start';
+    await saveEventToDisk(evt);
+    return { event: evt };
+  });
+
+  // Replace the course (controls drawn on the map image, in course order)
+  app.put<{ Params: { id: string }; Body: { controls?: CourseControl[] } }>(
+    '/api/events/:id/course',
+    async (req, reply) => {
+      const evt = eventsStore.get(req.params.id);
+      if (!evt || !evt.map) {
+        return reply.code(404).send({ error: 'Сначала загрузите карту' });
+      }
+      const controls = req.body?.controls;
+      if (!Array.isArray(controls) || controls.length > 99) {
+        return reply.code(400).send({ error: 'Некорректный список КП' });
+      }
+      const { width, height } = evt.map;
+      const clean: CourseControl[] = [];
+      for (const c of controls) {
+        const ok =
+          c &&
+          typeof c.id === 'string' &&
+          c.id.length > 0 &&
+          c.id.length <= 40 &&
+          CONTROL_KINDS.includes(c.kind) &&
+          Number.isFinite(c.px) &&
+          Number.isFinite(c.py) &&
+          Math.abs(c.px) <= width * 3 &&
+          Math.abs(c.py) <= height * 3;
+        if (!ok) return reply.code(400).send({ error: 'Некорректный КП' });
+        clean.push({
+          id: c.id,
+          kind: c.kind,
+          px: Math.round(c.px * 10) / 10,
+          py: Math.round(c.py * 10) / 10,
+        });
+      }
+      evt.map.controls = clean;
+      await saveEventToDisk(evt);
+      return { event: evt };
+    }
+  );
+
+  // Set start/finish of several participants at once (e.g. punches at S and F from the splits)
+  app.put<{
+    Params: { id: string };
+    Body: { trims?: { participantId: string; trimStartSec: number; trimEndSec: number }[] };
+  }>('/api/events/:id/trims', async (req, reply) => {
+    const evt = eventsStore.get(req.params.id);
+    if (!evt) return reply.code(404).send({ error: 'Событие не найдено' });
+    const trims = req.body?.trims;
+    if (!Array.isArray(trims)) {
+      return reply.code(400).send({ error: 'Нет данных о старте/финише' });
+    }
+    for (const tr of trims) {
+      const p = evt.participants.find((x) => x.id === tr?.participantId);
+      if (!p) continue;
+      if (!Number.isFinite(tr.trimStartSec) || !Number.isFinite(tr.trimEndSec)) {
+        return reply.code(400).send({ error: 'Некорректное время старта/финиша' });
+      }
+      const start = Math.max(0, Math.min(p.durationSec, tr.trimStartSec));
+      const end = Math.max(start, Math.min(p.durationSec, tr.trimEndSec));
+      p.trimStartSec = start;
+      p.trimEndSec = end;
+      p.offsetSec = 0;
+    }
     evt.timeMode = 'from_start';
     await saveEventToDisk(evt);
     return { event: evt };

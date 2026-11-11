@@ -33,6 +33,7 @@ import {
   groundMetersPerPixelFromPrint,
   groundMetersPerPixelFromScaleBar,
   lonLatToMercator,
+  lonLatToPixel,
   matrixGroundMetersPerPixel,
   matrixToCorners,
   matrixUpBearingDeg,
@@ -49,6 +50,7 @@ import {
 import {
   eventKindOf,
   type BaseLayer,
+  type CourseControl,
   type EventKind,
   type MapImageKind,
   type MapOverlayMeta,
@@ -57,6 +59,15 @@ import {
   type TimeMode,
 } from '../../shared/types.js';
 import { magneticDeclinationDeg } from '../../shared/declination.js';
+import {
+  computeSplits,
+  controlLabels,
+  controlsLonLat,
+  correctTrackToControls,
+} from '../../shared/course.js';
+import { readImageDpi } from '../imageDpi.js';
+import { useCourseOverlay } from './useCourseOverlay.js';
+import { SplitsPanel } from './SplitsPanel.js';
 
 const BASE_LAYERS: readonly BaseLayer[] = ['topo', 'osm', 'satellite'];
 const BASE_LAYER_LABELS: Record<BaseLayer, string> = {
@@ -151,11 +162,23 @@ export const ReplayWorkspace: React.FC<Props> = ({
   const [selectedLeg, setSelectedLeg] = useState<{
     startLonLat: [number, number];
     endLonLat: [number, number];
+    /** Punch indices from the splits, when the leg was picked from the course */
+    knownPassages?: Record<string, { startIdx: number; endIdx: number }>;
+    /** Leg index in the course (0 = start → 1st control) */
+    courseLegIdx?: number;
   } | null>(null);
+
+  // Course editing: clicks on the map place controls (start → 1, 2, … → finish)
+  const [courseEdit, setCourseEdit] = useState<boolean>(false);
+  const [nextIsFinish, setNextIsFinish] = useState<boolean>(false);
+  // Livelox-style adjustment of the tracks onto the punched controls
+  const [trackCorrection, setTrackCorrection] = useState<boolean>(true);
 
   const mapContainerRef = useRef<HTMLDivElement | null>(null);
   const mapRef = useRef<maplibregl.Map | null>(null);
   const mapReadyRef = useRef<boolean>(false);
+  // Bumped on every MapLibre 'load': lets overlays declared before the map effect redraw
+  const [mapLoadCount, setMapLoadCount] = useState<number>(0);
   const runnerMarkersRef = useRef<Map<string, maplibregl.Marker>>(new Map());
   const anchorMarkerRef = useRef<maplibregl.Marker | null>(null);
   const legMarkersRef = useRef<maplibregl.Marker[]>([]);
@@ -277,6 +300,8 @@ export const ReplayWorkspace: React.FC<Props> = ({
     setSnapStage('idle');
     setPickedFeatureLonLat(null);
     setUploadError(null);
+    setCourseEdit(false);
+    setNextIsFinish(false);
   }, [event.id]);
 
   // Each event kind starts on its own default base map (also when the kind is switched)
@@ -285,8 +310,25 @@ export const ReplayWorkspace: React.FC<Props> = ({
     if (kind === 'run') {
       setSpeedNormMode('real');
       onToggleFitMap?.(false);
+      setCourseEdit(false);
     }
   }, [event.id, kind]);
+
+  // Dragging the map and placing controls both use the left mouse button: one at a time
+  useEffect(() => {
+    if (fitMapMode) setCourseEdit(false);
+  }, [fitMapMode]);
+  useEffect(() => {
+    if (courseEdit) {
+      onToggleFitMap?.(false);
+      setSnapStage('idle');
+    } else {
+      setNextIsFinish(false);
+    }
+  }, [courseEdit]);
+  useEffect(() => {
+    if (!event.map) setCourseEdit(false);
+  }, [Boolean(event.map)]);
 
   // Compute group mean speed (m/s) for Livelox speed normalization
   const groupReferenceSpeedMs = useMemo(() => {
@@ -301,15 +343,160 @@ export const ReplayWorkspace: React.FC<Props> = ({
     return sum / visible.length;
   }, [event.participants]);
 
+  // ---- Course: controls on the map → punches → splits → tracks pulled onto the controls ----
+  const courseControls = useMemo<CourseControl[]>(
+    () => (isOrienteering ? event.map?.controls ?? [] : []),
+    [isOrienteering, event.map?.controls]
+  );
+  const courseLL = useMemo<[number, number][]>(
+    () =>
+      event.map?.matrix && courseControls.length > 0
+        ? controlsLonLat(courseControls, event.map.matrix)
+        : [],
+    [courseControls, event.map?.matrix]
+  );
+  const splits = useMemo(
+    () =>
+      event.map?.matrix && courseControls.length >= 2
+        ? computeSplits(event.participants, courseControls, event.map.matrix)
+        : [],
+    [event.participants, courseControls, event.map?.matrix]
+  );
+  // Tracks as drawn and replayed: with the Livelox-style adjustment when it is on
+  const displayParticipants = useMemo<ParticipantTrack[]>(() => {
+    if (!trackCorrection || splits.length === 0) return event.participants;
+    const byId = new Map(splits.map((s) => [s.participantId, s]));
+    return event.participants.map((p) => {
+      const s = byId.get(p.id);
+      return s
+        ? { ...p, points: correctTrackToControls(p.points, s.passages, courseLL) }
+        : p;
+    });
+  }, [event.participants, splits, courseLL, trackCorrection]);
+  const displayParticipantsRef = useRef(displayParticipants);
+  displayParticipantsRef.current = displayParticipants;
+  const courseLabels = useMemo(() => controlLabels(courseControls), [courseControls]);
+
+  const { syncToMatrix: syncCourseToMatrix } = useCourseOverlay({
+    mapRef,
+    mapReadyRef,
+    mapLoadCount,
+    controls: courseControls,
+    matrix: event.map?.matrix,
+    visible: isOrienteering && Boolean(event.map),
+    editable: courseEdit,
+    onMove: (id, px, py) =>
+      void saveCourse(
+        courseControlsRef.current.map((c) => (c.id === id ? { ...c, px, py } : c))
+      ),
+    onRemove: (id) =>
+      void saveCourse(courseControlsRef.current.filter((c) => c.id !== id)),
+  });
+  const courseControlsRef = useRef(courseControls);
+  courseControlsRef.current = courseControls;
+
+  async function saveCourse(controls: CourseControl[]) {
+    const eventId = eventRef.current.id;
+    const res = await fetch(`/api/events/${eventId}/course`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ controls }),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      setUploadError(data.error || 'Не удалось сохранить КП');
+      return;
+    }
+    if (eventRef.current.id === eventId) onEventUpdated(data.event);
+  }
+
+  /** Map click while editing the course: start first, then controls in order, finish last */
+  function addControlAt(lngLat: [number, number]) {
+    const m = liveMatrixRef.current ?? eventRef.current.map?.matrix;
+    if (!m) return;
+    const px = lonLatToPixel(m, lngLat[0], lngLat[1]);
+    if (!px) return;
+    const current = courseControlsRef.current;
+    const newControl = (k: CourseControl['kind']): CourseControl => ({
+      id: `${k}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`,
+      kind: k,
+      px: px[0],
+      py: px[1],
+    });
+    let next: CourseControl[];
+    if (current.length === 0) {
+      next = [newControl('start')];
+    } else if (nextIsFinish) {
+      next = [...current.filter((c) => c.kind !== 'finish'), newControl('finish')];
+      setNextIsFinish(false);
+    } else {
+      const finish = current.find((c) => c.kind === 'finish');
+      const rest = current.filter((c) => c.kind !== 'finish');
+      next = [...rest, newControl('control'), ...(finish ? [finish] : [])];
+    }
+    void saveCourse(next);
+  }
+
+  /** Give everyone the punches of one leg (or the whole course) as their start/finish */
+  async function applyCourseTrims(fromIdx: number, toIdx: number) {
+    const trims = splits
+      .filter((s) => s.passages[fromIdx]?.detected && s.passages[toIdx]?.detected)
+      .map((s) => ({
+        participantId: s.participantId,
+        trimStartSec: Math.floor(s.passages[fromIdx].t),
+        trimEndSec: Math.ceil(s.passages[toIdx].t),
+      }));
+    if (trims.length === 0) return;
+    const res = await fetch(`/api/events/${event.id}/trims`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ trims }),
+    });
+    if (res.ok) {
+      const data = await res.json();
+      onEventUpdated(data.event);
+      setRaceTimeSec(0);
+      setIsPlaying(false);
+    }
+  }
+
+  function selectCourseLeg(k: number) {
+    if (courseLL.length < k + 2) return;
+    const knownPassages: Record<string, { startIdx: number; endIdx: number }> = {};
+    for (const s of splits) {
+      if (s.legTimes[k] !== null) {
+        knownPassages[s.participantId] = {
+          startIdx: s.passages[k].idx,
+          endIdx: s.passages[k + 1].idx,
+        };
+      }
+    }
+    setCustomStartSpot(null);
+    setSelectedLeg({
+      startLonLat: courseLL[k],
+      endLonLat: courseLL[k + 1],
+      knownPassages,
+      courseLegIdx: k,
+    });
+    void applyCourseTrims(k, k + 1);
+  }
+
+  function selectWholeCourse() {
+    setSelectedLeg(null);
+    setCustomStartSpot(null);
+    void applyCourseTrims(0, courseControls.length - 1);
+  }
+
   // Compute detailed route-choice analytics when a leg (A -> B) is selected
   const legAnalysis = useMemo(() => {
     if (!selectedLeg) return null;
     return analyzeLegBetweenSpots(
-      event.participants,
+      displayParticipants,
       selectedLeg.startLonLat,
-      selectedLeg.endLonLat
+      selectedLeg.endLonLat,
+      selectedLeg.knownPassages
     );
-  }, [event.participants, selectedLeg]);
+  }, [displayParticipants, selectedLeg]);
 
   // Compute earliest start epoch across participants for 'real' time mode
   const eventEpochZeroMs = useMemo(() => {
@@ -495,7 +682,7 @@ export const ReplayWorkspace: React.FC<Props> = ({
       // 2. Full GPS tracks (white halo + clear colored line)
       map.addSource('ghost-tracks', {
         type: 'geojson',
-        data: buildGhostTracksGeoJson(event.participants),
+        data: buildGhostTracksGeoJson(displayParticipantsRef.current),
       });
       map.addLayer({
         id: 'ghost-tracks-casing',
@@ -560,7 +747,7 @@ export const ReplayWorkspace: React.FC<Props> = ({
       // 5. Common Start Spot Circle
       map.addSource('common-start', {
         type: 'geojson',
-        data: buildCommonStartGeoJson(event.participants),
+        data: buildCommonStartGeoJson(displayParticipantsRef.current),
       });
       map.addLayer({
         id: 'common-start-circle',
@@ -575,6 +762,7 @@ export const ReplayWorkspace: React.FC<Props> = ({
       });
 
       fitMapToTracksOrMap(map, event);
+      setMapLoadCount((c) => c + 1);
     });
 
     return () => {
@@ -795,6 +983,8 @@ export const ReplayWorkspace: React.FC<Props> = ({
       if (src) {
         src.setCoordinates(corners);
       }
+      // Controls are drawn on the map, so they travel with it
+      syncCourseToMatrix(nextMatrix);
     };
 
     const onMouseUp = () => {
@@ -848,6 +1038,7 @@ export const ReplayWorkspace: React.FC<Props> = ({
     if (src) {
       src.setCoordinates(res.cornersLonLat);
     }
+    syncCourseToMatrix(res.matrix);
 
     if (params.commitToServer) {
       void saveMatrixToServer(res.matrix);
@@ -930,6 +1121,7 @@ export const ReplayWorkspace: React.FC<Props> = ({
     liveMatrixRef.current = next;
     const src = map.getSource('custom-map') as maplibregl.ImageSource | undefined;
     src?.setCoordinates(matrixToCorners(next, mapMeta.width, mapMeta.height));
+    syncCourseToMatrix(next);
     resetRelativeSliders();
     setUploadError(null);
     void saveMatrixToServer(next, {
@@ -1047,19 +1239,19 @@ export const ReplayWorkspace: React.FC<Props> = ({
       | maplibregl.GeoJSONSource
       | undefined;
     if (src) {
-      src.setData(buildGhostTracksGeoJson(event.participants));
+      src.setData(buildGhostTracksGeoJson(displayParticipants));
     }
     const startSrc = map.getSource('common-start') as
       | maplibregl.GeoJSONSource
       | undefined;
     if (startSrc) {
-      startSrc.setData(buildCommonStartGeoJson(event.participants));
+      startSrc.setData(buildCommonStartGeoJson(displayParticipants));
     }
-  }, [event.participants]);
+  }, [displayParticipants]);
 
   // Compute live interpolated states for each participant at `raceTimeSec`
   const runnerStates = useMemo(() => {
-    return event.participants.map((p) => ({
+    return displayParticipants.map((p) => ({
       participant: p,
       state: interpolateTrackAt(
         p,
@@ -1071,7 +1263,7 @@ export const ReplayWorkspace: React.FC<Props> = ({
       ),
     }));
   }, [
-    event.participants,
+    displayParticipants,
     raceTimeSec,
     event.timeMode,
     eventEpochZeroMs,
@@ -1091,7 +1283,7 @@ export const ReplayWorkspace: React.FC<Props> = ({
       if (tailSrc) {
         tailSrc.setData(
           buildActiveTailsGeoJson(
-            event.participants,
+            displayParticipants,
             raceTimeSec,
             tailLengthSec,
             event.timeMode,
@@ -1163,7 +1355,7 @@ export const ReplayWorkspace: React.FC<Props> = ({
     speedHeatmap,
     speedNormMode,
     groupReferenceSpeedMs,
-    event.participants,
+    displayParticipants,
     event.timeMode,
     eventEpochZeroMs,
   ]);
@@ -1251,9 +1443,13 @@ export const ReplayWorkspace: React.FC<Props> = ({
         }
       );
 
+      // Scanners store their resolution in the file: then only the print scale is left to type
+      const dpi = await readImageDpi(file);
+
       const form = new FormData();
       form.append('width', String(dims.width));
       form.append('height', String(dims.height));
+      if (dpi) form.append('dpi', String(dpi));
       form.append('file', file);
 
       const res = await fetch(`/api/events/${event.id}/map`, {
@@ -1337,6 +1533,11 @@ export const ReplayWorkspace: React.FC<Props> = ({
         Number(e.lngLat.lat.toFixed(6)),
       ];
 
+      if (courseEdit && snapStage === 'idle') {
+        addControlAt([e.lngLat.lng, e.lngLat.lat]);
+        return;
+      }
+
       if (snapStage === 'scalebar_start') {
         setPickedFeatureLonLat(clicked);
         setSnapStage('scalebar_end');
@@ -1387,6 +1588,8 @@ export const ReplayWorkspace: React.FC<Props> = ({
     printScale,
     scanDpi,
     declinationDeg,
+    courseEdit,
+    nextIsFinish,
   ]);
 
   async function syncStartAtSpot(
@@ -1415,9 +1618,14 @@ export const ReplayWorkspace: React.FC<Props> = ({
   }
 
   async function resetToFullRaceStart() {
+    setSpeedNormMode('real');
+    // With a course, "whole race" means start triangle → finish punches
+    if (splits.length > 0 && courseControls.length >= 2) {
+      selectWholeCourse();
+      return;
+    }
     setCustomStartSpot(null);
     setSelectedLeg(null);
-    setSpeedNormMode('real');
     await syncStartAtSpot();
   }
 
@@ -1494,6 +1702,23 @@ export const ReplayWorkspace: React.FC<Props> = ({
                     title="Удалить загруженную карту из этого мероприятия"
                   >
                     <Trash2 className="w-3.5 h-3.5" />
+                  </button>
+
+                  <button
+                    onClick={() => setCourseEdit((v) => !v)}
+                    className={`inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg font-medium border transition ${
+                      courseEdit
+                        ? 'bg-fuchsia-600 border-fuchsia-400 text-white shadow'
+                        : 'bg-slate-800 hover:bg-slate-700 border-slate-700 text-fuchsia-300'
+                    }`}
+                    title="Отметить старт, КП и финиш на карте — получатся сплиты по перегонам"
+                  >
+                    ◎ КП дистанции
+                    {courseControls.length > 0 && (
+                      <span className="text-[10px] opacity-80">
+                        ({courseControls.filter((c) => c.kind === 'control').length})
+                      </span>
+                    )}
                   </button>
 
                   <div className="flex items-center gap-1.5">
@@ -1928,6 +2153,57 @@ export const ReplayWorkspace: React.FC<Props> = ({
             </div>
           )}
 
+          {/* Course editing: click the map to place start → controls → finish */}
+          {courseEdit && isOrienteering && event.map && (
+            <div className="relative z-10 px-3 py-1.5 bg-fuchsia-950/80 border-b border-fuchsia-500/40 text-xs text-fuchsia-100 flex flex-wrap items-center justify-between gap-2 shrink-0">
+              <span>
+                {courseControls.length === 0
+                  ? '▲ Кликните СТАРТ (треугольник) на карте'
+                  : nextIsFinish
+                    ? '◎ Кликните ФИНИШ на карте'
+                    : `Кликните КП ${
+                        courseControls.filter((c) => c.kind === 'control').length + 1
+                      } по порядку. Маркеры можно перетаскивать, правый клик — удалить`}
+              </span>
+              <div className="flex items-center gap-1.5">
+                <button
+                  onClick={() => setNextIsFinish((v) => !v)}
+                  disabled={courseControls.length === 0}
+                  className={`px-2 py-0.5 rounded border transition disabled:opacity-40 ${
+                    nextIsFinish
+                      ? 'bg-fuchsia-500 border-fuchsia-300 text-white'
+                      : 'bg-slate-900 border-slate-700 text-fuchsia-200 hover:text-white'
+                  }`}
+                >
+                  ◎ Следующий клик — финиш
+                </button>
+                <button
+                  onClick={() => void saveCourse(courseControls.slice(0, -1))}
+                  disabled={courseControls.length === 0}
+                  className="px-2 py-0.5 rounded bg-slate-900 border border-slate-700 text-slate-200 hover:text-white disabled:opacity-40"
+                >
+                  ↶ Убрать последний
+                </button>
+                <button
+                  onClick={() => {
+                    if (window.confirm('Удалить все КП дистанции?')) void saveCourse([]);
+                  }}
+                  disabled={courseControls.length === 0}
+                  className="px-2 py-0.5 rounded bg-slate-900 border border-slate-700 text-slate-400 hover:text-rose-300 disabled:opacity-40"
+                >
+                  Очистить
+                </button>
+                <button
+                  onClick={() => setCourseEdit(false)}
+                  className="inline-flex items-center gap-1 px-2.5 py-0.5 rounded bg-emerald-600 hover:bg-emerald-500 text-white font-semibold"
+                >
+                  <Check className="w-3.5 h-3.5" />
+                  Готово
+                </button>
+              </div>
+            </div>
+          )}
+
           {/* Active Map Click Prompt Banner (for Spot Start, Leg Selection or Scale Bar) */}
           {snapStage !== 'idle' && (
             <div className="relative z-10 px-3 py-1.5 bg-fuchsia-600/25 border-b border-fuchsia-400/50 text-fuchsia-200 text-xs font-medium flex items-center justify-between animate-pulse shrink-0">
@@ -1973,7 +2249,7 @@ export const ReplayWorkspace: React.FC<Props> = ({
           <div
             ref={mapContainerRef}
             className={`relative flex-1 w-full overflow-hidden ${
-              snapStage !== 'idle'
+              snapStage !== 'idle' || courseEdit
                 ? 'cursor-crosshair'
                 : fitMapMode && dragMovesMap && event.map
                   ? 'cursor-move'
@@ -2137,6 +2413,19 @@ export const ReplayWorkspace: React.FC<Props> = ({
               </button>
             )}
           </div>
+
+          {/* Course splits: who ran each leg how fast */}
+          {isOrienteering && courseControls.length >= 2 && (
+            <SplitsPanel
+              splits={splits}
+              labels={courseLabels}
+              selectedLegIdx={selectedLeg?.courseLegIdx ?? null}
+              onSelectLeg={selectCourseLeg}
+              onWholeCourse={selectWholeCourse}
+              trackCorrection={trackCorrection}
+              onToggleTrackCorrection={setTrackCorrection}
+            />
+          )}
 
           {/* Selected Leg Route-Choice Comparison Panel */}
           {legAnalysis && (
