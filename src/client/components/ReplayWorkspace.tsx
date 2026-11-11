@@ -179,6 +179,8 @@ export const ReplayWorkspace: React.FC<Props> = ({
   // Course editing: clicks on the map place controls (start → 1, 2, … → finish)
   const [courseEdit, setCourseEdit] = useState<boolean>(false);
   const [nextIsFinish, setNextIsFinish] = useState<boolean>(false);
+  // Start/finish are placed by hand (tracks are switched on late / off late)
+  const [nextIsStart, setNextIsStart] = useState<boolean>(false);
   // Livelox-style adjustment of the tracks onto the punched controls
   const [trackCorrection, setTrackCorrection] = useState<boolean>(true);
 
@@ -334,6 +336,7 @@ export const ReplayWorkspace: React.FC<Props> = ({
       setSnapStage('idle');
     } else {
       setNextIsFinish(false);
+      setNextIsStart(false);
     }
   }, [courseEdit]);
   useEffect(() => {
@@ -434,11 +437,16 @@ export const ReplayWorkspace: React.FC<Props> = ({
       py: px[1],
     });
     let next: CourseControl[];
-    if (current.length === 0) {
+    if (nextIsStart) {
+      // one start, always first
+      next = [newControl('start'), ...current.filter((c) => c.kind !== 'start')];
+      setNextIsStart(false);
+    } else if (current.length === 0) {
       next = [newControl('start')];
     } else if (nextIsFinish) {
       next = [...current.filter((c) => c.kind !== 'finish'), newControl('finish')];
       setNextIsFinish(false);
+      setNextIsStart(false);
     } else {
       const finish = current.find((c) => c.kind === 'finish');
       const rest = current.filter((c) => c.kind !== 'finish');
@@ -491,10 +499,23 @@ export const ReplayWorkspace: React.FC<Props> = ({
     void applyCourseTrims(k, k + 1);
   }
 
+  /**
+   * Whole course for everyone: from the first to the last control that every runner of this
+   * course punched — someone may have started the watch after control 1 or stopped it before
+   * the finish. Runners of another course (they punch few of these controls) are left as is.
+   */
   function selectWholeCourse() {
     setSelectedLeg(null);
     setCustomStartSpot(null);
-    void applyCourseTrims(0, courseControls.length - 1);
+    const n = courseControls.length;
+    const onCourse = splits.filter(
+      (s) => s.passages.filter((p) => p.detected).length >= n / 2
+    );
+    let from = 0;
+    while (from < n - 1 && onCourse.some((s) => !s.passages[from].detected)) from++;
+    let to = n - 1;
+    while (to > from && onCourse.some((s) => !s.passages[to].detected)) to--;
+    void applyCourseTrims(from, to);
   }
 
   // Compute detailed route-choice analytics when a leg (A -> B) is selected
@@ -1224,7 +1245,8 @@ export const ReplayWorkspace: React.FC<Props> = ({
     // let the status paint before the CPU-heavy part
     await new Promise((r) => setTimeout(r, 30));
     try {
-      const circles = await detectCirclesOnScan(meta.imageUrl, meta.width, meta.scanDpi);
+      const scan = await detectCirclesOnScan(meta.imageUrl, meta.width, meta.scanDpi);
+      const circles = scan.circles;
       if (circles.length < 3) {
         setAutoGeorefState({
           busy: false,
@@ -1293,7 +1315,7 @@ export const ReplayWorkspace: React.FC<Props> = ({
             Math.round(res.rmsM * 10) / 10
           } м${res.impliedPrintScale ? `, масштаб ≈1:${res.impliedPrintScale}` : ''}.` +
           (courseCreated
-            ? ' Дистанция отмечена автоматически (порядок — по трекам): проверьте КП и старт.'
+            ? ' КП отмечены автоматически (порядок — по трекам). Старт и финиш поставьте вручную: ◎ КП → ▲ старт / ◎ финиш.'
             : ''),
       });
     } catch (err) {
@@ -1897,6 +1919,7 @@ export const ReplayWorkspace: React.FC<Props> = ({
     declinationDeg,
     courseEdit,
     nextIsFinish,
+    nextIsStart,
     pinDraftPx,
   ]);
 
@@ -2146,7 +2169,7 @@ export const ReplayWorkspace: React.FC<Props> = ({
           {courseEdit && isOrienteering && event.map && (
             <div className="relative z-10 px-3 py-1.5 bg-fuchsia-950/80 border-b border-fuchsia-500/40 text-xs text-fuchsia-100 flex flex-wrap items-center justify-between gap-2 shrink-0">
               <span>
-                {courseControls.length === 0
+                {courseControls.length === 0 || nextIsStart
                   ? '▲ Кликните СТАРТ (треугольник) на карте'
                   : nextIsFinish
                     ? '◎ Кликните ФИНИШ на карте'
@@ -2156,7 +2179,24 @@ export const ReplayWorkspace: React.FC<Props> = ({
               </span>
               <div className="flex items-center gap-1.5">
                 <button
-                  onClick={() => setNextIsFinish((v) => !v)}
+                  onClick={() => {
+                    setNextIsStart((v) => !v);
+                    setNextIsFinish(false);
+                  }}
+                  className={`px-2 py-0.5 rounded border transition ${
+                    nextIsStart
+                      ? 'bg-fuchsia-500 border-fuchsia-300 text-white'
+                      : 'bg-slate-900 border-slate-700 text-fuchsia-200 hover:text-white'
+                  }`}
+                  title="Поставить или передвинуть старт (треугольник): он всегда первый"
+                >
+                  {courseControls.some((c) => c.kind === 'start') ? '▲ Переставить старт' : '▲ Следующий клик — старт'}
+                </button>
+                <button
+                  onClick={() => {
+                    setNextIsFinish((v) => !v);
+                    setNextIsStart(false);
+                  }}
                   disabled={courseControls.length === 0}
                   className={`px-2 py-0.5 rounded border transition disabled:opacity-40 ${
                     nextIsFinish

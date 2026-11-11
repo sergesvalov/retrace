@@ -1,7 +1,7 @@
 import {
+  fitAffineTransform,
   fitSimilarityTransform,
   lonLatToMercator,
-  lonLatToPixel,
   mercatorToLonLat,
 } from './georef.js';
 import type { CourseControl, GCP, ParticipantTrack } from './types.js';
@@ -15,6 +15,8 @@ export interface DetectedCircle {
   r: number;
   /** Share of the ring that is actually drawn (0..1) */
   coverage: number;
+  /** Double circle (ISOM finish: 5 and 7 mm) */
+  finish?: boolean;
 }
 
 export interface AutoGeorefResult {
@@ -136,7 +138,10 @@ export function autoGeoref(opts: {
   /** Extra scale hypothesis, e.g. from the print scale + DPI the user entered */
   groundMPerPxHint?: number | null;
 }): AutoGeorefResult | null {
-  const { circles, declinationDeg } = opts;
+  const { declinationDeg } = opts;
+  // The finish double circle is left out: runners mill around start/finish and watches are
+  // stopped late, so it is a poor tie point (and not part of the auto course either)
+  const circles = opts.circles.filter((c) => !c.finish);
   const tracks = opts.participants.filter((p) => p.points.length >= 2);
   if (circles.length < 3 || tracks.length === 0) return null;
 
@@ -253,10 +258,33 @@ export function autoGeoref(opts: {
 
   const pairs = matchUnder(m, 20);
   if (pairs.length < 3) return null;
-  const rmsM = Math.sqrt(pairs.reduce((s, p) => s + p.distM ** 2, 0) / pairs.length);
+  let rmsM = Math.sqrt(pairs.reduce((s, p) => s + p.distM ** 2, 0) / pairs.length);
+
+  // A folded, slightly skewed scan is not exactly a scaled + rotated copy of the ground:
+  // with enough circles try an affine fit and keep it if it is clearly better
+  if (pairs.length >= 6) {
+    const gcps: GCP[] = pairs.map((p, i) => {
+      const [lon, lat] = mercatorToLonLat(p.x, p.y);
+      return { id: String(i), label: '', px: p.circle.px, py: p.circle.py, lon, lat };
+    });
+    const aff = fitAffineTransform(gcps);
+    if (aff) {
+      const affPairs = matchUnder(aff, 20);
+      if (affPairs.length >= pairs.length) {
+        const affRms = Math.sqrt(
+          affPairs.reduce((s, p) => s + p.distM ** 2, 0) / affPairs.length
+        );
+        if (affRms < rmsM * 0.85) {
+          m = aff;
+          rmsM = affRms;
+        }
+      }
+    }
+  }
+  const finalPairs = matchUnder(m, 20);
 
   const mpp = Math.sqrt(Math.abs(m[0] * m[4] - m[1] * m[3])) / mercK;
-  const rMed = median(pairs.map((p) => p.circle.r));
+  const rMed = median(finalPairs.map((p) => p.circle.r));
   // diameter on paper (mm) = 2 r px · mpp / scale · 1000 → pick the scale closest to 5–6 mm
   const impliedPrintScale =
     PRINT_SCALES.map((s) => ({
@@ -268,39 +296,44 @@ export function autoGeoref(opts: {
 
   return {
     matrix: m,
-    matchedCircles: pairs.map((p) => p.circle),
+    matchedCircles: finalPairs.map((p) => p.circle),
     rmsM,
     impliedPrintScale,
-    controls: buildCourseFromCircles(
-      pairs.map((p) => p.circle),
-      tracks,
-      m
-    ),
+    // The course may include circles the GPS passed a bit wider (fold of the paper, forest GPS)
+    controls: buildCourseFromCircles(circles, tracks, m),
   };
 }
 
 /**
- * Course from the matched circles: ordered by when the runners passed them (median of each
- * runner's relative time), a start at the runners' common starting point, and the last
- * circle as finish if it is where the tracks end.
+ * Numbered controls from the circles the runners passed (within `nearM`), ordered by when
+ * they punched them (closest approach, median over runners).
+ *
+ * Start and finish are NOT created: watches are switched on late and off after walking back
+ * to the start table, so tracks say little about them — the user places them by hand.
+ * The finish double circle (if detected) is therefore left out as well.
  */
 export function buildCourseFromCircles(
   circles: DetectedCircle[],
   tracks: ParticipantTrack[],
-  matrix: Matrix
+  matrix: Matrix,
+  nearM = 35
 ): CourseControl[] {
   const lat0 = tracks[0]?.points[0]?.lat ?? 0;
   const mercK = 1 / Math.cos((lat0 * Math.PI) / 180);
-  const near = 30 * mercK;
+  const near = nearM * mercK;
   const merc = tracks.map((t) =>
-    t.points.map((p) => ({ xy: lonLatToMercator(p.lon, p.lat), rel: p.t / Math.max(1, t.durationSec) }))
+    t.points.map((p) => ({
+      xy: lonLatToMercator(p.lon, p.lat),
+      rel: p.t / Math.max(1, t.durationSec),
+    }))
   );
 
   const ordered = circles
+    .filter((c) => !c.finish)
     .map((c) => {
       const x = matrix[0] * c.px + matrix[1] * c.py + matrix[2];
       const y = matrix[3] * c.px + matrix[4] * c.py + matrix[5];
-      const rels: number[] = [];
+      const closest: number[] = [];
       for (const pts of merc) {
         let bestD = near * near;
         let bestRel: number | null = null;
@@ -311,36 +344,17 @@ export function buildCourseFromCircles(
             bestRel = p.rel;
           }
         }
-        if (bestRel !== null) rels.push(bestRel);
+        if (bestRel !== null) closest.push(bestRel);
       }
-      return { c, order: rels.length ? median(rels) : Infinity };
+      return closest.length ? { c, order: median(closest) } : null;
     })
-    .filter((o) => Number.isFinite(o.order))
+    .filter((v): v is NonNullable<typeof v> => v !== null)
     .sort((a, b) => a.order - b.order);
 
-  const id = (k: string, i: number) => `${k}-auto-${i}-${Math.round(Math.random() * 1e6).toString(36)}`;
-  const course: CourseControl[] = [];
-
-  // Start: where the runners began (the start triangle itself is not detected)
-  const firstLon = median(tracks.map((t) => t.points[0].lon));
-  const firstLat = median(tracks.map((t) => t.points[0].lat));
-  const startPx = lonLatToPixel(matrix, firstLon, firstLat);
-  if (startPx) course.push({ id: id('start', 0), kind: 'start', px: startPx[0], py: startPx[1] });
-
-  const lastLon = median(tracks.map((t) => t.points[t.points.length - 1].lon));
-  const lastLat = median(tracks.map((t) => t.points[t.points.length - 1].lat));
-  const [ex, ey] = lonLatToMercator(lastLon, lastLat);
-  ordered.forEach((o, i) => {
-    const isLast = i === ordered.length - 1;
-    const x = matrix[0] * o.c.px + matrix[1] * o.c.py + matrix[2];
-    const y = matrix[3] * o.c.px + matrix[4] * o.c.py + matrix[5];
-    const atTrackEnd = Math.hypot(x - ex, y - ey) <= 60 * mercK;
-    course.push({
-      id: id(isLast && atTrackEnd ? 'finish' : 'control', i + 1),
-      kind: isLast && atTrackEnd ? 'finish' : 'control',
-      px: o.c.px,
-      py: o.c.py,
-    });
-  });
-  return course;
+  return ordered.map((o, i) => ({
+    id: `control-auto-${i + 1}-${Math.round(Math.random() * 1e6).toString(36)}`,
+    kind: 'control' as const,
+    px: o.c.px,
+    py: o.c.py,
+  }));
 }

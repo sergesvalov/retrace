@@ -102,13 +102,9 @@ describe('fully automatic georeferencing', () => {
       expect(haversineDistanceM(lon, lat, ...truthLL(p))).toBeLessThan(2);
     }
 
-    // Course built in the order the runners went: start, 1…7, finish
-    expect(res.controls.map((c) => c.kind)).toEqual([
-      'start',
-      ...Array(CONTROL_PX.length - 1).fill('control'),
-      'finish',
-    ]);
-    res.controls.slice(1).forEach((c, i) => {
+    // Numbered controls in the order the runners went; start/finish are left to the user
+    expect(res.controls.map((c) => c.kind)).toEqual(Array(CONTROL_PX.length).fill('control'));
+    res.controls.forEach((c, i) => {
       expect(Math.hypot(c.px - CONTROL_PX[i][0], c.py - CONTROL_PX[i][1])).toBeLessThan(3);
     });
   });
@@ -126,5 +122,28 @@ describe('fully automatic georeferencing', () => {
       declinationDeg: DECL,
     });
     expect(res === null || res.matchedCircles.length < 3).toBe(true);
+  });
+
+  it('orders the controls even if a runner started the watch after control 1, without start/finish', () => {
+    // The finish double circle (next to the start) is detected but must not become a control
+    const circles: DetectedCircle[] = [
+      ...CONTROL_PX.map(([px, py]) => ({ px, py, r: R_PX, coverage: 0.9 })),
+      { px: START_PX[0] + 20, py: START_PX[1] + 10, r: R_PX, coverage: 0.8, finish: true },
+    ];
+    const a = runner('a', 3.6, 0);
+    // runner b switched the watch on only after control 1
+    const b0 = runner('b', 3.1, 70);
+    const firstAfterC1 = b0.points.findIndex(
+      (p) => haversineDistanceM(p.lon, p.lat, ...truthLL(CONTROL_PX[1])) < 200
+    );
+    const b = { ...b0, points: b0.points.slice(firstAfterC1) };
+
+    const res = autoGeoref({ circles, participants: [a, b], declinationDeg: DECL })!;
+    expect(res).not.toBeNull();
+    expect(res.controls.every((c) => c.kind === 'control')).toBe(true);
+    expect(res.controls).toHaveLength(CONTROL_PX.length);
+    res.controls.forEach((c, i) => {
+      expect(Math.hypot(c.px - CONTROL_PX[i][0], c.py - CONTROL_PX[i][1])).toBeLessThan(3);
+    });
   });
 });

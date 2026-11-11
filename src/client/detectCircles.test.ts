@@ -99,3 +99,50 @@ describe('control circle detection', () => {
     expect(found).toHaveLength(controls.length);
   });
 });
+
+describe('finish and start symbols (ISOM)', () => {
+  function triangle(
+    data: Uint8ClampedArray,
+    cx: number,
+    cy: number,
+    side: number,
+    theta: number
+  ) {
+    const R = side / Math.sqrt(3);
+    const v = [0, 1, 2].map((k) => [
+      cx + R * Math.cos(theta + (k * 2 * Math.PI) / 3),
+      cy + R * Math.sin(theta + (k * 2 * Math.PI) / 3),
+    ]);
+    // ISOM proportions: 0.35 mm line on a 7 mm side → a thin (1 px) outline at this size
+    for (let k = 0; k < 3; k++) {
+      const [ax, ay] = v[k];
+      const [bx, by] = v[(k + 1) % 3];
+      const n = Math.ceil(Math.hypot(bx - ax, by - ay) * 2);
+      for (let i = 0; i <= n; i++) put(data, ax + ((bx - ax) * i) / n, ay + ((by - ay) * i) / n, PURPLE);
+    }
+  }
+
+  it('flags the double circle as finish, even with the start triangle drawn over it', () => {
+    const data = blank();
+    const c1: [number, number] = [200, 120];
+    const finish: [number, number] = [470, 300];
+    ring(data, ...c1, 12);
+    ring(data, 330, 90, 12);
+    ring(data, 520, 120, 12);
+    // finish: 5 mm inside 7 mm
+    ring(data, ...finish, 12);
+    ring(data, ...finish, 17);
+    // start triangle drawn over the finish (start and finish together), apex to control 1
+    const start: [number, number] = [460, 305];
+    triangle(data, ...start, 30, Math.atan2(c1[1] - start[1], c1[0] - start[0]));
+    // decoy: a purple arrow head nearby pointing down (a map note), not at control 1
+    triangle(data, 330, 250, 30, Math.PI / 2);
+
+    const found = detectOverprintCircles({ width: W, height: H, data }, { rMin: 8, rMax: 16 });
+    const fin = found.filter((c) => c.finish);
+    expect(fin).toHaveLength(1);
+    expect(Math.hypot(fin[0].px - finish[0], fin[0].py - finish[1])).toBeLessThanOrEqual(2);
+    expect(found.filter((c) => !c.finish)).toHaveLength(3);
+
+  });
+});
