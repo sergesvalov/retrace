@@ -36,8 +36,9 @@ export function parseGpxText(xml: string): {
     xml.match(/<name>([^<]+)<\/name>/i);
   const name = nameMatch ? nameMatch[1].trim() : undefined;
 
+  // `(?<!\/)>` skips self-closing <trkpt .../> (no <time>), which would otherwise swallow the next point's body
   const ptRegex =
-    /<trkpt\b[^>]*?\blat=["']([^"']+)["'][^>]*?\blon=["']([^"']+)["'][^>]*>([\s\S]*?)<\/trkpt>|<trkpt\b[^>]*?\blon=["']([^"']+)["'][^>]*?\blat=["']([^"']+)["'][^>]*>([\s\S]*?)<\/trkpt>/gi;
+    /<trkpt\b[^>]*?\blat=["']([^"']+)["'][^>]*?\blon=["']([^"']+)["'][^>]*(?<!\/)>([\s\S]*?)<\/trkpt>|<trkpt\b[^>]*?\blon=["']([^"']+)["'][^>]*?\blat=["']([^"']+)["'][^>]*(?<!\/)>([\s\S]*?)<\/trkpt>/gi;
 
   const samples: RawTrackSample[] = [];
   let match: RegExpExecArray | null;
@@ -585,6 +586,55 @@ export interface InterpolatedState {
   ele?: number;
   finished: boolean;
   notStarted: boolean;
+  /** Track-local time `t` (seconds from the track's first point) of the runner's head position */
+  localT: number;
+}
+
+function overallSpeedOf(track: ParticipantTrack, fallbackMs: number): number {
+  return track.durationSec > 0
+    ? track.totalDistanceM / track.durationSec
+    : fallbackMs;
+}
+
+/**
+ * Track seconds that elapse per race-clock second in 'from_start' mode.
+ * Livelox handicap: every runner is replayed at the group reference speed on average,
+ * so a faster-than-average runner is slowed down (rate < 1) and a slower one sped up.
+ */
+function trackRateFactor(
+  track: ParticipantTrack,
+  speedNormMode: SpeedNormMode,
+  referenceSpeedMs: number
+): number {
+  if (speedNormMode !== 'livelox_handicap' || referenceSpeedMs <= 0.3) return 1;
+  const overall = overallSpeedOf(track, referenceSpeedMs);
+  return overall > 0.3 ? referenceSpeedMs / overall : 1;
+}
+
+/**
+ * Race-clock second at which the runner passes track point `pt` (inverse of `interpolateTrackAt`).
+ * Used for the timeline length and the speed chart, so they match what the map shows.
+ */
+export function raceTimeOfTrackPoint(
+  track: ParticipantTrack,
+  pt: TrackPoint,
+  timeMode: 'from_start' | 'real',
+  eventEpochZeroMs: number,
+  speedNormMode: SpeedNormMode = 'real',
+  referenceSpeedMs = 2.8
+): number {
+  if (timeMode === 'real') {
+    return (pt.absTimeMs - eventEpochZeroMs) / 1000 + track.offsetSec;
+  }
+  if (speedNormMode === 'equal_speed') {
+    const pStart = findPointAtT(track.points, track.trimStartSec);
+    return (
+      (pt.distM - pStart.distM) / Math.max(0.5, referenceSpeedMs) +
+      track.offsetSec
+    );
+  }
+  const rate = trackRateFactor(track, speedNormMode, referenceSpeedMs);
+  return (pt.t - track.trimStartSec) / rate + track.offsetSec;
 }
 
 /**
@@ -609,18 +659,20 @@ export function interpolateTrackAt(
   // Mode 3: Constant equal speed along each runner's chosen trajectory (shows pure geometry/detour cost)
   if (speedNormMode === 'equal_speed' && timeMode === 'from_start') {
     const pEnd = findPointAtT(pts, maxT);
+    const runSec = raceTimeSec - track.offsetSec;
     const targetDistM =
-      pStart.distM + Math.max(0, raceTimeSec) * Math.max(0.5, referenceSpeedMs);
-    if (raceTimeSec <= 0) {
+      pStart.distM + Math.max(0, runSec) * Math.max(0.5, referenceSpeedMs);
+    if (runSec <= 0) {
       return {
         lat: pStart.lat,
         lon: pStart.lon,
-        speedMs: referenceSpeedMs,
+        speedMs: 0,
         distM: 0,
         hr: pStart.hr,
         ele: pStart.ele,
         finished: false,
         notStarted: true,
+        localT: pStart.t,
       };
     }
     if (targetDistM >= pEnd.distM) {
@@ -633,6 +685,7 @@ export function interpolateTrackAt(
         ele: pEnd.ele,
         finished: true,
         notStarted: false,
+        localT: pEnd.t,
       };
     }
     let lo = 0;
@@ -649,25 +702,20 @@ export function interpolateTrackAt(
     return {
       lat: p0.lat + (p1.lat - p0.lat) * alpha,
       lon: p0.lon + (p1.lon - p0.lon) * alpha,
-      speedMs: p0.speedMs + (p1.speedMs - p0.speedMs) * alpha,
+      speedMs: Math.max(0.5, referenceSpeedMs),
       distM: Math.max(0, targetDistM - pStart.distM),
       hr: p0.hr ?? p1.hr,
       ele: p0.ele ?? p1.ele,
       finished: false,
       notStarted: false,
+      localT: p0.t + (p1.t - p0.t) * alpha,
     };
   }
 
   let localT: number;
+  let rateFactor = 1;
   if (timeMode === 'from_start') {
-    const overallSpeedMs =
-      track.durationSec > 0
-        ? track.totalDistanceM / track.durationSec
-        : referenceSpeedMs;
-    const rateFactor =
-      speedNormMode === 'livelox_handicap' && referenceSpeedMs > 0.3
-        ? overallSpeedMs / referenceSpeedMs
-        : 1;
+    rateFactor = trackRateFactor(track, speedNormMode, referenceSpeedMs);
     localT =
       (raceTimeSec - track.offsetSec) * rateFactor + track.trimStartSec;
   } else {
@@ -687,6 +735,7 @@ export function interpolateTrackAt(
       ele: p.ele,
       finished: false,
       notStarted: true,
+      localT: minT,
     };
   }
   if (localT >= maxT) {
@@ -700,6 +749,7 @@ export function interpolateTrackAt(
       ele: p.ele,
       finished: true,
       notStarted: false,
+      localT: maxT,
     };
   }
 
@@ -720,7 +770,8 @@ export function interpolateTrackAt(
   return {
     lat: p0.lat + (p1.lat - p0.lat) * alpha,
     lon: p0.lon + (p1.lon - p0.lon) * alpha,
-    speedMs: p0.speedMs + (p1.speedMs - p0.speedMs) * alpha,
+    // Replayed speed: the Livelox handicap slows down / speeds up the whole track by `rateFactor`
+    speedMs: (p0.speedMs + (p1.speedMs - p0.speedMs) * alpha) * rateFactor,
     distM: Math.max(
       0,
       p0.distM + (p1.distM - p0.distM) * alpha - pStart.distM
@@ -735,10 +786,14 @@ export function interpolateTrackAt(
         : p0.ele ?? p1.ele,
     finished: false,
     notStarted: false,
+    localT,
   };
 }
 
 function findPointAtT(pts: TrackPoint[], t: number): TrackPoint {
+  // The bisection below never lands on the last index, so the finish point needs its own check
+  const last = pts[pts.length - 1];
+  if (t >= last.t) return last;
   let lo = 0;
   let hi = pts.length - 1;
   while (lo + 1 < hi) {
@@ -754,9 +809,10 @@ export function formatPaceMinKm(speedMs: number): string {
   if (!Number.isFinite(speedMs) || speedMs < 0.35) return '— /км';
   const secPerKm = 1000 / speedMs;
   if (secPerKm > 1800) return '>30:00';
-  const mins = Math.floor(secPerKm / 60);
-  const secs = Math.round(secPerKm % 60);
-  return `${mins}:${secs < 10 ? '0' : ''}${secs === 60 ? '59' : secs} /км`;
+  const totalSec = Math.round(secPerKm);
+  const mins = Math.floor(totalSec / 60);
+  const secs = totalSec % 60;
+  return `${mins}:${secs < 10 ? '0' : ''}${secs} /км`;
 }
 
 /** Format seconds into HH:MM:SS or MM:SS */

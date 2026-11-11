@@ -65,10 +65,16 @@ async function ensureDirs() {
 async function loadAllEvents(): Promise<Map<string, RaceEvent>> {
   const map = new Map<string, RaceEvent>();
 
+  let files: string[] = [];
   try {
-    const files = await fs.readdir(EVENTS_DIR);
-    for (const f of files) {
-      if (!f.endsWith('.json')) continue;
+    files = await fs.readdir(EVENTS_DIR);
+  } catch {
+    return map;
+  }
+  for (const f of files) {
+    if (!f.endsWith('.json')) continue;
+    // One broken file must not hide every event that comes after it
+    try {
       const raw = await fs.readFile(path.join(EVENTS_DIR, f), 'utf8');
       const evt = JSON.parse(raw) as RaceEvent;
       if (evt.id === 'demo-bitza-2026') continue;
@@ -97,19 +103,40 @@ async function loadAllEvents(): Promise<Map<string, RaceEvent>> {
       }
 
       map.set(evt.id, evt);
+    } catch (err) {
+      console.error(`Skipping unreadable event file ${f}:`, err);
     }
-  } catch {
-    // ignore
   }
   return map;
 }
 
 async function saveEventToDisk(evt: RaceEvent) {
-  await fs.writeFile(
-    path.join(EVENTS_DIR, `${evt.id}.json`),
-    JSON.stringify(evt, null, 2),
-    'utf8'
-  );
+  // Write to a temp file and rename, so a crash mid-write never leaves a truncated JSON
+  const target = path.join(EVENTS_DIR, `${evt.id}.json`);
+  const tmp = `${target}.${makeId(6)}.tmp`;
+  await fs.writeFile(tmp, JSON.stringify(evt, null, 2), 'utf8');
+  await fs.rename(tmp, target);
+}
+
+const MAP_IMAGE_EXTS = new Set(['.png', '.jpg', '.jpeg', '.webp', '.gif']);
+const HEX_COLOR_RE = /^#[0-9a-fA-F]{6}$/;
+
+/** Finite and invertible (a zero scale would collapse the map into a point) */
+function isUsableMatrix(m: number[] | undefined): boolean {
+  if (!Array.isArray(m) || m.length !== 6 || !m.every(Number.isFinite)) {
+    return false;
+  }
+  const [a, b, , c, d] = m;
+  return Math.abs(a * d - b * c) > 1e-6;
+}
+
+async function removeUploadedMapFile(imageUrl: string | undefined) {
+  if (!imageUrl?.startsWith('/uploads/')) return;
+  try {
+    await fs.unlink(path.join(UPLOADS_DIR, path.basename(imageUrl)));
+  } catch {
+    // already gone
+  }
 }
 
 async function startServer() {
@@ -218,10 +245,13 @@ async function startServer() {
   }>('/api/events/:id', async (req, reply) => {
     const evt = eventsStore.get(req.params.id);
     if (!evt) return reply.code(404).send({ error: 'Событие не найдено' });
-    if (req.body.title !== undefined) evt.title = req.body.title;
-    if (req.body.description !== undefined)
-      evt.description = req.body.description;
-    if (req.body.timeMode !== undefined) evt.timeMode = req.body.timeMode;
+    const { title, description, timeMode } = req.body ?? {};
+    if (timeMode !== undefined && timeMode !== 'from_start' && timeMode !== 'real') {
+      return reply.code(400).send({ error: 'Неизвестный режим времени' });
+    }
+    if (typeof title === 'string' && title.trim()) evt.title = title.trim();
+    if (typeof description === 'string') evt.description = description;
+    if (timeMode !== undefined) evt.timeMode = timeMode;
     await saveEventToDisk(evt);
     return { event: evt };
   });
@@ -238,7 +268,14 @@ async function startServer() {
         return reply.code(400).send({ error: 'Файл карты не передан' });
       }
 
+      // Only image extensions: anything else (e.g. .html) would be served back as active content
       const ext = path.extname(data.filename || '.png').toLowerCase() || '.png';
+      if (!MAP_IMAGE_EXTS.has(ext)) {
+        data.file.resume();
+        return reply
+          .code(400)
+          .send({ error: 'Карта должна быть изображением (PNG, JPG, WEBP, GIF)' });
+      }
       const fileId = `${evt.id}-map-${makeId(6)}${ext}`;
       const filePath = path.join(UPLOADS_DIR, fileId);
       const buffer = await data.toBuffer();
@@ -275,8 +312,11 @@ async function startServer() {
         rotationDeg: 0,
       };
 
+      const previousImageUrl = evt.map?.imageUrl;
       evt.map = mapOverlay;
       await saveEventToDisk(evt);
+      // The replaced scan is no longer referenced by anything
+      await removeUploadedMapFile(previousImageUrl);
       return { event: evt };
     }
   );
@@ -342,6 +382,7 @@ async function startServer() {
       evt.map.gcps = gcps;
       evt.map.rmsErrorM = undefined;
     }
+    if (gcps.length > 0) evt.map.manuallyPlaced = true;
 
     await saveEventToDisk(evt);
     return { event: evt };
@@ -372,6 +413,8 @@ async function startServer() {
       return reply.code(404).send({ error: 'Сначала загрузите карту' });
     }
 
+    const previousMap = structuredClone(evt.map);
+
     const defaultBounds = () =>
       computeTracksBoundingBox(evt.participants) ?? {
         minLon: 32.415,
@@ -393,6 +436,7 @@ async function startServer() {
       evt.map.gcps = [];
       evt.map.rmsErrorM = undefined;
       evt.map.rotationDeg = 0;
+      evt.map.manuallyPlaced = false;
       if (req.body.resetAutoFit) {
         await saveEventToDisk(evt);
         return { event: evt };
@@ -467,6 +511,13 @@ async function startServer() {
         ) / 10;
     }
 
+    // Bad input (NaN anchor, zero scale...) must never be persisted as a broken map placement
+    if (!isUsableMatrix(evt.map.matrix)) {
+      evt.map = previousMap;
+      return reply.code(400).send({ error: 'Некорректные параметры подгонки карты' });
+    }
+
+    evt.map.manuallyPlaced = true;
     await saveEventToDisk(evt);
     return { event: evt };
   });
@@ -521,11 +572,12 @@ async function startServer() {
         evt.participants.push(participant);
         syncAllParticipantsToCommonStartSpot(evt.participants);
 
+        // Auto-fit only a map the user has not placed by hand yet
         if (
           evt.map &&
           (!evt.map.matrix ||
-            evt.map.gcps.length === 0 ||
-            evt.map.gcps.every((g) => g.id.startsWith('gcp-auto-')))
+            (!evt.map.manuallyPlaced &&
+              evt.map.gcps.every((g) => g.id.startsWith('gcp-auto-'))))
         ) {
           const trackBounds = computeTracksBoundingBox(evt.participants);
           if (trackBounds) {
@@ -574,13 +626,26 @@ async function startServer() {
     );
     if (!p) return reply.code(404).send({ error: 'Участник не найден' });
 
-    if (req.body.name !== undefined) p.name = req.body.name;
-    if (req.body.color !== undefined) p.color = req.body.color;
-    if (req.body.visible !== undefined) p.visible = req.body.visible;
-    if (req.body.offsetSec !== undefined) p.offsetSec = req.body.offsetSec;
-    if (req.body.trimStartSec !== undefined)
-      p.trimStartSec = req.body.trimStartSec;
-    if (req.body.trimEndSec !== undefined) p.trimEndSec = req.body.trimEndSec;
+    const body = req.body ?? {};
+    const isNum = (v: unknown): v is number =>
+      typeof v === 'number' && Number.isFinite(v);
+    if (body.color !== undefined && !HEX_COLOR_RE.test(String(body.color))) {
+      return reply.code(400).send({ error: 'Цвет должен быть в формате #rrggbb' });
+    }
+    for (const key of ['offsetSec', 'trimStartSec', 'trimEndSec'] as const) {
+      if (body[key] !== undefined && !isNum(body[key])) {
+        return reply.code(400).send({ error: `Некорректное значение ${key}` });
+      }
+    }
+
+    if (typeof body.name === 'string' && body.name.trim()) p.name = body.name.trim();
+    if (body.color !== undefined) p.color = body.color;
+    if (typeof body.visible === 'boolean') p.visible = body.visible;
+    if (body.offsetSec !== undefined) p.offsetSec = body.offsetSec;
+    if (body.trimStartSec !== undefined)
+      p.trimStartSec = Math.max(0, Math.min(p.durationSec, body.trimStartSec));
+    if (body.trimEndSec !== undefined)
+      p.trimEndSec = Math.max(0, Math.min(p.durationSec, body.trimEndSec));
 
     await saveEventToDisk(evt);
     return { event: evt };
@@ -656,14 +721,7 @@ async function startServer() {
     async (req, reply) => {
       const evt = eventsStore.get(req.params.id);
       if (!evt) return reply.code(404).send({ error: 'Событие не найдено' });
-      if (evt.map?.imageUrl?.startsWith('/uploads/')) {
-        const fileName = path.basename(evt.map.imageUrl);
-        try {
-          await fs.unlink(path.join(UPLOADS_DIR, fileName));
-        } catch {
-          // ignore
-        }
-      }
+      await removeUploadedMapFile(evt.map?.imageUrl);
       evt.map = undefined;
       await saveEventToDisk(evt);
       return { event: evt };
@@ -679,14 +737,7 @@ async function startServer() {
       if (!evt) {
         return reply.code(404).send({ error: 'Событие не найдено' });
       }
-      if (evt.map?.imageUrl?.startsWith('/uploads/')) {
-        const fileName = path.basename(evt.map.imageUrl);
-        try {
-          await fs.unlink(path.join(UPLOADS_DIR, fileName));
-        } catch {
-          // ignore
-        }
-      }
+      await removeUploadedMapFile(evt.map?.imageUrl);
       eventsStore.delete(id);
       try {
         await fs.unlink(path.join(EVENTS_DIR, `${id}.json`));

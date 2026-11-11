@@ -38,6 +38,7 @@ import {
   formatDuration,
   formatPaceMinKm,
   interpolateTrackAt,
+  raceTimeOfTrackPoint,
   type SpeedNormMode,
 } from '../../shared/trackParser.js';
 import type {
@@ -121,6 +122,10 @@ export const ReplayWorkspace: React.FC<Props> = ({
   const legMarkersRef = useRef<maplibregl.Marker[]>([]);
   const rafRef = useRef<number | null>(null);
   const lastFrameMsRef = useRef<number | null>(null);
+  const customMapUrlRef = useRef<string | null>(null);
+  // Only the latest placement save may update the event (older responses would roll the map back)
+  const matrixSaveSeqRef = useRef<number>(0);
+  const matrixSaveChainRef = useRef<Promise<void>>(Promise.resolve());
 
   const eventRef = useRef(event);
   eventRef.current = event;
@@ -171,6 +176,11 @@ export const ReplayWorkspace: React.FC<Props> = ({
     setCustomStartSpot(null);
     setSelectedLeg(null);
     setSpeedNormMode('real');
+    setIsPlaying(false);
+    setRaceTimeSec(0);
+    setSnapStage('idle');
+    setPickedFeatureLonLat(null);
+    setUploadError(null);
   }, [event.id]);
 
   // Compute group mean speed (m/s) for Livelox speed normalization
@@ -206,30 +216,41 @@ export const ReplayWorkspace: React.FC<Props> = ({
     );
   }, [event.participants]);
 
-  // Compute total replay duration
+  // Total replay duration: the race-clock moment the last runner reaches their trimmed finish
+  // (depends on the speed mode, since normalization stretches/compresses each runner's timeline)
   const totalDurationSec = useMemo(() => {
-    if (event.participants.length === 0) return 600;
-    if (event.timeMode === 'from_start') {
-      return Math.max(
-        15,
-        ...event.participants.map(
-          (p) =>
-            Math.min(p.trimEndSec, p.durationSec) -
-            p.trimStartSec +
-            Math.max(0, p.offsetSec)
-        )
+    const withPoints = event.participants.filter((p) => p.points.length > 0);
+    if (withPoints.length === 0) return 600;
+    const finishTimes = withPoints.map((p) => {
+      const endT = Math.min(p.trimEndSec, p.durationSec);
+      const finishPt =
+        [...p.points].reverse().find((pt) => pt.t <= endT) ??
+        p.points[p.points.length - 1];
+      return raceTimeOfTrackPoint(
+        p,
+        finishPt,
+        event.timeMode,
+        eventEpochZeroMs,
+        speedNormMode,
+        groupReferenceSpeedMs
       );
-    } else {
-      const maxAbsMs = Math.max(
-        ...event.participants.map(
-          (p) =>
-            (p.points[p.points.length - 1]?.absTimeMs ?? eventEpochZeroMs) +
-            p.offsetSec * 1000
-        )
-      );
-      return Math.max(60, Math.ceil((maxAbsMs - eventEpochZeroMs) / 1000));
-    }
-  }, [event.participants, event.timeMode, eventEpochZeroMs]);
+    });
+    return Math.max(
+      event.timeMode === 'from_start' ? 15 : 60,
+      Math.ceil(Math.max(...finishTimes))
+    );
+  }, [
+    event.participants,
+    event.timeMode,
+    eventEpochZeroMs,
+    speedNormMode,
+    groupReferenceSpeedMs,
+  ]);
+
+  // Keep the playhead inside the timeline when it shrinks (speed mode, trims, deleted runner)
+  useEffect(() => {
+    setRaceTimeSec((t) => Math.min(t, totalDurationSec));
+  }, [totalDurationSec]);
 
   // Animation loop via requestAnimationFrame
   useEffect(() => {
@@ -326,6 +347,8 @@ export const ReplayWorkspace: React.FC<Props> = ({
 
     map.on('load', () => {
       mapReadyRef.current = true;
+      // The event may have been updated while the style was loading: use the latest one
+      const event = eventRef.current;
       // 1. Georeferenced custom map overlay
       if (event.map?.cornersLonLat) {
         map.addSource('custom-map', {
@@ -333,6 +356,7 @@ export const ReplayWorkspace: React.FC<Props> = ({
           url: event.map.imageUrl,
           coordinates: event.map.cornersLonLat,
         });
+        customMapUrlRef.current = event.map.imageUrl;
         map.addLayer({
           id: 'custom-map-layer',
           type: 'raster',
@@ -439,6 +463,7 @@ export const ReplayWorkspace: React.FC<Props> = ({
       legMarkersRef.current = [];
       map.remove();
       mapRef.current = null;
+      customMapUrlRef.current = null;
     };
   }, [event.id]);
 
@@ -473,6 +498,7 @@ export const ReplayWorkspace: React.FC<Props> = ({
       if (map.getSource('custom-map')) {
         map.removeSource('custom-map');
       }
+      customMapUrlRef.current = null;
       return;
     }
 
@@ -483,11 +509,16 @@ export const ReplayWorkspace: React.FC<Props> = ({
       | undefined;
 
     if (src) {
-      src.updateImage({
-        url: mapObj.imageUrl,
-        coordinates: corners,
-      });
+      // Re-downloading the (multi-MB) scan on every placement save makes it flicker:
+      // only reload when the image itself changed
+      if (customMapUrlRef.current === mapObj.imageUrl) {
+        src.setCoordinates(corners);
+      } else {
+        src.updateImage({ url: mapObj.imageUrl, coordinates: corners });
+      }
+      customMapUrlRef.current = mapObj.imageUrl;
     } else {
+      customMapUrlRef.current = mapObj.imageUrl;
       map.addSource('custom-map', {
         type: 'image',
         url: mapObj.imageUrl,
@@ -544,7 +575,8 @@ export const ReplayWorkspace: React.FC<Props> = ({
       marker.remove();
       anchorMarkerRef.current = null;
     };
-  }, [fitMapMode, effectiveAnchorLonLat?.[0], effectiveAnchorLonLat?.[1]]);
+    // event.id: the MapLibre instance is recreated per event, so the marker must be re-attached
+  }, [fitMapMode, effectiveAnchorLonLat?.[0], effectiveAnchorLonLat?.[1], event.id]);
 
   // Direct 60 FPS mouse dragging of the custom map overlay when `fitMapMode && dragMovesMap` is active
   useEffect(() => {
@@ -654,7 +686,8 @@ export const ReplayWorkspace: React.FC<Props> = ({
       window.removeEventListener('mouseup', onMouseUp);
       map.dragPan.enable();
     };
-  }, [fitMapMode, dragMovesMap, Boolean(event.map), snapStage]);
+    // event.id: listeners belong to the per-event MapLibre instance
+  }, [fitMapMode, dragMovesMap, Boolean(event.map), snapStage, event.id]);
 
   // Apply live 60 FPS transform around `effectiveAnchorLonLat` and update MapLibre ImageSource
   function applyLiveNudge(params: {
@@ -695,15 +728,28 @@ export const ReplayWorkspace: React.FC<Props> = ({
   async function saveMatrixToServer(
     matrix: [number, number, number, number, number, number]
   ) {
-    const res = await fetch(`/api/events/${eventRef.current.id}/map-nudge`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ matrix }),
+    const seq = ++matrixSaveSeqRef.current;
+    const eventId = eventRef.current.id;
+    // Saves run one after another so the server always ends up with the last placement
+    matrixSaveChainRef.current = matrixSaveChainRef.current.then(async () => {
+      try {
+        const res = await fetch(`/api/events/${eventId}/map-nudge`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ matrix }),
+        });
+        if (!res.ok) return;
+        const data = await res.json();
+        // Skip stale responses (a newer save is queued) and responses for an event we left
+        if (seq !== matrixSaveSeqRef.current || eventRef.current.id !== eventId) {
+          return;
+        }
+        onEventUpdated(data.event);
+      } catch {
+        // network error: the next save carries the full matrix anyway
+      }
     });
-    if (res.ok) {
-      const data = await res.json();
-      onEventUpdated(data.event);
-    }
+    await matrixSaveChainRef.current;
   }
 
   async function handleResetMapAutoFit() {
@@ -862,14 +908,19 @@ export const ReplayWorkspace: React.FC<Props> = ({
 
         let marker = runnerMarkersRef.current.get(p.id);
         if (!marker) {
+          // Built with DOM APIs, not innerHTML: name/color come from shared event data
           const el = document.createElement('div');
           el.className = 'flex items-center gap-1.5 pointer-events-none';
-          el.innerHTML = `
-            <div class="w-4 h-4 rounded-full border-2 border-white shadow-lg" style="background:${p.color}"></div>
-            <div class="px-1.5 py-0.5 rounded bg-slate-900/90 border border-slate-700 text-[11px] font-semibold text-white whitespace-nowrap shadow">
-              <span class="runner-label"></span>
-            </div>
-          `;
+          const dot = document.createElement('div');
+          dot.className =
+            'runner-dot w-4 h-4 rounded-full border-2 border-white shadow-lg';
+          const box = document.createElement('div');
+          box.className =
+            'px-1.5 py-0.5 rounded bg-slate-900/90 border border-slate-700 text-[11px] font-semibold text-white whitespace-nowrap shadow';
+          const label = document.createElement('span');
+          label.className = 'runner-label';
+          box.appendChild(label);
+          el.append(dot, box);
           marker = new maplibregl.Marker({ element: el, anchor: 'left' })
             .setLngLat([state.lon, state.lat])
             .addTo(map);
@@ -878,9 +929,12 @@ export const ReplayWorkspace: React.FC<Props> = ({
           marker.setLngLat([state.lon, state.lat]);
         }
 
-        const labelSpan = marker
-          .getElement()
-          .querySelector('.runner-label') as HTMLElement | null;
+        const markerEl = marker.getElement();
+        const dotEl = markerEl.querySelector('.runner-dot') as HTMLElement | null;
+        if (dotEl) dotEl.style.background = p.color;
+        const labelSpan = markerEl.querySelector(
+          '.runner-label'
+        ) as HTMLElement | null;
         if (labelSpan) {
           const paceStr = formatPaceMinKm(state.speedMs);
           labelSpan.textContent = `${p.name} • ${paceStr}`;
@@ -1014,7 +1068,12 @@ export const ReplayWorkspace: React.FC<Props> = ({
         prevStretchPctRef.current = 0;
         onEventUpdated(data.event);
         onToggleFitMap?.(true);
+      } else {
+        const data = await res.json().catch(() => ({}));
+        setUploadError(data.error || 'Не удалось загрузить карту');
       }
+    } catch {
+      setUploadError('Не удалось загрузить карту (нет связи с сервером)');
     } finally {
       setUploadingScreenshot(false);
       e.target.value = '';
@@ -1538,11 +1597,12 @@ export const ReplayWorkspace: React.FC<Props> = ({
             <div className="absolute bottom-4 left-3 z-10 px-3 py-1.5 rounded-lg bg-slate-900/90 border border-slate-800 text-[11px] flex items-center gap-2 shadow-lg">
               <span className="text-slate-400">Темп:</span>
               <span className="inline-block w-3 h-3 rounded-sm bg-rose-500" />
-              <span>&gt;6:30/км</span>
+              {/* Thresholds match speedToColorHex: 2.7 m/s ≈ 6:10/км, 3.6 m/s ≈ 4:38/км */}
+              <span>&gt;6:10/км</span>
               <span className="inline-block w-3 h-3 rounded-sm bg-amber-400 ml-1" />
-              <span>4:45/км</span>
+              <span>4:38–6:10/км</span>
               <span className="inline-block w-3 h-3 rounded-sm bg-emerald-400 ml-1" />
-              <span>&lt;3:45/км</span>
+              <span>&lt;4:38/км</span>
             </div>
           )}
 
@@ -1948,6 +2008,10 @@ export const ReplayWorkspace: React.FC<Props> = ({
               participants={event.participants}
               currentTimeSec={raceTimeSec}
               totalDurationSec={totalDurationSec}
+              timeMode={event.timeMode}
+              eventEpochZeroMs={eventEpochZeroMs}
+              speedNormMode={speedNormMode}
+              referenceSpeedMs={groupReferenceSpeedMs}
               onSeek={(sec) => setRaceTimeSec(sec)}
             />
           </div>
@@ -2138,21 +2202,8 @@ function buildActiveTailsGeoJson(
     );
     if (!headState || headState.notStarted) continue;
 
-    let headLocalT: number;
-    if (timeMode === 'from_start') {
-      const overallSpeedMs =
-        p.durationSec > 0 ? p.totalDistanceM / p.durationSec : referenceSpeedMs;
-      const rateFactor =
-        speedNormMode === 'livelox_handicap' && referenceSpeedMs > 0.3
-          ? overallSpeedMs / referenceSpeedMs
-          : 1;
-      headLocalT =
-        (raceTimeSec - p.offsetSec) * rateFactor + p.trimStartSec;
-    } else {
-      const targetAbsMs =
-        eventEpochZeroMs + (raceTimeSec - p.offsetSec) * 1000;
-      headLocalT = (targetAbsMs - p.points[0].absTimeMs) / 1000;
-    }
+    // Track-local time of the head, consistent with every speed mode (incl. equal speed)
+    const headLocalT = headState.localT;
 
     const tailStartT = Math.max(p.trimStartSec, headLocalT - tailLengthSec);
     const tailEndT = Math.min(p.trimEndSec, p.durationSec, headLocalT);
@@ -2204,8 +2255,21 @@ const SpeedComparisonChart: React.FC<{
   participants: ParticipantTrack[];
   currentTimeSec: number;
   totalDurationSec: number;
+  timeMode: TimeMode;
+  eventEpochZeroMs: number;
+  speedNormMode: SpeedNormMode;
+  referenceSpeedMs: number;
   onSeek: (sec: number) => void;
-}> = ({ participants, currentTimeSec, totalDurationSec, onSeek }) => {
+}> = ({
+  participants,
+  currentTimeSec,
+  totalDurationSec,
+  timeMode,
+  eventEpochZeroMs,
+  speedNormMode,
+  referenceSpeedMs,
+  onSeek,
+}) => {
   const width = 320;
   const height = 84;
   const maxKmh = 22;
@@ -2244,7 +2308,16 @@ const SpeedComparisonChart: React.FC<{
           const pts: string[] = [];
           for (let i = 0; i < p.points.length; i += step) {
             const pt = p.points[i];
-            const activeT = pt.t - p.trimStartSec + p.offsetSec;
+            if (pt.t < p.trimStartSec || pt.t > p.trimEndSec) continue;
+            // Same race clock as the map replay, in every time/speed mode
+            const activeT = raceTimeOfTrackPoint(
+              p,
+              pt,
+              timeMode,
+              eventEpochZeroMs,
+              speedNormMode,
+              referenceSpeedMs
+            );
             if (activeT < 0 || activeT > totalDurationSec) continue;
             const x = (activeT / totalDurationSec) * width;
             const kmh = Math.min(maxKmh, pt.speedMs * 3.6);

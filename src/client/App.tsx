@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import {
   Check,
   Compass,
@@ -29,9 +29,20 @@ export const App: React.FC = () => {
   const [copiedSlug, setCopiedSlug] = useState(false);
   const [creatingEvent, setCreatingEvent] = useState(false);
 
+  // StrictMode runs effects twice in dev: without the guard two "Тренировка" events get created
+  const initStartedRef = useRef(false);
   useEffect(() => {
+    if (initStartedRef.current) return;
+    initStartedRef.current = true;
     void initApp();
   }, []);
+
+  function setEventInUrl(slug: string | null) {
+    const url = new URL(window.location.href);
+    if (slug) url.searchParams.set('event', slug);
+    else url.searchParams.delete('event');
+    window.history.replaceState({}, '', url.toString());
+  }
 
   async function initApp() {
     const params = new URLSearchParams(window.location.search);
@@ -79,9 +90,7 @@ export const App: React.FC = () => {
     if (res.ok) {
       const data = await res.json();
       setCurrentEvent(data.event);
-      const url = new URL(window.location.href);
-      url.searchParams.set('event', data.event.slug);
-      window.history.replaceState({}, '', url.toString());
+      setEventInUrl(data.event.slug);
     }
   }
 
@@ -102,6 +111,7 @@ export const App: React.FC = () => {
         const data = await res.json();
         const evt: RaceEvent = data.event;
         setCurrentEvent(evt);
+        setEventInUrl(evt.slug);
         await refreshEventsList();
       }
     } finally {
@@ -146,9 +156,8 @@ export const App: React.FC = () => {
       method: 'DELETE',
     });
     if (res.ok) {
-      const url = new URL(window.location.href);
-      url.searchParams.delete('event');
-      window.history.replaceState({}, '', url.toString());
+      setEventInUrl(null);
+      setFitMapMode(false);
 
       const listRes = await fetch('/api/events');
       const listData = await listRes.json();

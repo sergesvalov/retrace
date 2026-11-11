@@ -30,6 +30,8 @@ export interface MapOverlay {
   ];
   rmsErrorM?: number;
   rotationDeg?: number;
+  /** True once the user has placed the map by hand (drag, sliders, pins, GCPs); auto-fit must not overwrite it */
+  manuallyPlaced?: boolean;
 }
 
 export interface TrackPoint {
