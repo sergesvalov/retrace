@@ -109,7 +109,15 @@ export const ReplayWorkspace: React.FC<Props> = ({
 }) => {
   const [isPlaying, setIsPlaying] = useState<boolean>(false);
   const [playbackRate, setPlaybackRate] = useState<number>(10);
+  // `raceTimeSec` drives the panels and is refreshed a few times a second while playing;
+  // the exact clock lives in `raceTimeRef` and moves the map every animation frame
   const [raceTimeSec, setRaceTimeSec] = useState<number>(0);
+  const raceTimeRef = useRef<number>(0);
+  /** Jump the clock (seek, reset, leg start): exact clock and panels together */
+  const seekTo = (t: number) => {
+    raceTimeRef.current = t;
+    setRaceTimeSec(t);
+  };
   const [tailLengthSec, setTailLengthSec] = useState<number>(120);
   const [mapOpacity, setMapOpacity] = useState<number>(0.78);
   const [osmOpacity, setOsmOpacity] = useState<number>(0.85);
@@ -322,7 +330,7 @@ export const ReplayWorkspace: React.FC<Props> = ({
     setSelectedLeg(null);
     setSpeedNormMode('real');
     setIsPlaying(false);
-    setRaceTimeSec(0);
+    seekTo(0);
     setSnapStage('idle');
     setPickedFeatureLonLat(null);
     setUploadError(null);
@@ -489,7 +497,7 @@ export const ReplayWorkspace: React.FC<Props> = ({
     if (res.ok) {
       const data = await res.json();
       applyServerEvent(data.event);
-      setRaceTimeSec(0);
+      seekTo(0);
       setIsPlaying(false);
     }
   }
@@ -588,7 +596,7 @@ export const ReplayWorkspace: React.FC<Props> = ({
 
   // Keep the playhead inside the timeline when it shrinks (speed mode, trims, deleted runner)
   useEffect(() => {
-    setRaceTimeSec((t) => Math.min(t, totalDurationSec));
+    seekTo(Math.min(raceTimeRef.current, totalDurationSec));
   }, [totalDurationSec]);
 
   // Animation loop via requestAnimationFrame
@@ -599,17 +607,23 @@ export const ReplayWorkspace: React.FC<Props> = ({
       return;
     }
 
+    let lastUiMs = 0;
     const tick = (nowMs: number) => {
       if (lastFrameMsRef.current !== null) {
         const dtSec = ((nowMs - lastFrameMsRef.current) / 1000) * playbackRate;
-        setRaceTimeSec((prev) => {
-          const next = prev + dtSec;
-          if (next >= totalDurationSec) {
-            setIsPlaying(false);
-            return totalDurationSec;
-          }
-          return next;
-        });
+        const next = Math.min(totalDurationSec, raceTimeRef.current + dtSec);
+        raceTimeRef.current = next;
+        drawFrameRef.current(next);
+        if (next >= totalDurationSec) {
+          setRaceTimeSec(next);
+          setIsPlaying(false);
+          return;
+        }
+        // Panels (clock, slider, leaderboard, chart) don't need 60 fps
+        if (nowMs - lastUiMs > 200) {
+          lastUiMs = nowMs;
+          setRaceTimeSec(next);
+        }
       }
       lastFrameMsRef.current = nowMs;
       rafRef.current = requestAnimationFrame(tick);
@@ -1559,12 +1573,32 @@ export const ReplayWorkspace: React.FC<Props> = ({
     groupReferenceSpeedMs,
   ]);
 
-  // Sync active tails GeoJSON and HTML runner markers on every frame
-  useEffect(() => {
+  // Runner markers + tails for clock time `t`. Called by the animation loop every frame
+  // (through a ref, so it always sees the latest data) and when inputs change while paused.
+  const drawFrameRef = useRef<(t: number) => void>(() => {});
+  drawFrameRef.current = (t: number) => {
     const map = mapRef.current;
-    if (!map) return;
+    if (!map || !mapReadyRef.current) return;
+    const states = displayParticipants.map((p) => ({
+      participant: p,
+      state: interpolateTrackAt(
+        p,
+        t,
+        event.timeMode,
+        eventEpochZeroMs,
+        speedNormMode,
+        groupReferenceSpeedMs
+      ),
+    }));
+    drawDynamicElements(map, t, states);
+  };
 
-    const updateDynamicElements = () => {
+  function drawDynamicElements(
+    map: maplibregl.Map,
+    raceTimeSec: number,
+    runnerStates: { participant: ParticipantTrack; state: ReturnType<typeof interpolateTrackAt> }[]
+  ) {
+    {
       const tailSrc = map.getSource('active-tails') as
         | maplibregl.GeoJSONSource
         | undefined;
@@ -1629,15 +1663,13 @@ export const ReplayWorkspace: React.FC<Props> = ({
           runnerMarkersRef.current.delete(id);
         }
       }
-    };
-
-    if (mapReadyRef.current) {
-      updateDynamicElements();
-    } else {
-      map.once('load', updateDynamicElements);
     }
+  }
+
+  // Redraw when something other than the running clock changes (or after a seek / map load)
+  useEffect(() => {
+    drawFrameRef.current(raceTimeRef.current);
   }, [
-    runnerStates,
     raceTimeSec,
     tailLengthSec,
     speedHeatmap,
@@ -1646,6 +1678,7 @@ export const ReplayWorkspace: React.FC<Props> = ({
     displayParticipants,
     event.timeMode,
     eventEpochZeroMs,
+    mapLoadCount,
   ]);
 
   // Sort participants by distance covered at current timestamp for live leaderboard
@@ -1848,7 +1881,7 @@ export const ReplayWorkspace: React.FC<Props> = ({
     if (res.ok) {
       const data = await res.json();
       applyServerEvent(data.event);
-      setRaceTimeSec(0);
+      seekTo(0);
     }
   }
 
@@ -1961,7 +1994,7 @@ export const ReplayWorkspace: React.FC<Props> = ({
     if (res.ok) {
       const data = await res.json();
       applyServerEvent(data.event);
-      setRaceTimeSec(0);
+      seekTo(0);
     }
   }
 
@@ -2831,7 +2864,7 @@ export const ReplayWorkspace: React.FC<Props> = ({
               eventEpochZeroMs={eventEpochZeroMs}
               speedNormMode={speedNormMode}
               referenceSpeedMs={groupReferenceSpeedMs}
-              onSeek={(sec) => setRaceTimeSec(sec)}
+              onSeek={(sec) => seekTo(sec)}
             />
           </div>
           )}
@@ -2858,7 +2891,7 @@ export const ReplayWorkspace: React.FC<Props> = ({
           <button
             onClick={() => {
               setIsPlaying(false);
-              setRaceTimeSec(0);
+              seekTo(0);
             }}
             className="p-2 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-300 transition"
             title="В начало (00:00)"
@@ -2884,7 +2917,7 @@ export const ReplayWorkspace: React.FC<Props> = ({
             max={totalDurationSec}
             step={0.5}
             value={raceTimeSec}
-            onChange={(e) => setRaceTimeSec(parseFloat(e.target.value))}
+            onChange={(e) => seekTo(parseFloat(e.target.value))}
             className="w-full h-2 bg-slate-800 rounded-lg appearance-none cursor-pointer accent-emerald-500"
           />
         </div>
@@ -2999,6 +3032,18 @@ function speedToColorHex(speedMs: number): string {
   return '#10b981';
 }
 
+/** Index of the first point with t ≥ `t` (points sorted by t) */
+function firstIndexAtOrAfter(points: { t: number }[], t: number): number {
+  let lo = 0;
+  let hi = points.length;
+  while (lo < hi) {
+    const mid = (lo + hi) >> 1;
+    if (points[mid].t < t) lo = mid + 1;
+    else hi = mid;
+  }
+  return lo;
+}
+
 function buildActiveTailsGeoJson(
   participants: ParticipantTrack[],
   raceTimeSec: number,
@@ -3029,8 +3074,11 @@ function buildActiveTailsGeoJson(
 
     const tailStartT = Math.max(p.trimStartSec, headLocalT - tailLengthSec);
     const tailEndT = Math.min(p.trimEndSec, p.durationSec, headLocalT);
-    const windowPts = p.points.filter(
-      (pt) => pt.t >= tailStartT && pt.t <= tailEndT
+    // Points are sorted by t: binary-search the window instead of scanning the whole track
+    // every frame
+    const windowPts = p.points.slice(
+      firstIndexAtOrAfter(p.points, tailStartT),
+      firstIndexAtOrAfter(p.points, tailEndT + 1e-9)
     );
 
     const coords: Array<[number, number, number]> = windowPts.map((pt) => [
@@ -3101,29 +3149,10 @@ const SpeedComparisonChart: React.FC<{
       ? Math.min(width, Math.max(0, (currentTimeSec / totalDurationSec) * width))
       : 0;
 
-  return (
-    <svg
-      viewBox={`0 0 ${width} ${height}`}
-      className="w-full flex-1 bg-slate-900/60 rounded-lg border border-slate-800/80 cursor-pointer overflow-visible"
-      onClick={(e) => {
-        const rect = e.currentTarget.getBoundingClientRect();
-        const rel = Math.max(
-          0,
-          Math.min(1, (e.clientX - rect.left) / rect.width)
-        );
-        onSeek(rel * totalDurationSec);
-      }}
-    >
-      <line
-        x1={0}
-        y1={height / 2}
-        x2={width}
-        y2={height / 2}
-        stroke="#1e293b"
-        strokeDasharray="3 3"
-      />
-
-      {participants
+  // The lines depend on the tracks and modes, not on the clock: only the cursor moves
+  const lines = useMemo(
+    () =>
+      participants
         .filter((p) => p.visible && p.points.length >= 2)
         .map((p) => {
           const step = Math.max(1, Math.floor(p.points.length / 80));
@@ -3146,17 +3175,43 @@ const SpeedComparisonChart: React.FC<{
             const y = height - (kmh / maxKmh) * (height - 8) - 4;
             pts.push(`${x.toFixed(1)},${y.toFixed(1)}`);
           }
-          return (
-            <polyline
-              key={p.id}
-              fill="none"
-              stroke={p.color}
-              strokeWidth={1.6}
-              strokeOpacity={0.85}
-              points={pts.join(' ')}
-            />
-          );
-        })}
+          return { id: p.id, color: p.color, points: pts.join(' ') };
+        }),
+    [participants, totalDurationSec, timeMode, eventEpochZeroMs, speedNormMode, referenceSpeedMs]
+  );
+
+  return (
+    <svg
+      viewBox={`0 0 ${width} ${height}`}
+      className="w-full flex-1 bg-slate-900/60 rounded-lg border border-slate-800/80 cursor-pointer overflow-visible"
+      onClick={(e) => {
+        const rect = e.currentTarget.getBoundingClientRect();
+        const rel = Math.max(
+          0,
+          Math.min(1, (e.clientX - rect.left) / rect.width)
+        );
+        onSeek(rel * totalDurationSec);
+      }}
+    >
+      <line
+        x1={0}
+        y1={height / 2}
+        x2={width}
+        y2={height / 2}
+        stroke="#1e293b"
+        strokeDasharray="3 3"
+      />
+
+      {lines.map((l) => (
+        <polyline
+          key={l.id}
+          fill="none"
+          stroke={l.color}
+          strokeWidth={1.6}
+          strokeOpacity={0.85}
+          points={l.points}
+        />
+      ))}
 
       <line
         x1={cursorX}
