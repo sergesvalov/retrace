@@ -29,8 +29,13 @@ import {
   Zap,
 } from 'lucide-react';
 import {
+  buildScaledOrientedMatrix,
+  groundMetersPerPixelFromPrint,
+  groundMetersPerPixelFromScaleBar,
   lonLatToMercator,
+  matrixGroundMetersPerPixel,
   matrixToCorners,
+  matrixUpBearingDeg,
   nudgeMapMatrix,
 } from '../../shared/georef.js';
 import {
@@ -41,11 +46,34 @@ import {
   raceTimeOfTrackPoint,
   type SpeedNormMode,
 } from '../../shared/trackParser.js';
-import type {
-  ParticipantTrack,
-  RaceEvent,
-  TimeMode,
+import {
+  eventKindOf,
+  type BaseLayer,
+  type EventKind,
+  type MapImageKind,
+  type MapOverlayMeta,
+  type ParticipantTrack,
+  type RaceEvent,
+  type TimeMode,
 } from '../../shared/types.js';
+import { magneticDeclinationDeg } from '../../shared/declination.js';
+
+const BASE_LAYERS: readonly BaseLayer[] = ['topo', 'osm', 'satellite'];
+const BASE_LAYER_LABELS: Record<BaseLayer, string> = {
+  topo: 'Топо',
+  osm: 'OSM',
+  satellite: 'Спутник',
+};
+/** Runs/hikes live on the base map, so default to the one with contours and trails */
+function defaultBaseLayerFor(kind: EventKind): BaseLayer {
+  return kind === 'run' ? 'topo' : 'osm';
+}
+const PRINT_SCALES = [4000, 5000, 7500, 10000, 15000];
+
+function formatSignedDeg(deg: number): string {
+  const r = Math.round(deg * 10) / 10;
+  return `${r > 0 ? '+' : ''}${r}°`;
+}
 
 interface Props {
   event: RaceEvent;
@@ -74,7 +102,13 @@ export const ReplayWorkspace: React.FC<Props> = ({
   const [tailLengthSec, setTailLengthSec] = useState<number>(120);
   const [mapOpacity, setMapOpacity] = useState<number>(0.78);
   const [osmOpacity, setOsmOpacity] = useState<number>(0.85);
-  const [useSatelliteBase, setUseSatelliteBase] = useState<boolean>(false);
+  const kind = eventKindOf(event);
+  const isOrienteering = kind === 'orienteering';
+  const [baseLayer, setBaseLayer] = useState<BaseLayer>(
+    defaultBaseLayerFor(kind)
+  );
+  const baseLayerRef = useRef(baseLayer);
+  baseLayerRef.current = baseLayer;
   const [speedHeatmap, setSpeedHeatmap] = useState<boolean>(false);
   const [speedNormMode, setSpeedNormMode] = useState<SpeedNormMode>('real');
   const [uploadingTrack, setUploadingTrack] = useState<boolean>(false);
@@ -100,7 +134,12 @@ export const ReplayWorkspace: React.FC<Props> = ({
 
   // Map click interaction stages for Spot Start & Leg Route-Choice Analysis
   const [snapStage, setSnapStage] = useState<
-    'idle' | 'spot_start' | 'leg_start' | 'leg_end'
+    | 'idle'
+    | 'spot_start'
+    | 'leg_start'
+    | 'leg_end'
+    | 'scalebar_start'
+    | 'scalebar_end'
   >('idle');
   const [pickedFeatureLonLat, setPickedFeatureLonLat] = useState<
     [number, number] | null
@@ -159,6 +198,63 @@ export const ReplayWorkspace: React.FC<Props> = ({
   const effectiveAnchorLonLat = anchorLonLat ?? commonStartLonLat;
   anchorLonLatRef.current = effectiveAnchorLonLat;
 
+  // ---- Scale & north of the map image (print scale / DPI / magnetic declination) ----
+  const [mapImageKind, setMapImageKind] = useState<MapImageKind>(
+    event.map?.imageKind ?? 'orienteering'
+  );
+  const [printScale, setPrintScale] = useState<number>(
+    event.map?.printScale ?? 10000
+  );
+  const [scanDpi, setScanDpi] = useState<number>(event.map?.scanDpi ?? 300);
+
+  // WMM declination at the start, for the day of the run (the field drifts ~0.1°/year)
+  const autoDeclinationDeg = useMemo(() => {
+    const at = commonStartLonLat;
+    if (!at) return 0;
+    const firstStart = event.participants[0]?.startedAtIso;
+    return magneticDeclinationDeg(
+      at[0],
+      at[1],
+      firstStart ? new Date(firstStart) : new Date()
+    );
+  }, [commonStartLonLat?.[0], commonStartLonLat?.[1], event.participants[0]?.startedAtIso]);
+
+  const [declinationDeg, setDeclinationDeg] = useState<number>(
+    event.map?.declinationDeg ?? autoDeclinationDeg
+  );
+
+  // Reload the stored settings when another map image (or event) is shown
+  useEffect(() => {
+    setMapImageKind(event.map?.imageKind ?? 'orienteering');
+    setPrintScale(event.map?.printScale ?? 10000);
+    setScanDpi(event.map?.scanDpi ?? 300);
+    setDeclinationDeg(event.map?.declinationDeg ?? autoDeclinationDeg);
+  }, [event.id, event.map?.id]);
+
+  // Until the user stores a declination, follow the auto value (tracks may arrive after the map)
+  useEffect(() => {
+    if (event.map?.declinationDeg === undefined) {
+      setDeclinationDeg(autoDeclinationDeg);
+    }
+  }, [autoDeclinationDeg]);
+
+  // Live readout of the current placement: ground m/px, implied print scale, map north bearing
+  const placementReadout = useMemo(() => {
+    const m = event.map?.matrix;
+    const at = effectiveAnchorLonLat;
+    if (!m || !at) return null;
+    const metersPerPixel = matrixGroundMetersPerPixel(m, at[1]);
+    const impliedScale =
+      mapImageKind === 'orienteering' && scanDpi > 0
+        ? Math.round((metersPerPixel * scanDpi) / 0.0254 / 100) * 100
+        : null;
+    return {
+      metersPerPixel,
+      impliedScale,
+      upBearingDeg: Math.round(matrixUpBearingDeg(m) * 10) / 10,
+    };
+  }, [event.map?.matrix, effectiveAnchorLonLat?.[0], effectiveAnchorLonLat?.[1], mapImageKind, scanDpi]);
+
   // Sync liveMatrixRef whenever event.map.matrix changes from server
   useEffect(() => {
     liveMatrixRef.current = event.map?.matrix ?? null;
@@ -182,6 +278,15 @@ export const ReplayWorkspace: React.FC<Props> = ({
     setPickedFeatureLonLat(null);
     setUploadError(null);
   }, [event.id]);
+
+  // Each event kind starts on its own default base map (also when the kind is switched)
+  useEffect(() => {
+    setBaseLayer(defaultBaseLayerFor(kind));
+    if (kind === 'run') {
+      setSpeedNormMode('real');
+      onToggleFitMap?.(false);
+    }
+  }, [event.id, kind]);
 
   // Compute group mean speed (m/s) for Livelox speed normalization
   const groupReferenceSpeedMs = useMemo(() => {
@@ -307,7 +412,21 @@ export const ReplayWorkspace: React.FC<Props> = ({
             type: 'raster',
             tiles: ['https://tile.openstreetmap.org/{z}/{x}/{y}.png'],
             tileSize: 256,
+            maxzoom: 19,
             attribution: '© OpenStreetMap contributors',
+          },
+          topo: {
+            type: 'raster',
+            tiles: [
+              'https://a.tile.opentopomap.org/{z}/{x}/{y}.png',
+              'https://b.tile.opentopomap.org/{z}/{x}/{y}.png',
+              'https://c.tile.opentopomap.org/{z}/{x}/{y}.png',
+            ],
+            tileSize: 256,
+            // OpenTopoMap has no tiles past z17: MapLibre over-zooms z17 instead of showing blanks
+            maxzoom: 17,
+            attribution:
+              '© OpenStreetMap contributors, SRTM | © OpenTopoMap (CC-BY-SA)',
           },
           satellite: {
             type: 'raster',
@@ -315,27 +434,23 @@ export const ReplayWorkspace: React.FC<Props> = ({
               'https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}',
             ],
             tileSize: 256,
+            maxzoom: 19,
             attribution: '© Esri World Imagery',
           },
         },
-        layers: [
-          {
-            id: 'osm-base',
-            type: 'raster',
-            source: 'osm',
-            paint: {
-              'raster-opacity': osmOpacity,
-            },
+        // Hidden base layers use `visibility: none` so their tiles are not downloaded at all
+        layers: BASE_LAYERS.map((layer) => ({
+          id: `${layer}-base`,
+          type: 'raster' as const,
+          source: layer,
+          layout: {
+            visibility:
+              layer === baseLayerRef.current
+                ? ('visible' as const)
+                : ('none' as const),
           },
-          {
-            id: 'satellite-base',
-            type: 'raster',
-            source: 'satellite',
-            paint: {
-              'raster-opacity': 0,
-            },
-          },
-        ],
+          paint: { 'raster-opacity': osmOpacity },
+        })),
       },
       center: initialCenter,
       zoom: 14.3,
@@ -349,6 +464,14 @@ export const ReplayWorkspace: React.FC<Props> = ({
       mapReadyRef.current = true;
       // The event may have been updated while the style was loading: use the latest one
       const event = eventRef.current;
+      // The base layer may have been switched (e.g. per event kind) while loading
+      for (const layer of BASE_LAYERS) {
+        map.setLayoutProperty(
+          `${layer}-base`,
+          'visibility',
+          layer === baseLayerRef.current ? 'visible' : 'none'
+        );
+      }
       // 1. Georeferenced custom map overlay
       if (event.map?.cornersLonLat) {
         map.addSource('custom-map', {
@@ -362,7 +485,8 @@ export const ReplayWorkspace: React.FC<Props> = ({
           type: 'raster',
           source: 'custom-map',
           paint: {
-            'raster-opacity': mapOpacity,
+            'raster-opacity':
+              eventKindOf(event) === 'orienteering' ? mapOpacity : 0,
             'raster-fade-duration': 0,
           },
         });
@@ -467,24 +591,29 @@ export const ReplayWorkspace: React.FC<Props> = ({
     };
   }, [event.id]);
 
-  // Update raster opacities when sliders change
+  // Update base layer choice and raster opacities when the controls change
   useEffect(() => {
     const map = mapRef.current;
     if (!map || !mapReadyRef.current) return;
-    if (map.getLayer('osm-base')) {
-      map.setPaintProperty('osm-base', 'raster-opacity', osmOpacity);
-    }
-    if (map.getLayer('satellite-base')) {
-      map.setPaintProperty(
-        'satellite-base',
-        'raster-opacity',
-        useSatelliteBase ? osmOpacity : 0
+    for (const layer of BASE_LAYERS) {
+      const id = `${layer}-base`;
+      if (!map.getLayer(id)) continue;
+      map.setLayoutProperty(
+        id,
+        'visibility',
+        layer === baseLayer ? 'visible' : 'none'
       );
+      map.setPaintProperty(id, 'raster-opacity', osmOpacity);
     }
     if (map.getLayer('custom-map-layer')) {
-      map.setPaintProperty('custom-map-layer', 'raster-opacity', mapOpacity);
+      map.setPaintProperty(
+        'custom-map-layer',
+        'raster-opacity',
+        // A run/hike keeps any old map hidden: the base map is the map there
+        isOrienteering ? mapOpacity : 0
+      );
     }
-  }, [osmOpacity, mapOpacity, useSatelliteBase]);
+  }, [osmOpacity, mapOpacity, baseLayer, isOrienteering]);
 
   // Update or remove custom map when `event.map` changes
   useEffect(() => {
@@ -530,7 +659,7 @@ export const ReplayWorkspace: React.FC<Props> = ({
           type: 'raster',
           source: 'custom-map',
           paint: {
-            'raster-opacity': mapOpacity,
+            'raster-opacity': isOrienteering ? mapOpacity : 0,
             'raster-fade-duration': 0,
           },
         },
@@ -726,7 +855,8 @@ export const ReplayWorkspace: React.FC<Props> = ({
   }
 
   async function saveMatrixToServer(
-    matrix: [number, number, number, number, number, number]
+    matrix: [number, number, number, number, number, number],
+    meta?: MapOverlayMeta
   ) {
     const seq = ++matrixSaveSeqRef.current;
     const eventId = eventRef.current.id;
@@ -736,9 +866,13 @@ export const ReplayWorkspace: React.FC<Props> = ({
         const res = await fetch(`/api/events/${eventId}/map-nudge`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ matrix }),
+          body: JSON.stringify({ matrix, meta }),
         });
-        if (!res.ok) return;
+        if (!res.ok) {
+          const data = await res.json().catch(() => ({}));
+          setUploadError(data.error || 'Не удалось сохранить положение карты');
+          return;
+        }
         const data = await res.json();
         // Skip stale responses (a newer save is queued) and responses for an event we left
         if (seq !== matrixSaveSeqRef.current || eventRef.current.id !== eventId) {
@@ -750,6 +884,74 @@ export const ReplayWorkspace: React.FC<Props> = ({
       }
     });
     await matrixSaveChainRef.current;
+  }
+
+  /** Relative sliders restart from zero after an absolute placement change */
+  function resetRelativeSliders() {
+    setScalePct(100);
+    setAngleDeg(0);
+    setStretchPct(0);
+    prevScalePctRef.current = 100;
+    prevAngleDegRef.current = 0;
+    prevStretchPctRef.current = 0;
+  }
+
+  /**
+   * Put the map at an exact ground scale and orientation around ⚓ СТАРТ:
+   * - O-map: scale from print scale + DPI (or `groundMPerPx` from a scale bar), up = magnetic north
+   * - Google screenshot: keep scale (or scale-bar value), up = true north
+   */
+  function applyScaleAndNorth(groundMPerPx: number | null) {
+    const map = mapRef.current;
+    const mapMeta = eventRef.current.map;
+    const current = liveMatrixRef.current;
+    const anchor = anchorLonLatRef.current;
+    if (!map || !mapMeta || !current || !anchor) return;
+
+    const isOMap = mapImageKind === 'orienteering';
+    if (isOMap && !(printScale >= 500 && scanDpi >= 30) && groundMPerPx === null) {
+      setUploadError('Укажите масштаб карты и DPI скана');
+      return;
+    }
+    const metersPerPixel =
+      groundMPerPx ??
+      (isOMap
+        ? groundMetersPerPixelFromPrint(printScale, scanDpi)
+        : matrixGroundMetersPerPixel(current, anchor[1]));
+    const upBearingDeg = isOMap ? declinationDeg : 0;
+    const next = buildScaledOrientedMatrix(
+      current,
+      anchor,
+      metersPerPixel,
+      upBearingDeg
+    );
+    if (!next) return;
+
+    liveMatrixRef.current = next;
+    const src = map.getSource('custom-map') as maplibregl.ImageSource | undefined;
+    src?.setCoordinates(matrixToCorners(next, mapMeta.width, mapMeta.height));
+    resetRelativeSliders();
+    setUploadError(null);
+    void saveMatrixToServer(next, {
+      imageKind: mapImageKind,
+      declinationDeg: isOMap ? declinationDeg : 0,
+      ...(isOMap && groundMPerPx === null ? { printScale, scanDpi } : {}),
+    });
+  }
+
+  /** Scale bar measured: ask its length and apply the resulting exact scale */
+  function finishScaleBar(p1: [number, number], p2: [number, number]) {
+    const current = liveMatrixRef.current;
+    if (!current) return;
+    const input = window.prompt('Длина масштабной линейки, метров:', '100');
+    if (!input) return;
+    const lengthM = Number(input.replace(',', '.'));
+    const mpp = groundMetersPerPixelFromScaleBar(current, p1, p2, lengthM);
+    if (!mpp) {
+      setUploadError('Не удалось измерить линейку: кликните два разных конца');
+      return;
+    }
+    applyScaleAndNorth(mpp);
   }
 
   async function handleResetMapAutoFit() {
@@ -1135,6 +1337,20 @@ export const ReplayWorkspace: React.FC<Props> = ({
         Number(e.lngLat.lat.toFixed(6)),
       ];
 
+      if (snapStage === 'scalebar_start') {
+        setPickedFeatureLonLat(clicked);
+        setSnapStage('scalebar_end');
+        return;
+      }
+      if (snapStage === 'scalebar_end' && pickedFeatureLonLat) {
+        const startPt = pickedFeatureLonLat;
+        setSnapStage('idle');
+        setPickedFeatureLonLat(null);
+        // Unrounded click position: 6 decimals (~10 cm) would be fine, but keep it exact
+        finishScaleBar(startPt, [e.lngLat.lng, e.lngLat.lat]);
+        return;
+      }
+
       if (snapStage === 'spot_start') {
         setSnapStage('idle');
         setSelectedLeg(null);
@@ -1162,7 +1378,16 @@ export const ReplayWorkspace: React.FC<Props> = ({
     return () => {
       map.off('click', onMapClick);
     };
-  }, [snapStage, pickedFeatureLonLat, event.id]);
+    // Scale-bar completion reads the current scale/north settings: re-bind when they change
+  }, [
+    snapStage,
+    pickedFeatureLonLat,
+    event.id,
+    mapImageKind,
+    printScale,
+    scanDpi,
+    declinationDeg,
+  ]);
 
   async function syncStartAtSpot(
     spot?: [number, number],
@@ -1229,22 +1454,27 @@ export const ReplayWorkspace: React.FC<Props> = ({
           {/* Docked Top Map Toolbar */}
           <div className="relative z-10 px-3 py-2 bg-slate-900 border-b border-slate-800 flex flex-wrap items-center justify-between gap-2 text-xs shrink-0">
             <div className="flex flex-wrap items-center gap-2">
-              <label className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white font-medium cursor-pointer transition">
-                <ImagePlus className="w-3.5 h-3.5" />
-                {uploadingScreenshot
-                  ? 'Загрузка...'
-                  : event.map
-                    ? 'Заменить карту'
-                    : 'Загрузить карту'}
-                <input
-                  type="file"
-                  accept="image/*"
-                  className="hidden"
-                  onChange={handleQuickScreenshotUpload}
-                />
-              </label>
+              {isOrienteering && (
+                <label
+                  className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white font-medium cursor-pointer transition"
+                  title="Скан карты ориентирования или скриншот Google Maps"
+                >
+                  <ImagePlus className="w-3.5 h-3.5" />
+                  {uploadingScreenshot
+                    ? 'Загрузка...'
+                    : event.map
+                      ? 'Заменить карту'
+                      : 'Загрузить карту'}
+                  <input
+                    type="file"
+                    accept="image/png,image/jpeg,image/webp,image/gif"
+                    className="hidden"
+                    onChange={handleQuickScreenshotUpload}
+                  />
+                </label>
+              )}
 
-              {event.map && (
+              {isOrienteering && event.map && (
                 <>
                   <button
                     onClick={() => onToggleFitMap?.(!fitMapMode)}
@@ -1265,25 +1495,42 @@ export const ReplayWorkspace: React.FC<Props> = ({
                   >
                     <Trash2 className="w-3.5 h-3.5" />
                   </button>
+
+                  <div className="flex items-center gap-1.5">
+                    <Layers className="w-3.5 h-3.5 text-emerald-400" />
+                    <span className="text-slate-300">Карта:</span>
+                    <input
+                      type="range"
+                      min={0}
+                      max={1}
+                      step={0.05}
+                      value={mapOpacity}
+                      onChange={(e) => setMapOpacity(parseFloat(e.target.value))}
+                      className="w-16 accent-emerald-500"
+                    />
+                  </div>
                 </>
               )}
 
-              <div className="flex items-center gap-1.5">
-                <Layers className="w-3.5 h-3.5 text-emerald-400" />
-                <span className="text-slate-300">Карта:</span>
-                <input
-                  type="range"
-                  min={0}
-                  max={1}
-                  step={0.05}
-                  value={mapOpacity}
-                  onChange={(e) => setMapOpacity(parseFloat(e.target.value))}
-                  className="w-16 accent-emerald-500"
-                />
+              {/* Base map: one active layer at a time (hidden ones download no tiles) */}
+              <div className="flex items-center gap-0.5 bg-slate-950 p-0.5 rounded-lg border border-slate-800">
+                {BASE_LAYERS.map((layer) => (
+                  <button
+                    key={layer}
+                    onClick={() => setBaseLayer(layer)}
+                    className={`px-2 py-0.5 rounded-md transition ${
+                      baseLayer === layer
+                        ? 'bg-sky-600 text-white font-medium'
+                        : 'text-slate-400 hover:text-slate-200'
+                    }`}
+                  >
+                    {BASE_LAYER_LABELS[layer]}
+                  </button>
+                ))}
               </div>
 
-              <div className="flex items-center gap-1.5">
-                <span className="text-slate-300">OSM:</span>
+              <div className="flex items-center gap-1.5" title="Прозрачность подложки">
+                <span className="text-slate-300">Подложка:</span>
                 <input
                   type="range"
                   min={0}
@@ -1294,17 +1541,6 @@ export const ReplayWorkspace: React.FC<Props> = ({
                   className="w-16 accent-sky-500"
                 />
               </div>
-
-              <button
-                onClick={() => setUseSatelliteBase((v) => !v)}
-                className={`px-2 py-0.5 rounded border transition ${
-                  useSatelliteBase
-                    ? 'bg-sky-600 border-sky-400 text-white font-medium'
-                    : 'bg-slate-800 border-slate-700 text-slate-300 hover:text-white'
-                }`}
-              >
-                {useSatelliteBase ? 'Спутник: ВКЛ' : 'Спутник'}
-              </button>
             </div>
 
             <div className="flex flex-wrap items-center gap-2">
@@ -1341,7 +1577,7 @@ export const ReplayWorkspace: React.FC<Props> = ({
           </div>
 
           {/* SIMPLE, DIRECT MAP FITTING PANEL (shown when fitMapMode is active) */}
-          {fitMapMode && event.map && (
+          {fitMapMode && isOrienteering && event.map && (
             <div className="relative z-10 px-3 py-2.5 bg-slate-900/95 border-b border-amber-500/40 space-y-2 text-xs shrink-0 shadow-xl">
               <div className="flex flex-wrap items-center justify-between gap-2">
                 <div className="flex flex-wrap items-center gap-2">
@@ -1564,15 +1800,142 @@ export const ReplayWorkspace: React.FC<Props> = ({
                   </div>
                 </div>
               </div>
+
+              {/* Scale & north: exact size from print scale/DPI or a scale bar, O-map turned to magnetic north */}
+              <div className="flex flex-wrap items-center gap-x-3 gap-y-1.5 bg-slate-950/90 p-2 rounded-xl border border-slate-800">
+                <div className="flex items-center gap-0.5 bg-slate-900 p-0.5 rounded-lg border border-slate-800">
+                  {(
+                    [
+                      ['orienteering', '🧭 Карта О'],
+                      ['screenshot', '🗺 Скриншот Google'],
+                    ] as const
+                  ).map(([k, label]) => (
+                    <button
+                      key={k}
+                      onClick={() => setMapImageKind(k)}
+                      className={`px-2 py-0.5 rounded-md transition ${
+                        mapImageKind === k
+                          ? 'bg-emerald-600 text-white font-medium'
+                          : 'text-slate-400 hover:text-slate-200'
+                      }`}
+                      title={
+                        k === 'orienteering'
+                          ? 'Карта ориентирования: нарисована на магнитный север, масштаб печати известен'
+                          : 'Скриншот Google Maps: истинный север, масштаб — по линейке на скриншоте'
+                      }
+                    >
+                      {label}
+                    </button>
+                  ))}
+                </div>
+
+                {mapImageKind === 'orienteering' && (
+                  <>
+                    <label className="flex items-center gap-1 text-slate-300">
+                      1:
+                      <input
+                        list="retrace-print-scales"
+                        type="number"
+                        min={500}
+                        max={200000}
+                        step={500}
+                        value={printScale}
+                        onChange={(e) => setPrintScale(Number(e.target.value))}
+                        className="w-20 px-1.5 py-0.5 rounded bg-slate-900 border border-slate-700 text-slate-100"
+                        title="Масштаб печати карты (указан на карте: 1:4000, 1:10000...)"
+                      />
+                      <datalist id="retrace-print-scales">
+                        {PRINT_SCALES.map((s) => (
+                          <option key={s} value={s} />
+                        ))}
+                      </datalist>
+                    </label>
+                    <label
+                      className="flex items-center gap-1 text-slate-300"
+                      title="Разрешение скана. Для фото с телефона DPI неизвестен — используйте линейку"
+                    >
+                      DPI
+                      <input
+                        type="number"
+                        min={30}
+                        max={2400}
+                        step={10}
+                        value={scanDpi}
+                        onChange={(e) => setScanDpi(Number(e.target.value))}
+                        className="w-16 px-1.5 py-0.5 rounded bg-slate-900 border border-slate-700 text-slate-100"
+                      />
+                    </label>
+                    <label
+                      className="flex items-center gap-1 text-slate-300"
+                      title="Магнитное склонение: карты ориентирования рисуются на магнитный север, а подложка — на истинный"
+                    >
+                      Склонение
+                      <input
+                        type="number"
+                        min={-60}
+                        max={60}
+                        step={0.1}
+                        value={declinationDeg}
+                        onChange={(e) => setDeclinationDeg(Number(e.target.value))}
+                        className="w-16 px-1.5 py-0.5 rounded bg-slate-900 border border-slate-700 text-slate-100"
+                      />
+                      °
+                      <button
+                        onClick={() => setDeclinationDeg(autoDeclinationDeg)}
+                        className="px-1.5 py-0.5 rounded bg-slate-800 hover:bg-slate-700 text-sky-300"
+                        title="Склонение по модели WMM2025 для места старта и даты забега"
+                      >
+                        авто {formatSignedDeg(autoDeclinationDeg)}
+                      </button>
+                    </label>
+                  </>
+                )}
+
+                <button
+                  onClick={() => applyScaleAndNorth(null)}
+                  className="px-2.5 py-1 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white font-medium"
+                  title={
+                    mapImageKind === 'orienteering'
+                      ? 'Выставить точный размер по масштабу и DPI и повернуть на магнитный север. ⚓ СТАРТ не сдвигается'
+                      : 'Повернуть скриншот строго на север (масштаб не меняется). ⚓ СТАРТ не сдвигается'
+                  }
+                >
+                  {mapImageKind === 'orienteering'
+                    ? 'Применить масштаб и север'
+                    : 'Выровнять на север'}
+                </button>
+                <button
+                  onClick={() => {
+                    setPickedFeatureLonLat(null);
+                    setSnapStage('scalebar_start');
+                  }}
+                  className="px-2.5 py-1 rounded-lg bg-slate-800 hover:bg-slate-700 border border-slate-700 text-amber-300"
+                  title="Кликнуть два конца масштабной линейки на карте и ввести её длину в метрах — для фото и скриншотов"
+                >
+                  📏 По линейке
+                </button>
+
+                {placementReadout && (
+                  <span className="text-[11px] text-slate-400 font-mono">
+                    сейчас: {placementReadout.metersPerPixel.toFixed(3)} м/пикс
+                    {placementReadout.impliedScale
+                      ? ` (≈1:${placementReadout.impliedScale})`
+                      : ''}
+                    , север карты {formatSignedDeg(placementReadout.upBearingDeg)}
+                  </span>
+                )}
+              </div>
             </div>
           )}
 
-          {/* Active Map Click Prompt Banner (for Spot Start or Leg Selection) */}
-          {(snapStage === 'spot_start' ||
-            snapStage === 'leg_start' ||
-            snapStage === 'leg_end') && (
+          {/* Active Map Click Prompt Banner (for Spot Start, Leg Selection or Scale Bar) */}
+          {snapStage !== 'idle' && (
             <div className="relative z-10 px-3 py-1.5 bg-fuchsia-600/25 border-b border-fuchsia-400/50 text-fuchsia-200 text-xs font-medium flex items-center justify-between animate-pulse shrink-0">
               <span>
+                {snapStage === 'scalebar_start' &&
+                  '📏 Шаг 1/2: кликните ЛЕВЫЙ конец масштабной линейки на карте'}
+                {snapStage === 'scalebar_end' &&
+                  '📏 Шаг 2/2: кликните ПРАВЫЙ конец линейки, затем введите её длину в метрах'}
                 {snapStage === 'spot_start' &&
                   '🏁 Кликните любую точку на карте (КП / развилку), чтобы запустить все треки одновременно из этого места!'}
                 {snapStage === 'leg_start' &&
@@ -1711,7 +2074,8 @@ export const ReplayWorkspace: React.FC<Props> = ({
               </button>
             </div>
 
-            {/* Livelox Speed Normalization Switch */}
+            {/* Livelox Speed Normalization Switch (orienteering route-choice tool) */}
+            {isOrienteering && (
             <div className="bg-slate-950 p-1.5 rounded-lg border border-slate-800 space-y-1">
               <div className="flex items-center justify-between text-[10px] text-slate-400 px-1">
                 <span className="flex items-center gap-1">
@@ -1763,6 +2127,15 @@ export const ReplayWorkspace: React.FC<Props> = ({
                 </button>
               </div>
             </div>
+            )}
+            {!isOrienteering && (customStartSpot || selectedLeg) && (
+              <button
+                onClick={() => void resetToFullRaceStart()}
+                className="w-full py-1 rounded-lg bg-slate-950 border border-slate-800 text-[11px] text-emerald-400 hover:underline"
+              >
+                ↺ Вся дистанция
+              </button>
+            )}
           </div>
 
           {/* Selected Leg Route-Choice Comparison Panel */}

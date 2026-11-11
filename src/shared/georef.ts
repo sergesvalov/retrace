@@ -377,6 +377,83 @@ export function nudgeMapMatrix(
   return { matrix: nextMatrix, cornersLonLat };
 }
 
+/** Ground metres per image pixel of a scan printed at 1:`printScale` and scanned at `dpi` */
+export function groundMetersPerPixelFromPrint(
+  printScale: number,
+  dpi: number
+): number {
+  return (printScale * 0.0254) / dpi;
+}
+
+/**
+ * Ground metres per image pixel of a placement matrix at latitude `lat`
+ * (Web Mercator metres are stretched by 1/cos(lat) relative to ground metres).
+ * For a non-uniform (affine) matrix this is the geometric mean of both axes.
+ */
+export function matrixGroundMetersPerPixel(
+  matrix: [number, number, number, number, number, number],
+  lat: number
+): number {
+  const [a, b, , c, d] = matrix;
+  return Math.sqrt(Math.abs(a * d - b * c)) * Math.cos((lat * Math.PI) / 180);
+}
+
+/** Bearing (deg, clockwise from true north) that the image's "up" direction points to */
+export function matrixUpBearingDeg(
+  matrix: [number, number, number, number, number, number]
+): number {
+  const [, b, , , d] = matrix;
+  // Image up = pixel (0, -1) -> mercator (-b, -d): east component -b, north component -d
+  return (Math.atan2(-b, -d) * 180) / Math.PI;
+}
+
+/**
+ * Rebuild a North-Up-like placement with an exact ground scale and orientation while the
+ * map point under `anchorLonLat` (e.g. the Start triangle) stays exactly where it is.
+ *
+ * `upBearingDeg` is where the image's up direction must point: for an orienteering map
+ * this is the magnetic declination (O-maps are drawn to magnetic north), for a
+ * Google Maps screenshot it is 0 (true north).
+ */
+export function buildScaledOrientedMatrix(
+  currentMatrix: [number, number, number, number, number, number],
+  anchorLonLat: [number, number],
+  groundMetersPerPixel: number,
+  upBearingDeg: number
+): [number, number, number, number, number, number] | null {
+  const anchorPx = lonLatToPixel(currentMatrix, anchorLonLat[0], anchorLonLat[1]);
+  if (!anchorPx || !(groundMetersPerPixel > 0)) return null;
+  const s = groundMetersPerPixel / Math.cos((anchorLonLat[1] * Math.PI) / 180);
+  // Image up must point to `upBearingDeg`, i.e. rotate the north-up matrix clockwise by it
+  const theta = (-upBearingDeg * Math.PI) / 180;
+  const a = s * Math.cos(theta);
+  const b = s * Math.sin(theta);
+  const c = s * Math.sin(theta);
+  const d = -s * Math.cos(theta);
+  const [mx, my] = lonLatToMercator(anchorLonLat[0], anchorLonLat[1]);
+  const tx = mx - (a * anchorPx[0] + b * anchorPx[1]);
+  const ty = my - (c * anchorPx[0] + d * anchorPx[1]);
+  return [a, b, tx, c, d, ty];
+}
+
+/**
+ * Ground metres per image pixel measured from a scale bar: the user clicks both ends of the
+ * bar on the displayed map (`p1`, `p2` in lon/lat under the current placement) and enters its length.
+ */
+export function groundMetersPerPixelFromScaleBar(
+  currentMatrix: [number, number, number, number, number, number],
+  p1: [number, number],
+  p2: [number, number],
+  barLengthM: number
+): number | null {
+  const px1 = lonLatToPixel(currentMatrix, p1[0], p1[1]);
+  const px2 = lonLatToPixel(currentMatrix, p2[0], p2[1]);
+  if (!px1 || !px2 || !(barLengthM > 0)) return null;
+  const pxDist = Math.hypot(px2[0] - px1[0], px2[1] - px1[1]);
+  if (pxDist < 3) return null;
+  return barLengthM / pxDist;
+}
+
 /**
  * Compute smooth Inverse-Distance-Weighted (Shepard Rubber-Sheeting) pixel displacement (dx, dy)
  * at quad coordinate (u, v) for 3+ control points so local orienteering map distortions

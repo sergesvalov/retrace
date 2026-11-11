@@ -23,13 +23,18 @@ import {
   syncAllParticipantsToCommonStartSpot,
   syncAllParticipantsToSpot,
 } from '../shared/trackParser.js';
-import type {
-  GCP,
-  MapOverlay,
-  ParticipantTrack,
-  RaceEvent,
-  TimeMode,
-  TransformType,
+import {
+  EVENT_KINDS,
+  MAP_IMAGE_KINDS,
+  eventKindOf,
+  type EventKind,
+  type GCP,
+  type MapOverlay,
+  type MapOverlayMeta,
+  type ParticipantTrack,
+  type RaceEvent,
+  type TimeMode,
+  type TransformType,
 } from '../shared/types.js';
 
 const DATA_DIR = path.resolve(process.cwd(), 'data');
@@ -130,6 +135,30 @@ function isUsableMatrix(m: number[] | undefined): boolean {
   return Math.abs(a * d - b * c) > 1e-6;
 }
 
+/** Validate and copy client-editable map metadata; returns an error message or null */
+function applyMapMeta(map: MapOverlay, meta: MapOverlayMeta | undefined): string | null {
+  if (!meta) return null;
+  const inRange = (v: unknown, min: number, max: number) =>
+    typeof v === 'number' && Number.isFinite(v) && v >= min && v <= max;
+  if (meta.imageKind !== undefined && !MAP_IMAGE_KINDS.includes(meta.imageKind)) {
+    return 'Неизвестный тип изображения карты';
+  }
+  if (meta.printScale !== undefined && !inRange(meta.printScale, 500, 200000)) {
+    return 'Масштаб карты должен быть от 1:500 до 1:200 000';
+  }
+  if (meta.scanDpi !== undefined && !inRange(meta.scanDpi, 30, 2400)) {
+    return 'DPI скана должен быть от 30 до 2400';
+  }
+  if (meta.declinationDeg !== undefined && !inRange(meta.declinationDeg, -60, 60)) {
+    return 'Склонение должно быть от -60° до 60°';
+  }
+  if (meta.imageKind !== undefined) map.imageKind = meta.imageKind;
+  if (meta.printScale !== undefined) map.printScale = meta.printScale;
+  if (meta.scanDpi !== undefined) map.scanDpi = meta.scanDpi;
+  if (meta.declinationDeg !== undefined) map.declinationDeg = meta.declinationDeg;
+  return null;
+}
+
 async function removeUploadedMapFile(imageUrl: string | undefined) {
   if (!imageUrl?.startsWith('/uploads/')) return;
   try {
@@ -196,6 +225,7 @@ async function startServer() {
       title: e.title,
       description: e.description,
       createdAt: e.createdAt,
+      kind: eventKindOf(e),
       participantCount: e.participants.length,
       hasMap: Boolean(e.map),
       mapRmsErrorM: e.map?.rmsErrorM,
@@ -219,9 +249,13 @@ async function startServer() {
   );
 
   // Create new event
-  app.post<{ Body: { title?: string; description?: string } }>(
+  app.post<{ Body: { title?: string; description?: string; kind?: EventKind } }>(
     '/api/events',
-    async (req) => {
+    async (req, reply) => {
+      const kind = req.body?.kind ?? 'orienteering';
+      if (!EVENT_KINDS.includes(kind)) {
+        return reply.code(400).send({ error: 'Неизвестный тип события' });
+      }
       const id = makeId(10);
       const evt: RaceEvent = {
         id,
@@ -229,6 +263,7 @@ async function startServer() {
         title: req.body?.title?.trim() || 'Новый разбор забега',
         description: req.body?.description?.trim() || '',
         createdAt: new Date().toISOString(),
+        kind,
         timeMode: 'from_start',
         participants: [],
       };
@@ -241,14 +276,24 @@ async function startServer() {
   // Update event settings (title, timeMode)
   app.patch<{
     Params: { id: string };
-    Body: { title?: string; description?: string; timeMode?: TimeMode };
+    Body: {
+      title?: string;
+      description?: string;
+      timeMode?: TimeMode;
+      kind?: EventKind;
+    };
   }>('/api/events/:id', async (req, reply) => {
     const evt = eventsStore.get(req.params.id);
     if (!evt) return reply.code(404).send({ error: 'Событие не найдено' });
-    const { title, description, timeMode } = req.body ?? {};
+    const { title, description, timeMode, kind } = req.body ?? {};
     if (timeMode !== undefined && timeMode !== 'from_start' && timeMode !== 'real') {
       return reply.code(400).send({ error: 'Неизвестный режим времени' });
     }
+    if (kind !== undefined && !EVENT_KINDS.includes(kind)) {
+      return reply.code(400).send({ error: 'Неизвестный тип события' });
+    }
+    // A run/hike keeps its uploaded map (if any) so switching back loses nothing
+    if (kind !== undefined) evt.kind = kind;
     if (typeof title === 'string' && title.trim()) evt.title = title.trim();
     if (typeof description === 'string') evt.description = description;
     if (timeMode !== undefined) evt.timeMode = timeMode;
@@ -406,6 +451,7 @@ async function startServer() {
       };
       undoLastPin?: boolean;
       clearPins?: boolean;
+      meta?: MapOverlayMeta;
     };
   }>('/api/events/:id/map-nudge', async (req, reply) => {
     const evt = eventsStore.get(req.params.id);
@@ -515,6 +561,12 @@ async function startServer() {
     if (!isUsableMatrix(evt.map.matrix)) {
       evt.map = previousMap;
       return reply.code(400).send({ error: 'Некорректные параметры подгонки карты' });
+    }
+
+    const metaError = applyMapMeta(evt.map, req.body.meta);
+    if (metaError) {
+      evt.map = previousMap;
+      return reply.code(400).send({ error: metaError });
     }
 
     evt.map.manuallyPlaced = true;

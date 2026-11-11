@@ -9,14 +9,20 @@ import {
   Share2,
   Trash2,
 } from 'lucide-react';
-import type { RaceEvent } from '../shared/types.js';
+import {
+  eventKindOf,
+  type EventKind,
+  type RaceEvent,
+} from '../shared/types.js';
 import { ReplayWorkspace } from './components/ReplayWorkspace.js';
+import { EVENT_KIND_INFO, EventDialog } from './components/EventDialog.js';
 
 interface EventSummary {
   id: string;
   slug: string;
   title: string;
   description: string;
+  kind?: EventKind;
   participantCount: number;
   hasMap: boolean;
   mapRmsErrorM?: number;
@@ -28,6 +34,9 @@ export const App: React.FC = () => {
   const [fitMapMode, setFitMapMode] = useState<boolean>(false);
   const [copiedSlug, setCopiedSlug] = useState(false);
   const [creatingEvent, setCreatingEvent] = useState(false);
+  const [dialog, setDialog] = useState<'create' | 'edit' | null>(null);
+  const isOrienteering =
+    currentEvent !== null && eventKindOf(currentEvent) === 'orienteering';
 
   // StrictMode runs effects twice in dev: without the guard two "Тренировка" events get created
   const initStartedRef = useRef(false);
@@ -94,24 +103,21 @@ export const App: React.FC = () => {
     }
   }
 
-  async function handleCreateNewEvent() {
-    const title = window.prompt(
-      'Название нового события / тренировки:',
-      'Тренировка ориентирования'
-    );
-    if (!title) return;
+  async function handleCreateNewEvent(value: { title: string; kind: EventKind }) {
     setCreatingEvent(true);
     try {
       const res = await fetch('/api/events', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ title }),
+        body: JSON.stringify(value),
       });
       if (res.ok) {
         const data = await res.json();
         const evt: RaceEvent = data.event;
         setCurrentEvent(evt);
         setEventInUrl(evt.slug);
+        setFitMapMode(false);
+        setDialog(null);
         await refreshEventsList();
       }
     } finally {
@@ -127,21 +133,18 @@ export const App: React.FC = () => {
     }
   }
 
-  async function handleRenameCurrentEvent() {
+  async function handleEditCurrentEvent(value: { title: string; kind: EventKind }) {
     if (!currentEvent) return;
-    const nextTitle = window.prompt(
-      'Новое название мероприятия:',
-      currentEvent.title
-    );
-    if (!nextTitle || nextTitle.trim() === currentEvent.title) return;
     const res = await fetch(`/api/events/${currentEvent.id}`, {
       method: 'PATCH',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ title: nextTitle.trim() }),
+      body: JSON.stringify(value),
     });
     if (res.ok) {
       const data = await res.json();
       setCurrentEvent(data.event);
+      if (value.kind === 'run') setFitMapMode(false);
+      setDialog(null);
       await refreshEventsList();
     }
   }
@@ -208,16 +211,17 @@ export const App: React.FC = () => {
           >
             {eventsList.map((ev) => (
               <option key={ev.id} value={ev.id}>
-                {ev.title} ({ev.participantCount} уч.)
+                {EVENT_KIND_INFO[ev.kind ?? 'orienteering'].icon} {ev.title} (
+                {ev.participantCount} уч.)
               </option>
             ))}
           </select>
 
           <button
-            onClick={handleRenameCurrentEvent}
+            onClick={() => setDialog('edit')}
             disabled={!currentEvent}
             className="p-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 border border-slate-700 text-slate-300 hover:text-white transition"
-            title="Переименовать текущее мероприятие"
+            title="Название и тип события (ориентирование / забег)"
           >
             <Pencil className="w-3.5 h-3.5" />
           </button>
@@ -232,7 +236,7 @@ export const App: React.FC = () => {
           </button>
 
           <button
-            onClick={handleCreateNewEvent}
+            onClick={() => setDialog('create')}
             disabled={creatingEvent}
             className="inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 border border-slate-700 text-xs text-slate-200 transition"
             title="Создать новое мероприятие"
@@ -242,7 +246,8 @@ export const App: React.FC = () => {
           </button>
         </div>
 
-        {/* Center Mode Switch: Replay vs Interactive Map Fit */}
+        {/* Center Mode Switch: Replay vs Interactive Map Fit (orienteering maps only) */}
+        {isOrienteering && (
         <div className="flex items-center bg-slate-950 p-1 rounded-xl border border-slate-800">
           <button
             onClick={() => setFitMapMode(false)}
@@ -269,6 +274,7 @@ export const App: React.FC = () => {
             ✋ Подогнать карту мышкой
           </button>
         </div>
+        )}
 
         {/* Share event button */}
         <div className="flex items-center gap-2">
@@ -309,6 +315,24 @@ export const App: React.FC = () => {
           />
         )}
       </main>
+
+      {dialog === 'create' && (
+        <EventDialog
+          mode="create"
+          busy={creatingEvent}
+          onSubmit={(v) => void handleCreateNewEvent(v)}
+          onCancel={() => setDialog(null)}
+        />
+      )}
+      {dialog === 'edit' && currentEvent && (
+        <EventDialog
+          mode="edit"
+          initialTitle={currentEvent.title}
+          initialKind={eventKindOf(currentEvent)}
+          onSubmit={(v) => void handleEditCurrentEvent(v)}
+          onCancel={() => setDialog(null)}
+        />
+      )}
     </div>
   );
 };

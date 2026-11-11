@@ -1,5 +1,24 @@
 export type TransformType = 'similarity' | 'affine';
 export type TimeMode = 'from_start' | 'real';
+/** orienteering: map scan + controls + route-choice tools; run: plain run/hike on a base map */
+export type EventKind = 'orienteering' | 'run';
+export type BaseLayer = 'topo' | 'osm' | 'satellite';
+/**
+ * orienteering: printed/scanned O-map — drawn to magnetic north, known print scale;
+ * screenshot: Google Maps / web map screenshot — true north, Web Mercator, scale from its scale bar
+ */
+export type MapImageKind = 'orienteering' | 'screenshot';
+
+export const EVENT_KINDS: readonly EventKind[] = ['orienteering', 'run'];
+export const MAP_IMAGE_KINDS: readonly MapImageKind[] = [
+  'orienteering',
+  'screenshot',
+];
+
+/** Events saved before event kinds existed were all orienteering analyses */
+export function eventKindOf(evt: { kind?: EventKind }): EventKind {
+  return evt.kind ?? 'orienteering';
+}
 
 export interface GCP {
   id: string;
@@ -32,7 +51,20 @@ export interface MapOverlay {
   rotationDeg?: number;
   /** True once the user has placed the map by hand (drag, sliders, pins, GCPs); auto-fit must not overwrite it */
   manuallyPlaced?: boolean;
+  /** What the image is; decides whether magnetic declination applies (default: orienteering) */
+  imageKind?: MapImageKind;
+  /** Print scale denominator of an O-map, e.g. 10000 for 1:10 000 */
+  printScale?: number;
+  /** Scan resolution, dots per inch */
+  scanDpi?: number;
+  /** Magnetic declination used for the map's north, degrees (east positive) */
+  declinationDeg?: number;
 }
+
+/** Map metadata the client may change together with a placement */
+export type MapOverlayMeta = Partial<
+  Pick<MapOverlay, 'imageKind' | 'printScale' | 'scanDpi' | 'declinationDeg'>
+>;
 
 export interface TrackPoint {
   /** Seconds from track start (0..duration) */
@@ -76,6 +108,8 @@ export interface RaceEvent {
   title: string;
   description: string;
   createdAt: string;
+  /** Missing on events created before kinds existed — read it via `eventKindOf` */
+  kind?: EventKind;
   timeMode: TimeMode;
   map?: MapOverlay;
   participants: ParticipantTrack[];
