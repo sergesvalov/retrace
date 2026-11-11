@@ -59,6 +59,7 @@ import { magneticDeclinationDeg } from '../../shared/declination.js';
 import {
   computeSplits,
   controlLabels,
+  fitMapToCourse,
   controlsLonLat,
   correctTrackToControls,
 } from '../../shared/course.js';
@@ -119,6 +120,7 @@ export const ReplayWorkspace: React.FC<Props> = ({
     useState<boolean>(false);
   const [uploadError, setUploadError] = useState<string | null>(null);
   const [dropActive, setDropActive] = useState<boolean>(false);
+  const [autoFitInfo, setAutoFitInfo] = useState<{ ok: boolean; text: string } | null>(null);
 
   // Interactive Map Fitting state (drag map directly with mouse + sliders around Start anchor)
   const [dragMovesMap, setDragMovesMap] = useState<boolean>(true);
@@ -144,7 +146,11 @@ export const ReplayWorkspace: React.FC<Props> = ({
     | 'leg_end'
     | 'scalebar_start'
     | 'scalebar_end'
+    | 'pin_map'
+    | 'pin_base'
   >('idle');
+  // Landmark pin being placed: the scan pixel clicked first, then the same place on the base map
+  const [pinDraftPx, setPinDraftPx] = useState<[number, number] | null>(null);
   const [pickedFeatureLonLat, setPickedFeatureLonLat] = useState<
     [number, number] | null
   >(null);
@@ -295,6 +301,7 @@ export const ReplayWorkspace: React.FC<Props> = ({
     setUploadError(null);
     setCourseEdit(false);
     setNextIsFinish(false);
+    setAutoFitInfo(null);
   }, [event.id]);
 
   // Each event kind starts on its own default base map (also when the kind is switched)
@@ -790,11 +797,12 @@ export const ReplayWorkspace: React.FC<Props> = ({
       map.setPaintProperty(
         'custom-map-layer',
         'raster-opacity',
-        // A run/hike keeps any old map hidden: the base map is the map there
-        isOrienteering ? mapOpacity : 0
+        // A run/hike keeps any old map hidden: the base map is the map there.
+        // While picking a pin's base-map point the scan is hidden so the base map is visible.
+        isOrienteering && snapStage !== 'pin_base' ? mapOpacity : 0
       );
     }
-  }, [osmOpacity, mapOpacity, baseLayer, isOrienteering]);
+  }, [osmOpacity, mapOpacity, baseLayer, isOrienteering, snapStage]);
 
   // Update or remove custom map when `event.map` changes
   useEffect(() => {
@@ -1139,6 +1147,76 @@ export const ReplayWorkspace: React.FC<Props> = ({
     applyScaleAndNorth(mpp);
   }
 
+  /**
+   * Semi-automatic georeferencing: move/scale/rotate the scan so the course controls drawn on
+   * it coincide with where the runners punched them (see fitMapToCourse).
+   */
+  function autoFitMapToCourse() {
+    const map = mapRef.current;
+    const meta = eventRef.current.map;
+    const current = liveMatrixRef.current ?? meta?.matrix;
+    if (!map || !meta || !current) return;
+    // Landmark pins (if any) take part in the fit as fixed pairs
+    const fit = fitMapToCourse(
+      eventRef.current.participants,
+      courseControlsRef.current,
+      current,
+      meta.gcps ?? []
+    );
+    if (!fit) {
+      setAutoFitInfo({
+        ok: false,
+        text: 'Не получилось: ни один трек не прошёл рядом с КП. Подвиньте карту ближе (старт на ⚓) и повторите.',
+      });
+      return;
+    }
+    liveMatrixRef.current = fit.matrix;
+    (map.getSource('custom-map') as maplibregl.ImageSource | undefined)?.setCoordinates(
+      matrixToCorners(fit.matrix, meta.width, meta.height)
+    );
+    syncCourseToMatrix(fit.matrix);
+    resetRelativeSliders();
+    void saveMatrixToServer(fit.matrix);
+
+    const missed = fit.residualsM.filter((r) => r === null).length;
+    const acc = Math.round(fit.rmsM * 10) / 10;
+    const good = fit.rmsM <= 15 && fit.mode === 'similarity';
+    setAutoFitInfo({
+      ok: good,
+      text:
+        (fit.mode === 'shift'
+          ? `Сдвинула по ${fit.usedControls} КП (для масштаба и поворота нужно 3+ отмеченных КП). `
+          : `Подогнала по ${fit.usedControls} КП: точность ±${acc} м. `) +
+        (missed ? `${missed} КП никто не прошёл рядом — не учтены. ` : '') +
+        (fit.rmsM > 15
+          ? 'Точность низкая: проверьте, что КП отмечены по порядку и в центрах кружков.'
+          : ''),
+    });
+  }
+
+  /** Add / remove landmark pins; the server re-solves the placement from all pins */
+  async function sendPinChange(body: {
+    addPin?: { px: number; py: number; lon: number; lat: number };
+    removePinId?: string;
+    clearPins?: boolean;
+  }) {
+    const eventId = eventRef.current.id;
+    const res = await fetch(`/api/events/${eventId}/map-nudge`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      setUploadError(data.error || 'Не удалось сохранить точку привязки');
+      return;
+    }
+    if (eventRef.current.id !== eventId) return;
+    resetRelativeSliders();
+    setAnchorLonLat(null);
+    onEventUpdated(data.event);
+  }
+
   /** What the user is looking at: where a map without tracks should appear */
   function currentViewBounds(): LonLatBounds | null {
     const b = mapRef.current?.getBounds();
@@ -1201,6 +1279,28 @@ export const ReplayWorkspace: React.FC<Props> = ({
       onEventUpdated(data.event);
     }
   }
+
+  // Landmark pins: where on the ground each pinned scan point belongs (shown while fitting)
+  const pinMarkersRef = useRef<maplibregl.Marker[]>([]);
+  useEffect(() => {
+    const map = mapRef.current;
+    for (const mk of pinMarkersRef.current) mk.remove();
+    pinMarkersRef.current = [];
+    if (!map || !mapReadyRef.current || !fitMapMode || !isOrienteering) return;
+    (event.map?.gcps ?? []).forEach((g, i) => {
+      const el = document.createElement('div');
+      el.className =
+        'w-5 h-5 rounded-full bg-orange-500 border-2 border-white text-[10px] font-bold text-white flex items-center justify-center shadow pointer-events-none';
+      el.textContent = String(i + 1);
+      pinMarkersRef.current.push(
+        new maplibregl.Marker({ element: el }).setLngLat([g.lon, g.lat]).addTo(map)
+      );
+    });
+    return () => {
+      for (const mk of pinMarkersRef.current) mk.remove();
+      pinMarkersRef.current = [];
+    };
+  }, [event.map?.gcps, fitMapMode, isOrienteering, mapLoadCount]);
 
   // Render custom start spot or selected leg (A -> B) markers & line on MapLibre
   useEffect(() => {
@@ -1602,6 +1702,22 @@ export const ReplayWorkspace: React.FC<Props> = ({
         return;
       }
 
+      if (snapStage === 'pin_map') {
+        const m = liveMatrixRef.current ?? eventRef.current.map?.matrix;
+        const px = m ? lonLatToPixel(m, e.lngLat.lng, e.lngLat.lat) : null;
+        if (!px) return;
+        setPinDraftPx(px);
+        setSnapStage('pin_base');
+        return;
+      }
+      if (snapStage === 'pin_base' && pinDraftPx) {
+        const [px, py] = pinDraftPx;
+        setPinDraftPx(null);
+        setSnapStage('idle');
+        void sendPinChange({ addPin: { px, py, lon: e.lngLat.lng, lat: e.lngLat.lat } });
+        return;
+      }
+
       if (snapStage === 'scalebar_start') {
         setPickedFeatureLonLat(clicked);
         setSnapStage('scalebar_end');
@@ -1654,6 +1770,7 @@ export const ReplayWorkspace: React.FC<Props> = ({
     declinationDeg,
     courseEdit,
     nextIsFinish,
+    pinDraftPx,
   ]);
 
   async function syncStartAtSpot(
@@ -1938,6 +2055,19 @@ export const ReplayWorkspace: React.FC<Props> = ({
                 >
                   Очистить
                 </button>
+                {courseControls.length >= 3 && event.participants.length > 0 && (
+                  <button
+                    onClick={() => {
+                      autoFitMapToCourse();
+                      setCourseEdit(false);
+                      onToggleFitMap?.(true);
+                    }}
+                    className="px-2 py-0.5 rounded bg-fuchsia-600 hover:bg-fuchsia-500 text-white font-semibold"
+                    title="Подогнать карту так, чтобы КП совпали с отметками участников"
+                  >
+                    🎯 Подогнать карту по КП
+                  </button>
+                )}
                 <button
                   onClick={() => setCourseEdit(false)}
                   className="inline-flex items-center gap-1 px-2.5 py-0.5 rounded bg-emerald-600 hover:bg-emerald-500 text-white font-semibold"
@@ -1953,6 +2083,10 @@ export const ReplayWorkspace: React.FC<Props> = ({
           {snapStage !== 'idle' && (
             <div className="relative z-10 px-3 py-1.5 bg-fuchsia-600/25 border-b border-fuchsia-400/50 text-fuchsia-200 text-xs font-medium flex items-center justify-between animate-pulse shrink-0">
               <span>
+                {snapStage === 'pin_map' &&
+                  '📍 Шаг 1/2: кликните приметное место НА СКАНЕ (перекрёсток, угол здания или забора, мост)'}
+                {snapStage === 'pin_base' &&
+                  '📍 Шаг 2/2: скан скрыт — кликните то же место на подложке'}
                 {snapStage === 'scalebar_start' &&
                   '📏 Шаг 1/2: кликните ЛЕВЫЙ конец масштабной линейки на карте'}
                 {snapStage === 'scalebar_end' &&
@@ -1968,6 +2102,7 @@ export const ReplayWorkspace: React.FC<Props> = ({
                 onClick={() => {
                   setSnapStage('idle');
                   setPickedFeatureLonLat(null);
+                  setPinDraftPx(null);
                 }}
                 className="px-2 py-0.5 rounded bg-slate-900/80 text-slate-200 hover:text-white"
               >
@@ -2021,6 +2156,21 @@ export const ReplayWorkspace: React.FC<Props> = ({
                 onShowMap={showUploadedMap}
                 onMoveMapHere={moveMapToViewCenter}
                 onResetPlacement={() => void handleResetMapAutoFit()}
+                courseControlCount={courseControls.length}
+                onEditCourse={() => setCourseEdit(true)}
+                onAutoFitCourse={autoFitMapToCourse}
+                autoFitInfo={autoFitInfo}
+                pins={event.map?.gcps ?? []}
+                pinStage={
+                  snapStage === 'pin_map' || snapStage === 'pin_base' ? snapStage : null
+                }
+                onAddPin={() => {
+                  setPickedFeatureLonLat(null);
+                  setPinDraftPx(null);
+                  setSnapStage('pin_map');
+                }}
+                onRemovePin={(id) => void sendPinChange({ removePinId: id })}
+                onClearPins={() => void sendPinChange({ clearPins: true })}
                 dragMovesMap={dragMovesMap}
                 onToggleDragMovesMap={() => setDragMovesMap((v) => !v)}
                 mapImageKind={mapImageKind}
@@ -2047,9 +2197,16 @@ export const ReplayWorkspace: React.FC<Props> = ({
                 onCommitSlider={() => {
                   if (liveMatrixRef.current) void saveMatrixToServer(liveMatrixRef.current);
                 }}
-                onNudge={(dEastM, dNorthM) =>
-                  applyLiveNudge({ dEastM, dNorthM, commitToServer: true })
-                }
+                onNudge={(dEastM, dNorthM) => {
+                  // Web Mercator metres are stretched by 1/cos(lat): convert ground metres
+                  const lat = anchorLonLatRef.current?.[1] ?? 0;
+                  const k = 1 / Math.cos((lat * Math.PI) / 180);
+                  applyLiveNudge({
+                    dEastM: dEastM * k,
+                    dNorthM: dNorthM * k,
+                    commitToServer: true,
+                  });
+                }}
               />
             </>
           ) : (

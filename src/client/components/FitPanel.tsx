@@ -12,7 +12,7 @@ import {
   Move,
   Plus,
 } from 'lucide-react';
-import type { MapImageKind } from '../../shared/types.js';
+import type { GCP, MapImageKind } from '../../shared/types.js';
 
 const PRINT_SCALES = [4000, 5000, 7500, 10000, 15000];
 
@@ -29,6 +29,19 @@ interface Props {
   onShowMap: () => void;
   onMoveMapHere: () => void;
   onResetPlacement: () => void;
+
+  /** Semi-automatic fit: course controls on the scan ↔ runners' punches */
+  courseControlCount: number;
+  onEditCourse: () => void;
+  onAutoFitCourse: () => void;
+  autoFitInfo: { ok: boolean; text: string } | null;
+
+  /** Landmark pins: scan point ↔ the same place on the base map */
+  pins: GCP[];
+  pinStage: 'pin_map' | 'pin_base' | null;
+  onAddPin: () => void;
+  onRemovePin: (id: string) => void;
+  onClearPins: () => void;
 
   dragMovesMap: boolean;
   onToggleDragMovesMap: () => void;
@@ -156,6 +169,92 @@ export const FitPanel: React.FC<Props> = (p) => {
           <Crosshair className="w-3.5 h-3.5" />
           Перенести сюда
         </button>
+      </div>
+
+      {/* Fastest: fit from the course controls and the tracks */}
+      <div className="p-2.5 rounded-xl bg-fuchsia-950/40 border border-fuchsia-500/40 space-y-2">
+        <div className="font-semibold text-fuchsia-200">🎯 Авто: по КП и трекам</div>
+        {p.courseControlCount >= 3 && p.hasTracks ? (
+          <>
+            <div className="text-slate-300">
+              Карта сама подстроится (сдвиг, масштаб, поворот), чтобы КП на скане совпали с
+              местами, где участники их отмечали. Карта должна лежать хотя бы примерно (в пределах
+              ~150 м).
+            </div>
+            <button
+              onClick={p.onAutoFitCourse}
+              className="w-full px-2.5 py-1.5 rounded-lg bg-fuchsia-600 hover:bg-fuchsia-500 text-white font-semibold"
+            >
+              🎯 Подогнать карту по КП
+            </button>
+          </>
+        ) : (
+          <>
+            <div className="text-slate-300">
+              {p.hasTracks ? '' : 'Нужны треки и отмеченные КП. '}
+              Отметьте на скане старт и хотя бы 3 КП (сейчас:{' '}
+              {Math.max(0, p.courseControlCount)}) — и карту можно будет подогнать одной кнопкой.
+            </div>
+            <button
+              onClick={p.onEditCourse}
+              className="w-full px-2.5 py-1 rounded-lg bg-slate-800 hover:bg-slate-700 border border-fuchsia-500/50 text-fuchsia-200"
+            >
+              ◎ Отметить КП на карте
+            </button>
+          </>
+        )}
+        {p.autoFitInfo && (
+          <div className={p.autoFitInfo.ok ? 'text-emerald-300' : 'text-amber-300'}>
+            {p.autoFitInfo.text}
+          </div>
+        )}
+      </div>
+
+      {/* Landmarks: the tracks lie on the base map, so its features are ground truth too */}
+      <div className="p-2.5 rounded-xl bg-orange-950/30 border border-orange-500/40 space-y-2">
+        <div className="font-semibold text-orange-200">📍 По приметным местам</div>
+        <div className="text-slate-300">
+          Кликните место на скане (перекрёсток, угол здания или забора), затем то же место на
+          подложке. 1 точка — сдвиг, 2–3 — ещё масштаб и поворот, 4+ — и растяжение. Точки
+          учитываются и при подгонке по КП.
+        </div>
+        <button
+          onClick={p.onAddPin}
+          disabled={p.pinStage !== null}
+          className="w-full px-2.5 py-1.5 rounded-lg bg-orange-600 hover:bg-orange-500 disabled:opacity-60 text-white font-semibold"
+        >
+          {p.pinStage === 'pin_map'
+            ? 'Кликните место на скане…'
+            : p.pinStage === 'pin_base'
+              ? 'Кликните то же место на подложке…'
+              : '+ Добавить точку'}
+        </button>
+        {p.pins.length > 0 && (
+          <div className="space-y-0.5">
+            {p.pins.map((g, i) => (
+              <div key={g.id} className="flex items-center justify-between text-slate-300">
+                <span>
+                  <span className="inline-flex w-4 h-4 mr-1 rounded-full bg-orange-500 text-[9px] font-bold text-white items-center justify-center">
+                    {i + 1}
+                  </span>
+                  {p.pins.length >= 2 && g.residualM !== undefined
+                    ? `расхождение ${g.residualM} м`
+                    : 'точка'}
+                </span>
+                <button
+                  onClick={() => p.onRemovePin(g.id)}
+                  className="text-slate-500 hover:text-rose-300"
+                  title="Удалить точку"
+                >
+                  ✕
+                </button>
+              </div>
+            ))}
+            <button onClick={p.onClearPins} className="text-[11px] text-slate-400 hover:text-rose-300">
+              очистить все точки
+            </button>
+          </div>
+        )}
       </div>
 
       {/* 1. Absolute scale & north */}

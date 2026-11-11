@@ -5,8 +5,9 @@ import {
   controlsLonLat,
   correctTrackToControls,
   detectControlPassages,
+  fitMapToCourse,
 } from './course.js';
-import { haversineDistanceM, lonLatToPixel } from './georef.js';
+import { haversineDistanceM, lonLatToPixel, nudgeMapMatrix } from './georef.js';
 import { normalizeSamplesToTrack } from './trackParser.js';
 import type { CourseControl } from './types.js';
 
@@ -170,5 +171,51 @@ describe('GPS noise cleanup', () => {
     expect(t.points).toHaveLength(29); // 31 − cold start − spike
     // ~29 × 3 m, not hundreds of metres of fake distance
     expect(t.totalDistanceM).toBeLessThan(100);
+  });
+});
+
+describe('semi-automatic map fit from the course', () => {
+  it('recovers the true placement from a rough one using the controls and tracks', () => {
+    // Course with controls at the corners of the runners' route
+    const course: CourseControl[] = [
+      control('start', 0, 0),
+      control('control', 300, 0),
+      control('control', 300, 300),
+      control('control', 0, 300),
+      control('finish', 0, 20),
+    ];
+    const runners = [runner('a', 4), runner('b', 3.2), runner('c', 4.6)];
+
+    // Rough placement: ~90 m off, turned 5°, 8% too big
+    const rough = nudgeMapMatrix(MATRIX, 1000, 1000, {
+      dEastM: 70,
+      dNorthM: -60,
+      dAngleDeg: 5,
+      scaleFactor: 1.08,
+    }).matrix;
+    const roughLL = controlsLonLat(course, rough);
+    const trueLL = controlsLonLat(course, MATRIX);
+    const worstRough = Math.max(
+      ...roughLL.map((ll, k) => haversineDistanceM(...ll, ...trueLL[k]))
+    );
+    expect(worstRough).toBeGreaterThan(80);
+
+    const fit = fitMapToCourse(runners, course, rough)!;
+    expect(fit.mode).toBe('similarity');
+    expect(fit.usedControls).toBe(5);
+    // From >80 m off to a few metres. Not exactly 0: every runner here takes the same
+    // straight legs, and a corner control can slide slightly along a leg while the
+    // closest track point stays close (the along-track ambiguity). Real runners take
+    // different routes, and GPS itself is ±5 m, so this is the accuracy that matters.
+    expect(fit.rmsM).toBeLessThan(3);
+    const fittedLL = controlsLonLat(course, fit.matrix);
+    fittedLL.forEach((ll, k) => {
+      expect(haversineDistanceM(...ll, ...trueLL[k])).toBeLessThan(5);
+    });
+  });
+
+  it('returns null without tracks or with fewer than two controls', () => {
+    expect(fitMapToCourse([], [control('start', 0, 0), control('finish', 0, 20)], MATRIX)).toBeNull();
+    expect(fitMapToCourse([runner('a', 4)], [control('start', 0, 0)], MATRIX)).toBeNull();
   });
 });

@@ -1,6 +1,11 @@
-import { haversineDistanceM, pixelToLonLat } from './georef.js';
+import {
+  fitSimilarityTransform,
+  haversineDistanceM,
+  lonLatToMercator,
+  pixelToLonLat,
+} from './georef.js';
 import { detectDepartureFromStartSpot } from './trackParser.js';
-import type { CourseControl, ParticipantTrack, TrackPoint } from './types.js';
+import type { CourseControl, GCP, ParticipantTrack, TrackPoint } from './types.js';
 
 type Matrix = [number, number, number, number, number, number];
 
@@ -44,7 +49,12 @@ export function detectControlPassages(
   points: TrackPoint[],
   controlsLL: [number, number][],
   kinds: CourseControl['kind'][],
-  radiusM = 60
+  radiusM = 60,
+  /**
+   * true (splits): the start punch is the moment of leaving the triangle.
+   * false (map fitting): the closest point, i.e. where runners stood at the start.
+   */
+  startAsDeparture = true
 ): ControlPassage[] {
   const out: ControlPassage[] = [];
   let fromIdx = 0;
@@ -52,7 +62,7 @@ export function detectControlPassages(
   for (let k = 0; k < controlsLL.length; k++) {
     const [lon, lat] = controlsLL[k];
 
-    if (kinds[k] === 'start' && k === 0) {
+    if (startAsDeparture && kinds[k] === 'start' && k === 0) {
       const t = detectDepartureFromStartSpot(points, lon, lat, 25);
       let idx = points.findIndex((p) => p.t >= t);
       if (idx < 0) idx = 0;
@@ -146,6 +156,126 @@ export function correctTrackToControls(
     }
     return { ...pt, lon: pt.lon + dLon, lat: pt.lat + dLat };
   });
+}
+
+export interface CourseFitResult {
+  matrix: Matrix;
+  /** RMS distance between the fitted controls and the runners' punches, metres */
+  rmsM: number;
+  /** Controls that took part in the fit (punched by at least one runner) */
+  usedControls: number;
+  /** Per control: distance to the runners' (median) punch after the fit, null = not punched */
+  residualsM: (number | null)[];
+  /** 'similarity' = shift + scale + rotation; 'shift' = only 2 controls usable */
+  mode: 'similarity' | 'shift';
+}
+
+function median(values: number[]): number {
+  const s = [...values].sort((a, b) => a - b);
+  const mid = s.length >> 1;
+  return s.length % 2 ? s[mid] : (s[mid - 1] + s[mid]) / 2;
+}
+
+/**
+ * Semi-automatic georeferencing from the course: the controls drawn on the scan must lie
+ * where the runners punched them. Iterative closest point:
+ *   1. find each runner's punch of every control under the current placement,
+ *   2. take the median punch over all runners (one bad GPS track does not pull the map),
+ *   3. fit a similarity transform (shift + scale + rotation) control pixel → punch,
+ * and repeat with a shrinking search radius until the placement stops moving.
+ * Works from a rough placement (the start roughly on the tracks, scale within ~20%).
+ */
+export function fitMapToCourse(
+  participants: ParticipantTrack[],
+  controls: CourseControl[],
+  matrix: Matrix,
+  /** Landmark pins (scan pixel ↔ base-map point): fixed pairs added to every iteration */
+  pins: GCP[] = []
+): CourseFitResult | null {
+  const tracks = participants.filter((p) => p.visible && p.points.length >= 2);
+  if (tracks.length === 0 || controls.length < 2) return null;
+  const kinds = controls.map((c) => c.kind);
+
+  const punchesUnder = (m: Matrix, radiusM: number) => {
+    const ll = controlsLonLat(controls, m);
+    const perControl: { lon: number[]; lat: number[] }[] = controls.map(() => ({
+      lon: [],
+      lat: [],
+    }));
+    for (const p of tracks) {
+      detectControlPassages(p.points, ll, kinds, radiusM, false).forEach((pass, k) => {
+        if (!pass.detected) return;
+        perControl[k].lon.push(p.points[pass.idx].lon);
+        perControl[k].lat.push(p.points[pass.idx].lat);
+      });
+    }
+    return { ll, perControl };
+  };
+
+  let m = matrix;
+  // Generous radius first (rough placement), then tighter so neighbouring paths don't attract.
+  // Closest-point matching converges gradually near corners, so keep iterating at the final
+  // radius until the placement settles.
+  const radii = [250, 150, 100, 70, 60, 50];
+  let mode: CourseFitResult['mode'] = 'similarity';
+
+  for (let iter = 0; iter < 80; iter++) {
+    const r = radii[Math.min(iter, radii.length - 1)];
+    const { ll, perControl } = punchesUnder(m, r);
+    const gcps: GCP[] = [];
+    perControl.forEach((pc, k) => {
+      if (pc.lon.length === 0) return;
+      gcps.push({
+        id: controls[k].id,
+        label: '',
+        px: controls[k].px,
+        py: controls[k].py,
+        lon: median(pc.lon),
+        lat: median(pc.lat),
+      });
+    });
+    if (gcps.length === 0) return null;
+    gcps.push(...pins);
+
+    let next: Matrix | null;
+    if (gcps.length >= 3) {
+      mode = 'similarity';
+      next = fitSimilarityTransform(gcps);
+    } else {
+      // Two points (often start + finish next to each other) cannot fix scale/rotation
+      mode = 'shift';
+      let dx = 0;
+      let dy = 0;
+      for (const g of gcps) {
+        const [cx, cy] = lonLatToMercator(...pixelToLonLat(m, g.px, g.py));
+        const [tx, ty] = lonLatToMercator(g.lon, g.lat);
+        dx += tx - cx;
+        dy += ty - cy;
+      }
+      next = [m[0], m[1], m[2] + dx / gcps.length, m[3], m[4], m[5] + dy / gcps.length];
+    }
+    if (!next) return null;
+
+    const moved = Math.max(
+      ...controls.map((c, k) => {
+        const [lon, lat] = pixelToLonLat(next!, c.px, c.py);
+        return haversineDistanceM(lon, lat, ll[k][0], ll[k][1]);
+      })
+    );
+    m = next;
+    if (moved < 0.02 && iter >= radii.length - 1) break;
+  }
+
+  const { ll, perControl } = punchesUnder(m, 50);
+  const residualsM = perControl.map((pc, k) =>
+    pc.lon.length
+      ? haversineDistanceM(ll[k][0], ll[k][1], median(pc.lon), median(pc.lat))
+      : null
+  );
+  const used = residualsM.filter((r): r is number => r !== null);
+  if (used.length === 0) return null;
+  const rmsM = Math.sqrt(used.reduce((s, r) => s + r * r, 0) / used.length);
+  return { matrix: m, rmsM, usedControls: used.length, residualsM, mode };
 }
 
 export interface ParticipantSplits {

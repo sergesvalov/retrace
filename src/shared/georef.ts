@@ -664,6 +664,53 @@ export function addPinMapToTrack(
   };
 }
 
+/**
+ * Placement from landmark pins (scan pixel ↔ ground point clicked on the base map):
+ *  - 1 pin: shift only — keeps the scale and north already set (print scale / declination);
+ *  - 2–3 pins: similarity (shift + scale + rotation), least squares;
+ *  - 4+ pins: affine (also absorbs paper stretch / slightly skewed scans).
+ */
+export function solvePins(
+  pins: GCP[],
+  currentMatrix: [number, number, number, number, number, number]
+): {
+  matrix: [number, number, number, number, number, number];
+  pins: GCP[];
+  rmsErrorM: number;
+  mode: 'shift' | 'similarity' | 'affine';
+} | null {
+  if (pins.length === 0) return null;
+  let matrix: [number, number, number, number, number, number] | null;
+  let mode: 'shift' | 'similarity' | 'affine';
+  if (pins.length === 1) {
+    const [p] = pins;
+    const [a, b, , c, d] = currentMatrix;
+    const [mx, my] = lonLatToMercator(p.lon, p.lat);
+    matrix = [a, b, mx - (a * p.px + b * p.py), c, d, my - (c * p.px + d * p.py)];
+    mode = 'shift';
+  } else if (pins.length <= 3) {
+    matrix = fitSimilarityTransform(pins);
+    mode = 'similarity';
+  } else {
+    matrix = fitAffineTransform(pins);
+    mode = 'affine';
+  }
+  if (!matrix) return null;
+  let sumSq = 0;
+  const withResiduals = pins.map((g) => {
+    const [lon, lat] = pixelToLonLat(matrix!, g.px, g.py);
+    const err = haversineDistanceM(g.lon, g.lat, lon, lat);
+    sumSq += err * err;
+    return { ...g, residualM: Math.round(err * 10) / 10 };
+  });
+  return {
+    matrix,
+    pins: withResiduals,
+    rmsErrorM: Math.round(Math.sqrt(sumSq / pins.length) * 10) / 10,
+    mode,
+  };
+}
+
 export interface GeorefSolution {
   matrix: [number, number, number, number, number, number];
   cornersLonLat: [

@@ -4,8 +4,9 @@ import path from 'node:path';
 import Fastify from 'fastify';
 import multipart from '@fastify/multipart';
 import {
-  addPinMapToTrack,
   autoPlaceScreenshotOnBounds,
+  haversineDistanceM,
+  solvePins,
   boundsForViewShare,
   boundsOverlap,
   matrixBounds,
@@ -203,6 +204,19 @@ function applyMapMeta(map: MapOverlay, meta: MapOverlayMeta | undefined): string
   if (meta.scanDpi !== undefined) map.scanDpi = meta.scanDpi;
   if (meta.declinationDeg !== undefined) map.declinationDeg = meta.declinationDeg;
   return null;
+}
+
+function refreshPinResiduals(pins: GCP[], m: [number, number, number, number, number, number]): GCP[] {
+  return pins.map((g) => {
+    const [lon, lat] = pixelToLonLat(m, g.px, g.py);
+    return { ...g, residualM: Math.round(haversineDistanceM(g.lon, g.lat, lon, lat) * 10) / 10 };
+  });
+}
+
+function pinsRms(pins: GCP[]): number | undefined {
+  if (pins.length < 2) return undefined;
+  const sq = pins.reduce((s, g) => s + (g.residualM ?? 0) ** 2, 0);
+  return Math.round(Math.sqrt(sq / pins.length) * 10) / 10;
 }
 
 async function removeUploadedMapFile(imageUrl: string | undefined) {
@@ -500,10 +514,9 @@ async function startServer() {
       stretchXFactor?: number;
       dAngleDeg?: number;
       anchorLonLat?: [number, number];
-      addPin?: {
-        mapLonLat: [number, number];
-        trackLonLat: [number, number];
-      };
+      /** Landmark pin: scan pixel ↔ the same place clicked on the base map */
+      addPin?: { px: number; py: number; lon: number; lat: number };
+      removePinId?: string;
       undoLastPin?: boolean;
       clearPins?: boolean;
       meta?: MapOverlayMeta;
@@ -544,50 +557,44 @@ async function startServer() {
       const m = req.body.matrix;
       evt.map.matrix = m;
       evt.map.cornersLonLat = matrixToCorners(m, evt.map.width, evt.map.height);
-      evt.map.gcps = [];
-      evt.map.rmsErrorM = undefined;
+      // Landmark pins stay: they are ground truth (pixel ↔ place), not a placement
+      evt.map.gcps = refreshPinResiduals(evt.map.gcps, m);
+      evt.map.rmsErrorM = pinsRms(evt.map.gcps);
       evt.map.rotationDeg =
         Math.round(((Math.atan2(m[3], m[0]) * 180) / Math.PI) * 10) / 10;
     } else if (req.body.clearPins) {
       evt.map.gcps = [];
       evt.map.rmsErrorM = undefined;
-    } else if (req.body.undoLastPin) {
-      const clean = evt.map.gcps.filter((g) => !g.id.startsWith('gcp-auto-'));
-      clean.pop();
-      evt.map.gcps = clean;
-      if (clean.length >= 2) {
-        const sol = solveGeoref(
-          clean,
-          evt.map.width,
-          evt.map.height,
-          clean.length >= 3 ? 'affine' : 'similarity'
-        );
-        if (sol) {
-          evt.map.gcps = sol.gcpsWithResiduals;
-          evt.map.matrix = sol.matrix;
-          evt.map.cornersLonLat = sol.cornersLonLat;
-          evt.map.rmsErrorM = sol.rmsErrorM;
-          evt.map.rotationDeg = sol.rotationDeg;
+    } else if (req.body.undoLastPin || req.body.removePinId || req.body.addPin) {
+      let pins = evt.map.gcps.filter((g) => !g.id.startsWith('gcp-auto-'));
+      if (req.body.undoLastPin) pins = pins.slice(0, -1);
+      if (req.body.removePinId) pins = pins.filter((g) => g.id !== req.body.removePinId);
+      if (req.body.addPin) {
+        const { px, py, lon, lat } = req.body.addPin;
+        if (![px, py, lon, lat].every(Number.isFinite) || Math.abs(lat) > 85) {
+          return reply.code(400).send({ error: 'Некорректная точка привязки' });
         }
+        pins.push({
+          id: `pin-${makeId(6)}`,
+          label: `Точка ${pins.length + 1}`,
+          px: Math.round(px * 10) / 10,
+          py: Math.round(py * 10) / 10,
+          lon: Number(lon.toFixed(7)),
+          lat: Number(lat.toFixed(7)),
+        });
       }
-    } else if (req.body.addPin) {
-      const pinned = addPinMapToTrack(
-        evt.map.matrix,
-        evt.map.gcps,
-        evt.map.width,
-        evt.map.height,
-        req.body.addPin.mapLonLat,
-        req.body.addPin.trackLonLat,
-        `pin-${makeId(6)}`
-      );
-      if (pinned) {
-        evt.map.gcps = pinned.gcps;
-        evt.map.matrix = pinned.matrix;
-        evt.map.cornersLonLat = pinned.cornersLonLat;
-        evt.map.rmsErrorM = pinned.rmsErrorM;
-        evt.map.rotationDeg = pinned.rotationDeg;
-        evt.map.transformType =
-          pinned.gcps.length >= 3 ? 'affine' : 'similarity';
+      const sol = solvePins(pins, evt.map.matrix);
+      if (sol) {
+        evt.map.gcps = sol.pins;
+        evt.map.matrix = sol.matrix;
+        evt.map.cornersLonLat = matrixToCorners(sol.matrix, evt.map.width, evt.map.height);
+        evt.map.rmsErrorM = sol.pins.length >= 2 ? sol.rmsErrorM : undefined;
+        evt.map.rotationDeg =
+          Math.round(((Math.atan2(sol.matrix[3], sol.matrix[0]) * 180) / Math.PI) * 10) / 10;
+        evt.map.transformType = sol.mode === 'affine' ? 'affine' : 'similarity';
+      } else {
+        evt.map.gcps = pins;
+        evt.map.rmsErrorM = undefined;
       }
     } else {
       const res = nudgeMapMatrix(
@@ -608,6 +615,11 @@ async function startServer() {
     if (!isUsableMatrix(evt.map.matrix)) {
       evt.map = previousMap;
       return reply.code(400).send({ error: 'Некорректные параметры подгонки карты' });
+    }
+    // Pins stay valid whatever moved the map; show how far each one is off now
+    if (evt.map.gcps.length > 0 && evt.map.matrix) {
+      evt.map.gcps = refreshPinResiduals(evt.map.gcps, evt.map.matrix);
+      evt.map.rmsErrorM = pinsRms(evt.map.gcps);
     }
 
     const metaError = applyMapMeta(evt.map, req.body.meta);
