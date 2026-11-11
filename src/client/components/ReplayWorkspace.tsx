@@ -91,7 +91,12 @@ import {
   buildGhostTracksGeoJson,
   fitMapToTracksOrMap,
 } from '../map/mapLayers.js';
-import { courseCamera, legCamera, replayPoints } from '../map/videoCamera.js';
+import {
+  courseCamera,
+  legCamera,
+  legRunnerIds,
+  replayPoints,
+} from '../map/videoCamera.js';
 // Map fitting UI is only needed for orienteering maps: loaded on first use
 const FitPanel = React.lazy(() =>
   import('./FitPanel.js').then((m) => ({ default: m.FitPanel }))
@@ -206,6 +211,9 @@ export const ReplayWorkspace: React.FC<Props> = ({
   // Videos: turn the map to fit the frame (a leg: A on the left, B on the right)
   const [recordRotateMap, setRecordRotateMap] = useState<boolean>(true);
   const recordPrevBearingRef = useRef<number | null>(null);
+  // A leg video shows only the runners who ran that leg, and ends when the last of them is at B
+  const recordOnlyIdsRef = useRef<Set<string> | null>(null);
+  const recordStopAtRef = useRef<number | null>(null);
   // Bumped once the run to record is set up: recording starts on the next render's data
   const [recordArm, setRecordArm] = useState<number>(0);
   const recorderRef = useRef<ReplayVideoRecorder | null>(null);
@@ -651,10 +659,12 @@ export const ReplayWorkspace: React.FC<Props> = ({
     const tick = (nowMs: number) => {
       if (lastFrameMsRef.current !== null) {
         const dtSec = ((nowMs - lastFrameMsRef.current) / 1000) * playbackRate;
-        const next = Math.min(totalDurationSec, raceTimeRef.current + dtSec);
+        // A leg video stops when its runners are at B, before the timeline's own end
+        const endSec = Math.min(totalDurationSec, recordStopAtRef.current ?? Infinity);
+        const next = Math.min(endSec, raceTimeRef.current + dtSec);
         raceTimeRef.current = next;
         drawFrameRef.current(next);
-        if (next >= totalDurationSec) {
+        if (next >= endSec) {
           setRaceTimeSec(next);
           setIsPlaying(false);
           return;
@@ -749,6 +759,8 @@ export const ReplayWorkspace: React.FC<Props> = ({
         recorderRef.current = null;
         setRecordPhase('idle');
       }
+      recordOnlyIdsRef.current = null;
+      recordStopAtRef.current = null;
       for (const m of runnerMarkersRef.current.values()) m.remove();
       runnerMarkersRef.current.clear();
       anchorMarkerRef.current?.remove();
@@ -1502,8 +1514,9 @@ export const ReplayWorkspace: React.FC<Props> = ({
   drawFrameRef.current = (t: number) => {
     const map = mapRef.current;
     if (!map || !mapReadyRef.current) return;
+    const only = recordOnlyIdsRef.current;
     lastRunnersRef.current = drawRunnersFrame(map, runnerMarkersRef.current, {
-      participants: displayParticipants,
+      participants: only ? displayParticipants.filter((p) => only.has(p.id)) : displayParticipants,
       raceTimeSec: t,
       tailLengthSec,
       timeMode: event.timeMode,
@@ -1913,6 +1926,40 @@ export const ReplayWorkspace: React.FC<Props> = ({
       return;
     }
     recordPrevBearingRef.current = null;
+    // A leg: only the runners who went from A to B (see legRunnerIds), up to the last one at B
+    let runParticipants = displayParticipants;
+    if (selectedLeg) {
+      const ids = legRunnerIds(displayParticipants, selectedLeg.startLonLat, selectedLeg.endLonLat);
+      if (ids.size > 0) {
+        runParticipants = displayParticipants.filter((p) => ids.has(p.id));
+        recordOnlyIdsRef.current = ids;
+        recordStopAtRef.current = Math.ceil(
+          Math.max(
+            ...runParticipants.map((p) => {
+              const endT = Math.min(p.trimEndSec, p.durationSec);
+              const finishPt =
+                [...p.points].reverse().find((pt) => pt.t <= endT) ??
+                p.points[p.points.length - 1];
+              return raceTimeOfTrackPoint(
+                p,
+                finishPt,
+                event.timeMode,
+                eventEpochZeroMs,
+                speedNormMode,
+                groupReferenceSpeedMs
+              );
+            })
+          )
+        );
+      } else {
+        // Nobody passed near both A and B: frame just the two points
+        runParticipants = [];
+      }
+      // The common start dot averages everyone's start: only the leg's runners count (≈ A)
+      (map.getSource('common-start') as maplibregl.GeoJSONSource | undefined)?.setData(
+        buildCommonStartGeoJson(runParticipants)
+      );
+    }
     if (recordFitView) {
       // The run fills the frame: a leg with A near the left edge and B near the right one,
       // the whole course turned the way it is largest; every runner's path stays in view
@@ -1926,7 +1973,7 @@ export const ReplayWorkspace: React.FC<Props> = ({
         right: Math.max(110, view.width * 0.09),
       };
       const opts = { rotate: recordRotateMap, maxZoom: 18 };
-      const path = replayPoints(displayParticipants);
+      const path = replayPoints(runParticipants);
       const cam = selectedLeg
         ? legCamera(selectedLeg.startLonLat, selectedLeg.endLonLat, path, view, pad, opts)
         : courseCamera(
@@ -1947,7 +1994,10 @@ export const ReplayWorkspace: React.FC<Props> = ({
     seekTo(0);
     drawFrameRef.current(0);
     await waitForMapIdle(map, 8000);
-    if (mapRef.current !== map) return;
+    if (mapRef.current !== map) {
+      clearVideoRun();
+      return;
+    }
 
     const label = currentRunLabel();
     const scene: VideoScene = {
@@ -1970,7 +2020,7 @@ export const ReplayWorkspace: React.FC<Props> = ({
     try {
       rec = new ReplayVideoRecorder(map, scene, () => ({
         raceTimeSec: raceTimeRef.current,
-        totalSec: videoClockRef.current.totalSec,
+        totalSec: recordStopAtRef.current ?? videoClockRef.current.totalSec,
         playbackRate: videoClockRef.current.playbackRate,
         runners: lastRunnersRef.current,
       }));
@@ -1978,6 +2028,7 @@ export const ReplayWorkspace: React.FC<Props> = ({
     } catch (e) {
       setRecordError(`Не удалось начать запись: ${(e as Error).message}`);
       setRecordPhase('idle');
+      clearVideoRun();
       return;
     }
     recorderRef.current = rec;
@@ -2004,6 +2055,7 @@ export const ReplayWorkspace: React.FC<Props> = ({
     recorderRef.current = null;
     const blob = await rec.stop();
     setRecordPhase('idle');
+    clearVideoRun();
     // The leg was turned A → B for the video: back to how the map was
     const prevBearing = recordPrevBearingRef.current;
     recordPrevBearingRef.current = null;
@@ -2013,6 +2065,16 @@ export const ReplayWorkspace: React.FC<Props> = ({
       return;
     }
     downloadBlob(blob, recordFileNameRef.current);
+  }
+
+  /** Back to the normal replay: every runner, the whole timeline */
+  function clearVideoRun() {
+    recordOnlyIdsRef.current = null;
+    recordStopAtRef.current = null;
+    drawFrameRef.current(raceTimeRef.current);
+    (mapRef.current?.getSource('common-start') as maplibregl.GeoJSONSource | undefined)?.setData(
+      buildCommonStartGeoJson(displayParticipantsRef.current)
+    );
   }
 
   // Playback stopped (reached the end or paused) while recording → save the video

@@ -1,3 +1,4 @@
+import { haversineDistanceM } from '../../shared/georef.js';
 import type { ParticipantTrack } from '../../shared/types.js';
 
 /**
@@ -42,6 +43,38 @@ export function replayPoints(participants: ParticipantTrack[]): LonLat[] {
     }
   }
   return out;
+}
+
+/**
+ * Who really ran the leg A → B: their replayed part (between the trims) starts within
+ * `maxMissM` of A and ends within `maxMissM` of B. A → B trims every runner from the point
+ * closest to A to the one closest to B however far that is, so someone who never went there
+ * gets a "leg" across the whole area — such runners are left out of a leg video.
+ */
+export function legRunnerIds(
+  participants: ParticipantTrack[],
+  a: LonLat,
+  b: LonLat,
+  maxMissM = 60
+): Set<string> {
+  const ids = new Set<string>();
+  for (const p of participants) {
+    if (!p.visible || p.points.length < 2) continue;
+    const end = Math.min(p.trimEndSec, p.durationSec);
+    const first = p.points.find((pt) => pt.t >= p.trimStartSec);
+    let last = null as (typeof p.points)[number] | null;
+    for (let i = p.points.length - 1; i >= 0; i--) {
+      if (p.points[i].t <= end) {
+        last = p.points[i];
+        break;
+      }
+    }
+    if (!first || !last || last.t <= first.t) continue;
+    const missA = haversineDistanceM(a[0], a[1], first.lon, first.lat);
+    const missB = haversineDistanceM(b[0], b[1], last.lon, last.lat);
+    if (missA <= maxMissM && missB <= maxMissM) ids.add(p.id);
+  }
+  return ids;
 }
 
 /** Web Mercator in world units 0…1, y pointing south (as MapLibre's MercatorCoordinate) */

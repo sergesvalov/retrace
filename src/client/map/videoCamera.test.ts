@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
-import { courseCamera, legCamera, type VideoCamera } from './videoCamera.js';
+import type { ParticipantTrack } from '../../shared/types.js';
+import { courseCamera, legCamera, legRunnerIds, type VideoCamera } from './videoCamera.js';
 
 type LonLat = [number, number];
 const view = { width: 1000, height: 700 };
@@ -82,6 +83,35 @@ describe('legCamera', () => {
     });
     expect(cam.bearing).toBe(0);
     expectInside([metres(0, 0), metres(300, -400)], cam);
+  });
+});
+
+describe('legRunnerIds', () => {
+  /** A track along `pts` (one point every 10 s), trimmed to [trimStart, trimEnd] */
+  function track(id: string, pts: LonLat[], trimStart: number, trimEnd: number) {
+    return {
+      id,
+      visible: true,
+      trimStartSec: trimStart,
+      trimEndSec: trimEnd,
+      durationSec: (pts.length - 1) * 10,
+      points: pts.map(([lon, lat], i) => ({ lon, lat, t: i * 10 })),
+    } as unknown as ParticipantTrack;
+  }
+  const a = metres(0, 0);
+  const b = metres(200, 0);
+
+  it('keeps runners whose replayed part goes from A to B, drops the ones who were elsewhere', () => {
+    const ran = track('ran', [metres(-100, 0), metres(5, 3), metres(100, 40), metres(195, -4)], 10, 30);
+    // Trimmed "from the point closest to A to the one closest to B" — 400 m away from both
+    const elsewhere = track('elsewhere', [metres(0, -400), metres(300, -900), metres(200, -400)], 0, 20);
+    const ids = legRunnerIds([ran, elsewhere], a, b);
+    expect([...ids]).toEqual(['ran']);
+  });
+
+  it('drops a runner who reached A but stopped short of B', () => {
+    const short = track('short', [metres(0, 5), metres(60, 10), metres(90, 10)], 0, 20);
+    expect(legRunnerIds([short], a, b).size).toBe(0);
   });
 });
 
