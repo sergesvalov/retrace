@@ -64,6 +64,8 @@ import {
   correctTrackToControls,
 } from '../../shared/course.js';
 import { readImageDpi } from '../imageDpi.js';
+import { detectCirclesOnScan } from '../detectCircles.js';
+import { autoGeoref } from '../../shared/autoGeoref.js';
 import { useCourseOverlay } from './useCourseOverlay.js';
 import { SplitsPanel } from './SplitsPanel.js';
 import { FitPanel } from './FitPanel.js';
@@ -121,6 +123,13 @@ export const ReplayWorkspace: React.FC<Props> = ({
   const [uploadError, setUploadError] = useState<string | null>(null);
   const [dropActive, setDropActive] = useState<boolean>(false);
   const [autoFitInfo, setAutoFitInfo] = useState<{ ok: boolean; text: string } | null>(null);
+  // Fully automatic georeferencing (circles on the scan ↔ tracks)
+  const [autoGeorefState, setAutoGeorefState] = useState<{
+    busy: boolean;
+    ok: boolean | null;
+    text: string;
+  } | null>(null);
+  const autoGeorefRunningRef = useRef(false);
 
   // Interactive Map Fitting state (drag map directly with mouse + sliders around Start anchor)
   const [dragMovesMap, setDragMovesMap] = useState<boolean>(true);
@@ -302,6 +311,7 @@ export const ReplayWorkspace: React.FC<Props> = ({
     setCourseEdit(false);
     setNextIsFinish(false);
     setAutoFitInfo(null);
+    setAutoGeorefState(null);
   }, [event.id]);
 
   // Each event kind starts on its own default base map (also when the kind is switched)
@@ -1194,6 +1204,109 @@ export const ReplayWorkspace: React.FC<Props> = ({
     });
   }
 
+  /**
+   * Fully automatic georeferencing: find the course circles on the scan and the placement
+   * where the runners pass through them. `quiet` = triggered by an upload: only a confident
+   * result is applied and a failure is reported without fuss.
+   */
+  async function runAutoGeoref(quiet = false) {
+    const evt = eventRef.current;
+    const meta = evt.map;
+    if (!meta || autoGeorefRunningRef.current) return;
+    if (evt.participants.length === 0) {
+      if (!quiet) {
+        setAutoGeorefState({ busy: false, ok: false, text: 'Сначала загрузите треки участников.' });
+      }
+      return;
+    }
+    autoGeorefRunningRef.current = true;
+    setAutoGeorefState({ busy: true, ok: null, text: 'Ищу кружки КП на скане…' });
+    // let the status paint before the CPU-heavy part
+    await new Promise((r) => setTimeout(r, 30));
+    try {
+      const circles = await detectCirclesOnScan(meta.imageUrl, meta.width, meta.scanDpi);
+      if (circles.length < 3) {
+        setAutoGeorefState({
+          busy: false,
+          ok: false,
+          text: `На скане не нашлось кружков дистанции (найдено: ${circles.length}). Нужна карта с фиолетовой надпечаткой КП — иначе подгоните по приметным местам.`,
+        });
+        return;
+      }
+      setAutoGeorefState({
+        busy: true,
+        ok: null,
+        text: `Найдено кружков: ${circles.length}. Сопоставляю с треками…`,
+      });
+      await new Promise((r) => setTimeout(r, 30));
+
+      const hint =
+        meta.printScale && meta.scanDpi
+          ? groundMetersPerPixelFromPrint(meta.printScale, meta.scanDpi)
+          : null;
+      const res = autoGeoref({
+        circles,
+        participants: eventRef.current.participants,
+        declinationDeg: meta.declinationDeg ?? autoDeclinationDeg,
+        groundMPerPxHint: hint,
+      });
+      const matched = res?.matchedCircles.length ?? 0;
+      const confident =
+        res !== null &&
+        matched >= (quiet ? 4 : 3) &&
+        res.rmsM <= 15 &&
+        (!quiet || matched >= Math.min(circles.length, 0.5 * circles.length + 1));
+      if (!res || !confident) {
+        setAutoGeorefState({
+          busy: false,
+          ok: false,
+          text: `Не получилось уверенно сопоставить ${circles.length} кружков с треками${
+            res ? ` (совпало ${matched})` : ''
+          }. Подвиньте карту примерно на место и используйте «🎯 по КП» или точки привязки.`,
+        });
+        return;
+      }
+      if (eventRef.current.id !== evt.id) return;
+
+      // Apply: placement first, then (if empty) the course built from the circles
+      const map = mapRef.current;
+      liveMatrixRef.current = res.matrix;
+      (map?.getSource('custom-map') as maplibregl.ImageSource | undefined)?.setCoordinates(
+        matrixToCorners(res.matrix, meta.width, meta.height)
+      );
+      syncCourseToMatrix(res.matrix);
+      resetRelativeSliders();
+      setAnchorLonLat(null);
+      await saveMatrixToServer(res.matrix, {
+        imageKind: 'orienteering',
+        declinationDeg: meta.declinationDeg ?? autoDeclinationDeg,
+        ...(res.impliedPrintScale ? { printScale: res.impliedPrintScale } : {}),
+      });
+      const courseCreated = courseControlsRef.current.length === 0;
+      if (courseCreated) await saveCourse(res.controls);
+
+      setAutoGeorefState({
+        busy: false,
+        ok: true,
+        text:
+          `🪄 Готово: совпало ${matched} из ${circles.length} кружков, точность ±${
+            Math.round(res.rmsM * 10) / 10
+          } м${res.impliedPrintScale ? `, масштаб ≈1:${res.impliedPrintScale}` : ''}.` +
+          (courseCreated
+            ? ' Дистанция отмечена автоматически (порядок — по трекам): проверьте КП и старт.'
+            : ''),
+      });
+    } catch (err) {
+      setAutoGeorefState({
+        busy: false,
+        ok: false,
+        text: err instanceof Error ? err.message : 'Автоподгонка не удалась',
+      });
+    } finally {
+      autoGeorefRunningRef.current = false;
+    }
+  }
+
   /** Add / remove landmark pins; the server re-solves the placement from all pins */
   async function sendPinChange(body: {
     addPin?: { px: number; py: number; lon: number; lat: number };
@@ -1555,6 +1668,16 @@ export const ReplayWorkspace: React.FC<Props> = ({
       if (mapRef.current) {
         fitMapToTracksOrMap(mapRef.current, latestEvent);
       }
+      // A scan nobody placed by hand yet: try to put it on the tracks automatically
+      if (
+        eventKindOf(latestEvent) === 'orienteering' &&
+        latestEvent.map &&
+        !latestEvent.map.manuallyPlaced &&
+        latestEvent.participants.length > 0
+      ) {
+        eventRef.current = latestEvent;
+        void runAutoGeoref(true);
+      }
     } catch {
       setUploadError('Не удалось загрузить трек (нет связи с сервером)');
     } finally {
@@ -1631,6 +1754,10 @@ export const ReplayWorkspace: React.FC<Props> = ({
         prevStretchPctRef.current = 0;
         onEventUpdated(data.event);
         onToggleFitMap?.(true);
+        if (data.event?.participants?.length > 0) {
+          eventRef.current = data.event;
+          void runAutoGeoref(true);
+        }
       } else {
         const data = await res.json().catch(() => ({}));
         setUploadError(data.error || 'Не удалось загрузить карту');
@@ -2160,6 +2287,8 @@ export const ReplayWorkspace: React.FC<Props> = ({
                 onEditCourse={() => setCourseEdit(true)}
                 onAutoFitCourse={autoFitMapToCourse}
                 autoFitInfo={autoFitInfo}
+                autoGeorefState={autoGeorefState}
+                onAutoGeoref={() => void runAutoGeoref(false)}
                 pins={event.map?.gcps ?? []}
                 pinStage={
                   snapStage === 'pin_map' || snapStage === 'pin_base' ? snapStage : null

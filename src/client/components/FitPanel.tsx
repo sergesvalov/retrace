@@ -36,6 +36,10 @@ interface Props {
   onAutoFitCourse: () => void;
   autoFitInfo: { ok: boolean; text: string } | null;
 
+  /** Fully automatic: course circles found on the scan ↔ tracks */
+  autoGeorefState: { busy: boolean; ok: boolean | null; text: string } | null;
+  onAutoGeoref: () => void;
+
   /** Landmark pins: scan point ↔ the same place on the base map */
   pins: GCP[];
   pinStage: 'pin_map' | 'pin_base' | null;
@@ -169,6 +173,35 @@ export const FitPanel: React.FC<Props> = (p) => {
           <Crosshair className="w-3.5 h-3.5" />
           Перенести сюда
         </button>
+      </div>
+
+      {/* Fully automatic: circles on the scan ↔ tracks */}
+      <div className="p-2.5 rounded-xl bg-emerald-950/40 border border-emerald-500/40 space-y-2">
+        <div className="font-semibold text-emerald-200">🪄 Полностью автоматически</div>
+        <div className="text-slate-300">
+          Находит кружки КП на скане и ставит карту так, чтобы через них прошли все треки.
+          Масштаб и поворот определяются сами; дистанция отмечается по порядку прохождения.
+        </div>
+        <button
+          onClick={p.onAutoGeoref}
+          disabled={p.autoGeorefState?.busy}
+          className="w-full px-2.5 py-1.5 rounded-lg bg-emerald-600 hover:bg-emerald-500 disabled:opacity-60 text-white font-semibold"
+        >
+          {p.autoGeorefState?.busy ? 'Подгоняю…' : '🪄 Подогнать автоматически'}
+        </button>
+        {p.autoGeorefState && (
+          <div
+            className={
+              p.autoGeorefState.ok === null
+                ? 'text-slate-300'
+                : p.autoGeorefState.ok
+                  ? 'text-emerald-300'
+                  : 'text-amber-300'
+            }
+          >
+            {p.autoGeorefState.text}
+          </div>
+        )}
       </div>
 
       {/* Fastest: fit from the course controls and the tracks */}
