@@ -41,6 +41,8 @@ import {
   eventKindOf,
   type BaseLayer,
   type CourseControl,
+  type GroundControl,
+  type GroundCourseDef,
   type MapImageKind,
   type MapOverlayMeta,
   type ParticipantTrack,
@@ -63,7 +65,16 @@ import {
   courseToGround,
   GROUND_MATRIX,
   groundToCourse,
+  type ParticipantSplits,
 } from '../../shared/course.js';
+import {
+  addCourse,
+  applyCourseEdit,
+  assignRunnersToCourses,
+  removeCourse,
+  resolveCourses,
+  SINGLE_COURSE_ID,
+} from '../../shared/courses.js';
 
 type Matrix = [number, number, number, number, number, number];
 import { readImageDpi } from '../imageDpi.js';
@@ -72,6 +83,7 @@ import { SplitsPanel } from './SplitsPanel.js';
 import { SpeedComparisonChart } from './SpeedComparisonChart.js';
 import { ParticipantCard } from './ParticipantCard.js';
 import { MapBanners, type SnapStage } from './MapBanners.js';
+import { CourseTabs } from './CourseTabs.js';
 import { VideoMenu, type RecordPhase, type VideoTarget } from './VideoMenu.js';
 import { drawRunnersFrame } from '../map/runnerMarkers.js';
 import {
@@ -413,14 +425,30 @@ export const ReplayWorkspace: React.FC<Props> = ({
   // Marked on the base map (no scan needed) or drawn on the scan: see courseOnGround
   const groundCourse = isOrienteering && courseOnGround(event);
   const courseMatrix = groundCourse ? GROUND_MATRIX : event.map?.matrix;
+  // Courses A, B, C… on one area (a course marked on the ground): shared start and finish
+  const areaCourses = useMemo(
+    () => (groundCourse ? resolveCourses(event.course ?? [], event.courses) : null),
+    [groundCourse, event.course, event.courses]
+  );
+  const multiCourse = groundCourse && (event.courses?.length ?? 0) > 0;
+  const [activeCourseId, setActiveCourseId] = useState<string>(SINGLE_COURSE_ID);
+  // Several courses: the next КП is common to all courses (or only for the shown one)
+  const [nextControlCommon, setNextControlCommon] = useState<boolean>(false);
+  const nextControlCommonRef = useRef(nextControlCommon);
+  nextControlCommonRef.current = nextControlCommon;
+  // The course shown, edited and analysed (splits, legs, videos)
+  const activeCourse =
+    areaCourses?.find((c) => c.id === activeCourseId) ?? areaCourses?.[0] ?? null;
+  const activeCourseIdRef = useRef(activeCourse?.id ?? SINGLE_COURSE_ID);
+  activeCourseIdRef.current = activeCourse?.id ?? SINGLE_COURSE_ID;
   const courseControls = useMemo<CourseControl[]>(
     () =>
       !isOrienteering
         ? []
-        : groundCourse
-          ? groundToCourse(event.course ?? [])
+        : areaCourses
+          ? groundToCourse(activeCourse?.controls ?? [])
           : event.map?.controls ?? [],
-    [isOrienteering, groundCourse, event.course, event.map?.controls]
+    [isOrienteering, areaCourses, activeCourse, event.map?.controls]
   );
   const courseLL = useMemo<[number, number][]>(
     () =>
@@ -429,24 +457,78 @@ export const ReplayWorkspace: React.FC<Props> = ({
         : [],
     [courseControls, courseMatrix]
   );
-  const splits = useMemo(
+  // Controls of the area not on the shown course (other courses): drawn faded
+  const otherCourseControls = useMemo<CourseControl[]>(() => {
+    if (!multiCourse || !activeCourse) return [];
+    const shown = new Set(activeCourse.controls.map((c) => c.id));
+    return groundToCourse(
+      (event.course ?? []).filter((c) => c.kind === 'control' && !shown.has(c.id))
+    );
+  }, [multiCourse, activeCourse, event.course]);
+  // Which course each runner ran (several courses only): punched controls, or set by hand
+  const runnerCourse = useMemo(
     () =>
-      courseMatrix && courseControls.length >= 2
-        ? computeSplits(event.participants, courseControls, courseMatrix)
-        : [],
-    [event.participants, courseControls, courseMatrix]
+      multiCourse && areaCourses
+        ? assignRunnersToCourses(
+            event.participants,
+            areaCourses.map((c) => ({ id: c.id, controls: groundToCourse(c.controls) })),
+            GROUND_MATRIX
+          )
+        : null,
+    [multiCourse, areaCourses, event.participants]
   );
-  // Tracks as drawn and replayed: with the adjustment to the controls when it is on
+  // Splits of every course, each over its own runners (one course: everyone)
+  const courseRuns = useMemo(() => {
+    if (!courseMatrix) return [];
+    if (!multiCourse || !areaCourses || !runnerCourse) {
+      return [
+        {
+          id: activeCourse?.id ?? SINGLE_COURSE_ID,
+          ll: courseLL,
+          splits:
+            courseControls.length >= 2
+              ? computeSplits(event.participants, courseControls, courseMatrix)
+              : [],
+        },
+      ];
+    }
+    return areaCourses.map((c) => {
+      const controls = groundToCourse(c.controls);
+      const runners = event.participants.filter((p) => runnerCourse.get(p.id) === c.id);
+      return {
+        id: c.id,
+        ll: controlsLonLat(controls, GROUND_MATRIX),
+        splits: controls.length >= 2 ? computeSplits(runners, controls, GROUND_MATRIX) : [],
+      };
+    });
+  }, [
+    courseMatrix,
+    multiCourse,
+    areaCourses,
+    runnerCourse,
+    activeCourse,
+    courseLL,
+    courseControls,
+    event.participants,
+  ]);
+  const splits = useMemo<ParticipantSplits[]>(
+    () => courseRuns.find((r) => r.id === activeCourse?.id)?.splits ?? courseRuns[0]?.splits ?? [],
+    [courseRuns, activeCourse]
+  );
+  // Tracks as drawn and replayed: with the adjustment to the controls when it is on (each
+  // runner onto the controls of their own course)
   const displayParticipants = useMemo<ParticipantTrack[]>(() => {
-    if (!trackCorrection || splits.length === 0) return event.participants;
-    const byId = new Map(splits.map((s) => [s.participantId, s]));
+    if (!trackCorrection) return event.participants;
+    const byId = new Map<string, { s: ParticipantSplits; ll: [number, number][] }>();
+    for (const run of courseRuns) for (const s of run.splits) byId.set(s.participantId, { s, ll: run.ll });
+    if (byId.size === 0) return event.participants;
     return event.participants.map((p) => {
-      const s = byId.get(p.id);
-      return s
-        ? { ...p, points: correctTrackToControls(p.points, s.passages, courseLL) }
+      const hit = byId.get(p.id);
+      return hit
+        ? { ...p, points: correctTrackToControls(p.points, hit.s.passages, hit.ll) }
         : p;
     });
-  }, [event.participants, splits, courseLL, trackCorrection]);
+  }, [event.participants, courseRuns, trackCorrection]);
   const displayParticipantsRef = useRef(displayParticipants);
   displayParticipantsRef.current = displayParticipants;
   const courseLabels = useMemo(() => controlLabels(courseControls), [courseControls]);
@@ -454,9 +536,14 @@ export const ReplayWorkspace: React.FC<Props> = ({
   const videoLegNames = useMemo(
     () =>
       splits.length > 0 && courseLL.length >= 2
-        ? courseLabels.slice(0, -1).map((l, k) => `${l} → ${courseLabels[k + 1]}`)
+        ? courseLabels
+            .slice(0, -1)
+            .map(
+              (l, k) =>
+                `${multiCourse && activeCourse ? `${activeCourse.name}: ` : ''}${l} → ${courseLabels[k + 1]}`
+            )
         : [],
-    [splits, courseLL, courseLabels]
+    [splits, courseLL, courseLabels, multiCourse, activeCourse]
   );
   const videoLegMaxSec = useMemo(
     () =>
@@ -474,6 +561,7 @@ export const ReplayWorkspace: React.FC<Props> = ({
     mapReadyRef,
     mapLoadCount,
     controls: courseControls,
+    otherControls: otherCourseControls,
     matrix: courseMatrix,
     visible: isOrienteering && Boolean(courseMatrix),
     editable: courseEdit,
@@ -493,15 +581,46 @@ export const ReplayWorkspace: React.FC<Props> = ({
     if (!groundCourseRef.current) syncScanCourseToMatrix(m);
   };
 
-  async function saveCourse(controls: CourseControl[]) {
+  /**
+   * Save an edit of the shown course (its points in order: start → controls → finish).
+   * `makeCommon`: controls to make common to all courses (several courses on the ground).
+   */
+  async function saveCourse(controls: CourseControl[], makeCommon: string[] = []) {
+    const evt = eventRef.current;
+    if (!courseOnGround(evt)) {
+      await putCourse({ controls });
+      return;
+    }
+    // On the ground the edit goes into the area: shared start/finish, controls of other courses.
+    // Pixels carry no "common" flag: take it from the area (or from makeCommon)
+    const pool = new Map((evt.course ?? []).map((c) => [c.id, c]));
+    const withFlags = (list: CourseControl[]) =>
+      courseToGround(list).map((c) =>
+        c.kind === 'control' && (pool.get(c.id)?.common || makeCommon.includes(c.id))
+          ? { ...c, common: true }
+          : c
+      );
+    const { points, courses } = applyCourseEdit(
+      evt.course ?? [],
+      evt.courses,
+      activeCourseIdRef.current,
+      withFlags(courseControlsRef.current),
+      withFlags(controls)
+    );
+    await saveArea(points, courses);
+  }
+
+  /** The whole area marked on the ground: its points and its courses (A, B, C…) */
+  function saveArea(points: GroundControl[], courses: GroundCourseDef[] | undefined) {
+    return putCourse({ ground: true, controls: points, courses: courses ?? [] });
+  }
+
+  async function putCourse(body: object) {
     const eventId = eventRef.current.id;
-    const ground = courseOnGround(eventRef.current);
     const res = await fetch(`/api/events/${eventId}/course`, {
       method: 'PUT',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(
-        ground ? { ground: true, controls: courseToGround(controls) } : { controls }
-      ),
+      body: JSON.stringify(body),
     });
     const data = await res.json().catch(() => ({}));
     if (!res.ok) {
@@ -540,20 +659,108 @@ export const ReplayWorkspace: React.FC<Props> = ({
     } else {
       const finish = current.find((c) => c.kind === 'finish');
       const rest = current.filter((c) => c.kind !== 'finish');
-      next = [...rest, newControl('control'), ...(finish ? [finish] : [])];
+      const added = sharedControlAt(lngLat) ?? newControl('control');
+      next = [...rest, added, ...(finish ? [finish] : [])];
+      // "Общий КП": the control goes onto every course
+      if (nextControlCommonRef.current && (eventRef.current.courses?.length ?? 0) > 0) {
+        void saveCourse(next, [added.id]);
+        return;
+      }
     }
     void saveCourse(next);
   }
 
-  /** Give everyone the punches of one leg (or the whole course) as their start/finish */
-  async function applyCourseTrims(fromIdx: number, toIdx: number) {
-    const trims = splits
+  /**
+   * Several courses on one area: a click on a control of another course (within ~18 px) adds
+   * that same control to the shown course instead of a new one next to it
+   */
+  function sharedControlAt(lngLat: [number, number]): CourseControl | null {
+    const evt = eventRef.current;
+    const map = mapRef.current;
+    if (!map || !courseOnGround(evt) || !evt.courses?.length) return null;
+    const inCourse = new Set(courseControlsRef.current.map((c) => c.id));
+    const click = map.project(lngLat);
+    let best: { c: GroundControl; d: number } | null = null;
+    for (const c of evt.course ?? []) {
+      if (c.kind !== 'control' || inCourse.has(c.id)) continue;
+      const p = map.project([c.lon, c.lat]);
+      const d = Math.hypot(p.x - click.x, p.y - click.y);
+      if (d <= 18 && (!best || d < best.d)) best = { c, d };
+    }
+    return best ? groundToCourse([best.c])[0] : null;
+  }
+
+  // ---- Courses A, B, C… on one area (marked on the ground) ----
+  function makeCourseId() {
+    return `course-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`;
+  }
+
+  async function handleAddCourse() {
+    const evt = eventRef.current;
+    const courses = addCourse(evt.course ?? [], evt.courses, makeCourseId);
+    await saveArea(evt.course ?? [], courses);
+    setActiveCourseId(courses[courses.length - 1].id);
+  }
+
+  async function handleRenameCourse(id: string) {
+    const evt = eventRef.current;
+    const course = evt.courses?.find((c) => c.id === id);
+    if (!course) return;
+    const name = window.prompt('Название трассы', course.name)?.trim().slice(0, 20);
+    if (!name || name === course.name) return;
+    await saveArea(
+      evt.course ?? [],
+      evt.courses!.map((c) => (c.id === id ? { ...c, name } : c))
+    );
+  }
+
+  async function handleRemoveCourse(id: string) {
+    const evt = eventRef.current;
+    const course = evt.courses?.find((c) => c.id === id);
+    if (!course || evt.courses!.length <= 1) return;
+    if (!window.confirm(`Удалить трассу ${course.name}? Её КП, которых нет на других трассах, тоже удалятся.`))
+      return;
+    const res = removeCourse(evt.course ?? [], evt.courses!, id);
+    await saveArea(res.points, res.courses);
+    setActiveCourseId(res.courses[0].id);
+  }
+
+  /** "Очистить": with several courses only the shown course's controls (start/finish are shared) */
+  function clearShownCourse() {
+    const multi = courseOnGround(eventRef.current) && (eventRef.current.courses?.length ?? 0) > 0;
+    const name = activeCourse?.name;
+    if (multi) {
+      if (!window.confirm(`Убрать все КП трассы ${name}? Старт и финиш общие — останутся.`)) return;
+      void saveCourse(courseControlsRef.current.filter((c) => c.kind !== 'control'));
+      return;
+    }
+    if (window.confirm('Удалить все КП дистанции?')) void saveCourse([]);
+  }
+
+  // Another course shown: a leg picked on the previous one means nothing here
+  useEffect(() => {
+    setSelectedLeg((leg) => (leg?.courseLegIdx !== undefined ? null : leg));
+  }, [activeCourse?.id]);
+
+  /** The punches of controls fromIdx and toIdx as start/finish of each runner in `rows` */
+  function punchTrims(rows: ParticipantSplits[], fromIdx: number, toIdx: number) {
+    return rows
       .filter((s) => s.passages[fromIdx]?.detected && s.passages[toIdx]?.detected)
       .map((s) => ({
         participantId: s.participantId,
         trimStartSec: Math.floor(s.passages[fromIdx].t),
         trimEndSec: Math.ceil(s.passages[toIdx].t),
       }));
+  }
+
+  /** Give everyone the punches of one leg (or the whole course) as their start/finish */
+  function applyCourseTrims(fromIdx: number, toIdx: number) {
+    return putTrims(punchTrims(splits, fromIdx, toIdx));
+  }
+
+  async function putTrims(
+    trims: { participantId: string; trimStartSec: number; trimEndSec: number }[]
+  ) {
     if (trims.length === 0) return;
     const res = await fetch(`/api/events/${event.id}/trims`, {
       method: 'PUT',
@@ -593,19 +800,25 @@ export const ReplayWorkspace: React.FC<Props> = ({
    * Whole course for everyone: from the first to the last control that every runner of this
    * course punched — someone may have started the watch after control 1 or stopped it before
    * the finish. Runners of another course (they punch few of these controls) are left as is.
+   * With several courses (A, B, C…) every runner gets the start and finish of their own course:
+   * they all run at once from the shared start.
    */
   function selectWholeCourse(): Promise<void> {
     setSelectedLeg(null);
     setCustomStartSpot(null);
-    const n = courseControls.length;
-    const onCourse = splits.filter(
-      (s) => s.passages.filter((p) => p.detected).length >= n / 2
-    );
-    let from = 0;
-    while (from < n - 1 && onCourse.some((s) => !s.passages[from].detected)) from++;
-    let to = n - 1;
-    while (to > from && onCourse.some((s) => !s.passages[to].detected)) to--;
-    return applyCourseTrims(from, to);
+    const trims = courseRuns.flatMap(({ splits: rows }) => {
+      const n = rows[0]?.passages.length ?? 0;
+      if (n < 2) return [];
+      const onCourse = rows.filter(
+        (s) => s.passages.filter((p) => p.detected).length >= n / 2
+      );
+      let from = 0;
+      while (from < n - 1 && onCourse.some((s) => !s.passages[from].detected)) from++;
+      let to = n - 1;
+      while (to > from && onCourse.some((s) => !s.passages[to].detected)) to--;
+      return punchTrims(rows, from, to);
+    });
+    return putTrims(trims);
   }
 
   // Compute detailed route-choice analytics when a leg (A -> B) is selected
@@ -1909,6 +2122,7 @@ export const ReplayWorkspace: React.FC<Props> = ({
     if (selectedLeg?.courseLegIdx !== undefined) {
       const k = selectedLeg.courseLegIdx;
       label = `Перегон ${name(courseLabels[k])} → ${name(courseLabels[k + 1])}`;
+      if (multiCourse && activeCourse) label = `Трасса ${activeCourse.name} · ${label}`;
     } else if (selectedLeg) {
       label = 'Перегон A → B';
     } else if (customStartSpot) {
@@ -2338,6 +2552,22 @@ export const ReplayWorkspace: React.FC<Props> = ({
             onNextIsStart={setNextIsStart}
             onNextIsFinish={setNextIsFinish}
             onSaveCourse={(controls) => void saveCourse(controls)}
+            onClearCourse={clearShownCourse}
+            courseName={multiCourse ? activeCourse?.name : undefined}
+            nextControlCommon={nextControlCommon}
+            onNextControlCommon={setNextControlCommon}
+            courseTabs={
+              groundCourse ? (
+                <CourseTabs
+                  courses={multiCourse ? event.courses ?? [] : []}
+                  activeId={activeCourse?.id ?? null}
+                  onSelect={setActiveCourseId}
+                  onAdd={() => void handleAddCourse()}
+                  onRename={(id) => void handleRenameCourse(id)}
+                  onRemove={(id) => void handleRemoveCourse(id)}
+                />
+              ) : undefined
+            }
             onAutoFitCourse={() => {
               autoFitMapToCourse();
               setCourseEdit(false);
@@ -2625,8 +2855,18 @@ export const ReplayWorkspace: React.FC<Props> = ({
           </div>
 
           {/* Course splits: who ran each leg how fast */}
-          {isOrienteering && courseControls.length >= 2 && (
+          {isOrienteering && (courseControls.length >= 2 || multiCourse) && (
             <SplitsPanel
+              courseTabs={
+                multiCourse ? (
+                  <CourseTabs
+                    courses={event.courses ?? []}
+                    activeId={activeCourse?.id ?? null}
+                    onSelect={setActiveCourseId}
+                  />
+                ) : undefined
+              }
+              courseName={multiCourse ? activeCourse?.name : undefined}
               splits={splits}
               labels={courseLabels}
               selectedLegIdx={selectedLeg?.courseLegIdx ?? null}
@@ -2759,6 +2999,8 @@ export const ReplayWorkspace: React.FC<Props> = ({
                   state={state}
                   rank={rank}
                   gapMeters={gapMeters}
+                  courses={multiCourse ? event.courses : undefined}
+                  courseId={runnerCourse?.get(p.id) ?? null}
                   onUpdate={(patch) => void updateParticipant(p.id, patch)}
                   onDelete={() => void deleteParticipant(p.id)}
                 />

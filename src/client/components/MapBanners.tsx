@@ -23,6 +23,15 @@ interface Props {
   onNextIsStart: (v: boolean | ((prev: boolean) => boolean)) => void;
   onNextIsFinish: (v: boolean | ((prev: boolean) => boolean)) => void;
   onSaveCourse: (controls: CourseControl[]) => void;
+  /** "Очистить" (asks for confirmation itself) */
+  onClearCourse: () => void;
+  /** Course switcher A | B | C + add (a course marked on the ground) */
+  courseTabs?: React.ReactNode;
+  /** Name of the shown course when there are several */
+  courseName?: string;
+  /** Several courses: the next КП is common to all of them */
+  nextControlCommon?: boolean;
+  onNextControlCommon?: (common: boolean) => void;
   onAutoFitCourse: () => void;
   onCourseEditDone: () => void;
   snapStage: SnapStage;
@@ -40,6 +49,11 @@ export const MapBanners: React.FC<Props> = ({
   onNextIsStart,
   onNextIsFinish,
   onSaveCourse,
+  onClearCourse,
+  courseTabs,
+  courseName,
+  nextControlCommon = false,
+  onNextControlCommon,
   onAutoFitCourse,
   onCourseEditDone,
   snapStage,
@@ -63,8 +77,13 @@ export const MapBanners: React.FC<Props> = ({
               ? courseControls.some((c) => c.kind === 'finish')
                 ? '◎ Кликните новое место ФИНИША — старый переедет'
                 : '◎ Кликните ФИНИШ на карте'
-              : `Кликните КП ${controlCount + 1} — КП встают по порядку, сколько угодно. Маркеры можно перетаскивать, правый клик — удалить`}
+              : courseName
+                ? nextControlCommon
+                  ? `Кликните ОБЩИЙ КП — он встанет во все трассы (в конец, перед финишем); бледный КП другой трассы кликом станет общим`
+                  : `Кликните КП ${controlCount + 1} трассы ${courseName} — по порядку, сколько угодно; бледный КП другой трассы берётся кликом по нему. Правый клик — убрать из трассы`
+                : `Кликните КП ${controlCount + 1} — КП встают по порядку, сколько угодно. Маркеры можно перетаскивать, правый клик — удалить`}
         </span>
+        {courseTabs}
         <div className="flex items-center gap-1.5">
           {/* What the next click places: start is always first, finish last, controls between */}
           <div className="flex items-center gap-0.5 p-0.5 rounded bg-slate-950 border border-slate-700">
@@ -93,18 +112,51 @@ export const MapBanners: React.FC<Props> = ({
               </button>
             ))}
           </div>
+          {/* Several courses: a new КП only for the shown course, or common to all courses */}
+          {courseName && onNextControlCommon && placing === 'control' && (
+            <div className="flex items-center gap-0.5 p-0.5 rounded bg-slate-950 border border-slate-700">
+              <button
+                onClick={() => onNextControlCommon(false)}
+                className={`px-2 py-0.5 rounded transition ${
+                  !nextControlCommon
+                    ? 'bg-fuchsia-500 text-white font-semibold'
+                    : 'text-fuchsia-200 hover:text-white'
+                }`}
+                title={`Новый КП — только на трассе ${courseName}`}
+              >
+                только {courseName}
+              </button>
+              <button
+                onClick={() => onNextControlCommon(true)}
+                className={`px-2 py-0.5 rounded transition ${
+                  nextControlCommon
+                    ? 'bg-fuchsia-500 text-white font-semibold'
+                    : 'text-fuchsia-200 hover:text-white'
+                }`}
+                title="Общий КП — на всех трассах (и на тех, что добавите потом); встаёт в конец, перед финишем"
+              >
+                общий
+              </button>
+            </div>
+          )}
           <button
-            onClick={() => onSaveCourse(courseControls.slice(0, -1))}
-            disabled={courseControls.length === 0}
+            onClick={() => {
+              if (!courseName) {
+                onSaveCourse(courseControls.slice(0, -1));
+                return;
+              }
+              // Several courses: start and finish are shared — take back this course's last КП
+              const last = courseControls.map((c) => c.kind).lastIndexOf('control');
+              if (last >= 0) onSaveCourse(courseControls.filter((_, i) => i !== last));
+            }}
+            disabled={courseName ? controlCount === 0 : courseControls.length === 0}
             className="px-2 py-0.5 rounded bg-slate-900 border border-slate-700 text-slate-200 hover:text-white disabled:opacity-40"
           >
             ↶ Убрать последний
           </button>
           <button
-            onClick={() => {
-              if (window.confirm('Удалить все КП дистанции?')) onSaveCourse([]);
-            }}
-            disabled={courseControls.length === 0}
+            onClick={onClearCourse}
+            disabled={courseName ? controlCount === 0 : courseControls.length === 0}
             className="px-2 py-0.5 rounded bg-slate-900 border border-slate-700 text-slate-400 hover:text-rose-300 disabled:opacity-40"
           >
             Очистить

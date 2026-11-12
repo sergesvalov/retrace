@@ -4,6 +4,10 @@ import { formatDuration } from '../../shared/trackParser.js';
 import { COURSE_COLOR } from './useCourseOverlay.js';
 
 interface Props {
+  /** Course switcher A | B | C when the area has several courses */
+  courseTabs?: React.ReactNode;
+  /** Name of the shown course when there are several */
+  courseName?: string;
   splits: ParticipantSplits[];
   labels: string[];
   selectedLegIdx: number | null;
@@ -18,6 +22,8 @@ interface Props {
  * fits the narrow sidebar. Clicking a leg replays everyone from its start control.
  */
 export const SplitsPanel: React.FC<Props> = ({
+  courseTabs,
+  courseName,
   splits,
   labels,
   selectedLegIdx,
@@ -26,7 +32,7 @@ export const SplitsPanel: React.FC<Props> = ({
   trackCorrection,
   onToggleTrackCorrection,
 }) => {
-  const legCount = labels.length - 1;
+  const legCount = Math.max(0, labels.length - 1);
   const cell = (
     time: number | null,
     rank: number | null,
@@ -73,15 +79,28 @@ export const SplitsPanel: React.FC<Props> = ({
           <button
             onClick={onWholeCourse}
             className="text-[11px] text-emerald-400 hover:underline"
-            title="Всем старт с треугольника и финиш на финише, время от 00:00"
+            title={
+              courseName
+                ? 'Все участники всех трасс: старт с общего треугольника, финиш на общем финише, время от 00:00'
+                : 'Всем старт с треугольника и финиш на финише, время от 00:00'
+            }
           >
             ⏱ Вся дистанция
           </button>
         </div>
       </div>
+      {courseTabs}
 
-      {splits.length === 0 ? (
-        <div className="text-slate-400">Загрузите треки участников</div>
+      {legCount === 0 ? (
+        <div className="text-slate-400">
+          Трасса {courseName} ещё не размечена: «◎ КП» над картой
+        </div>
+      ) : splits.length === 0 ? (
+        <div className="text-slate-400">
+          {courseName
+            ? `Трассу ${courseName} никто не бежал. Бегуна можно отнести к трассе в его карточке`
+            : 'Загрузите треки участников'}
+        </div>
       ) : (
         <div className="max-h-64 overflow-auto rounded-lg border border-slate-800">
           <table className="w-full border-collapse">

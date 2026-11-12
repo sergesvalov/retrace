@@ -46,6 +46,7 @@ import {
   type EventKind,
   type GCP,
   type GroundControl,
+  type GroundCourseDef,
   type MapOverlay,
   type MapOverlayMeta,
   type ParticipantTrack,
@@ -817,6 +818,7 @@ async function startServer() {
         | 'offsetSec'
         | 'trimStartSec'
         | 'trimEndSec'
+        | 'courseId'
       >
     >;
   }>('/api/events/:id/participants/:participantId', async (req, reply) => {
@@ -849,6 +851,12 @@ async function startServer() {
       p.trimStartSec = Math.max(0, Math.min(p.durationSec, body.trimStartSec));
     if (body.trimEndSec !== undefined)
       p.trimEndSec = Math.max(0, Math.min(p.durationSec, body.trimEndSec));
+    // Course set by hand ('' = detect it again from the punches)
+    if (body.courseId !== undefined) {
+      if (body.courseId === '') delete p.courseId;
+      else if (evt.courses?.some((c) => c.id === body.courseId)) p.courseId = body.courseId;
+      else return reply.code(400).send({ error: 'Нет такой трассы' });
+    }
 
     await saveEventToDisk(evt);
     return { event: toLiteEvent(evt) };
@@ -920,17 +928,22 @@ async function startServer() {
   });
 
   // Replace the course, in course order: controls drawn on the map image (pixels), or —
-  // with `ground: true`, or when there is no scan — controls marked on the base map (lon/lat)
+  // with `ground: true`, or when there is no scan — controls marked on the base map (lon/lat),
+  // optionally with `courses` (A, B, C… on that area, sharing its start and finish)
   app.put<{
     Params: { id: string };
-    Body: { ground?: boolean; controls?: (CourseControl | GroundControl)[] };
+    Body: {
+      ground?: boolean;
+      controls?: (CourseControl | GroundControl)[];
+      courses?: GroundCourseDef[];
+    };
   }>(
     '/api/events/:id/course',
     async (req, reply) => {
       const evt = eventsStore.get(req.params.id);
       if (!evt) return reply.code(404).send({ error: 'Событие не найдено' });
       const controls = req.body?.controls;
-      if (!Array.isArray(controls) || controls.length > 99) {
+      if (!Array.isArray(controls) || controls.length > 199) {
         return reply.code(400).send({ error: 'Некорректный список КП' });
       }
       const validId = (id: unknown) => typeof id === 'string' && id.length > 0 && id.length <= 40;
@@ -953,9 +966,49 @@ async function startServer() {
             kind: c.kind,
             lon: Math.round(c.lon * 1e7) / 1e7,
             lat: Math.round(c.lat * 1e7) / 1e7,
+            ...(c.kind === 'control' && c.common === true ? { common: true } : {}),
           });
         }
+
+        // Courses on the area: each lists area controls; one shared start and finish
+        const rawCourses = req.body?.courses;
+        let courses: GroundCourseDef[] | undefined;
+        if (rawCourses !== undefined) {
+          if (!Array.isArray(rawCourses) || rawCourses.length > 20) {
+            return reply.code(400).send({ error: 'Некорректный список трасс' });
+          }
+          const controlIds = new Set(ground.filter((c) => c.kind === 'control').map((c) => c.id));
+          courses = [];
+          for (const c of rawCourses) {
+            const ok =
+              c &&
+              validId(c.id) &&
+              typeof c.name === 'string' &&
+              c.name.trim().length > 0 &&
+              c.name.length <= 20 &&
+              Array.isArray(c.controlIds) &&
+              c.controlIds.length <= 99 &&
+              c.controlIds.every((id) => controlIds.has(id));
+            if (!ok) return reply.code(400).send({ error: 'Некорректная трасса' });
+            courses.push({ id: c.id, name: c.name.trim(), controlIds: [...c.controlIds] });
+          }
+          if (
+            courses.length > 0 &&
+            (ground.filter((c) => c.kind === 'start').length > 1 ||
+              ground.filter((c) => c.kind === 'finish').length > 1)
+          ) {
+            return reply.code(400).send({ error: 'Старт и финиш у трасс общие — по одному' });
+          }
+        }
+
         evt.course = ground;
+        if (courses !== undefined) {
+          if (courses.length > 0) evt.courses = courses;
+          else delete evt.courses;
+          // A runner's hand-set course must still exist
+          const ids = new Set(courses.map((c) => c.id));
+          for (const p of evt.participants) if (p.courseId && !ids.has(p.courseId)) delete p.courseId;
+        }
         await saveEventToDisk(evt);
         return { event: toLiteEvent(evt) };
       }

@@ -12,6 +12,10 @@ interface Props {
   state: InterpolatedState | null;
   rank: number;
   gapMeters: number;
+  /** Courses A, B, C… on the area (several courses only) */
+  courses?: { id: string; name: string }[];
+  /** The runner's course: set by hand or detected from the punches (null = none fits) */
+  courseId?: string | null;
   onUpdate: (patch: Partial<ParticipantTrack>) => void;
   onDelete: () => void;
 }
@@ -78,6 +82,8 @@ export const ParticipantCard: React.FC<Props> = ({
   state,
   rank,
   gapMeters,
+  courses,
+  courseId,
   onUpdate,
   onDelete,
 }) => (
@@ -103,6 +109,26 @@ export const ParticipantCard: React.FC<Props> = ({
             title="Изменить цвет трека"
           />
           <RunnerName name={p.name} onRename={(name) => onUpdate({ name })} />
+          {courses && courses.length > 0 && (
+            // Course: detected from the punches ("авто") or set by hand
+            <select
+              value={p.courseId ?? ''}
+              onChange={(e) => onUpdate({ courseId: e.target.value })}
+              className="shrink-0 bg-slate-950 border border-fuchsia-500/40 rounded px-1 py-0.5 text-[11px] text-fuchsia-200"
+              title="Трасса бегуна: «авто» — по отмеченным КП, или выберите сами"
+            >
+              <option value="">
+                {p.courseId
+                  ? 'авто'
+                  : `авто: ${courses.find((c) => c.id === courseId)?.name ?? '—'}`}
+              </option>
+              {courses.map((c) => (
+                <option key={c.id} value={c.id}>
+                  Трасса {c.name}
+                </option>
+              ))}
+            </select>
+          )}
         </div>
 
         <div className="flex items-center gap-1">

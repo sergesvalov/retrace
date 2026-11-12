@@ -10,6 +10,7 @@ type Matrix = [number, number, number, number, number, number];
 export const COURSE_COLOR = '#c026d3';
 const SOURCE_ID = 'course-lines';
 const LAYER_ID = 'course-lines-layer';
+const NO_CONTROLS: CourseControl[] = [];
 
 interface Options {
   mapRef: React.MutableRefObject<maplibregl.Map | null>;
@@ -17,6 +18,8 @@ interface Options {
   /** Increments on every MapLibre 'load' (the map is recreated per event) */
   mapLoadCount: number;
   controls: CourseControl[];
+  /** Controls of the other courses on the area: drawn faded, unnumbered, not editable */
+  otherControls?: CourseControl[];
   matrix: Matrix | undefined;
   visible: boolean;
   editable: boolean;
@@ -34,6 +37,7 @@ export function useCourseOverlay({
   mapReadyRef,
   mapLoadCount,
   controls,
+  otherControls = NO_CONTROLS,
   matrix,
   visible,
   editable,
@@ -41,6 +45,7 @@ export function useCourseOverlay({
   onRemove,
 }: Options): { syncToMatrix: (m: Matrix) => void } {
   const markersRef = useRef<{ control: CourseControl; marker: maplibregl.Marker }[]>([]);
+  const otherMarkersRef = useRef<maplibregl.Marker[]>([]);
   const matrixRef = useRef(matrix);
   matrixRef.current = matrix;
   const onMoveRef = useRef(onMove);
@@ -56,6 +61,24 @@ export function useCourseOverlay({
     const draw = () => {
       for (const { marker } of markersRef.current) marker.remove();
       markersRef.current = [];
+      for (const marker of otherMarkersRef.current) marker.remove();
+      otherMarkersRef.current = [];
+      if (visible && matrix) {
+        // Other courses' controls: a click on one while editing adds it to this course
+        for (const c of otherControls) {
+          const el = makeControlElement('control', '', false);
+          // On the inner drawing: MapLibre sets the marker element's own opacity itself
+          el.dataset.otherCourse = '1';
+          for (const child of Array.from(el.children)) {
+            (child as HTMLElement | SVGElement).style.opacity = '0.4';
+          }
+          otherMarkersRef.current.push(
+            new maplibregl.Marker({ element: el })
+              .setLngLat(pixelToLonLat(matrix, c.px, c.py))
+              .addTo(map)
+          );
+        }
+      }
 
       if (!map.getSource(SOURCE_ID)) {
         map.addSource(SOURCE_ID, {
@@ -129,8 +152,10 @@ export function useCourseOverlay({
     return () => {
       for (const { marker } of markersRef.current) marker.remove();
       markersRef.current = [];
+      for (const marker of otherMarkersRef.current) marker.remove();
+      otherMarkersRef.current = [];
     };
-  }, [mapLoadCount, controls, matrix, visible, editable]);
+  }, [mapLoadCount, controls, otherControls, matrix, visible, editable]);
 
   const syncToMatrix = useCallback((m: Matrix) => {
     const map = mapRef.current;
@@ -170,7 +195,8 @@ function makeControlElement(
   editable: boolean
 ): HTMLElement {
   const el = document.createElement('div');
-  el.style.position = 'relative';
+  // No inline `position`: MapLibre's .maplibregl-marker is absolute (also the anchor for the
+  // number label); an inline `relative` put the markers in flow, each one below the previous
   el.style.width = '28px';
   el.style.height = '28px';
   el.style.pointerEvents = editable ? 'auto' : 'none';

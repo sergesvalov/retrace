@@ -83,6 +83,17 @@ export interface GroundControl {
   kind: ControlKind;
   lon: number;
   lat: number;
+  /** Several courses: a control common to all of them (a course added later gets it too) */
+  common?: boolean;
+}
+
+/** One of several courses on an area: its controls in order (start and finish are shared) */
+export interface GroundCourseDef {
+  id: string;
+  /** "A", "B", "C"… */
+  name: string;
+  /** Ids of `RaceEvent.course` controls (kind 'control'), in course order */
+  controlIds: string[];
 }
 
 /** Map metadata the client may change together with a placement */
@@ -119,6 +130,8 @@ export interface ParticipantTrack {
   trimStartSec: number;
   /** Trim end in seconds */
   trimEndSec: number;
+  /** Course (GroundCourseDef id) set by hand; without it the runner's course is detected */
+  courseId?: string;
   totalDistanceM: number;
   durationSec: number;
   avgSpeedMs: number;
@@ -137,9 +150,14 @@ export interface RaceEvent {
   timeMode: TimeMode;
   map?: MapOverlay;
   /**
-   * Course marked on the base map (start → controls → finish). When it is not empty it is
-   * the course, scan or not; otherwise the controls drawn on the scan (`map.controls`) are.
+   * Course marked on the base map. When it is not empty it is the course, scan or not;
+   * otherwise the controls drawn on the scan (`map.controls`) are.
+   * Without `courses`: one course, in order (start → controls → finish).
+   * With `courses`: the points of the area — one start, one finish (shared by all courses)
+   * and the controls; each course lists its controls in order.
    */
   course?: GroundControl[];
+  /** Several courses (A, B, C…) on one area, sharing the start and the finish */
+  courses?: GroundCourseDef[];
   participants: ParticipantTrack[];
 }
