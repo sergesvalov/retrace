@@ -257,16 +257,16 @@ src/
 1. Jenkins (`Jenkinsfile`) раз в 5 минут проверяет репозиторий.
 2. Собирает Docker-образ (`Dockerfile`): `npm ci` → typecheck → тесты → сборка.
 3. Отправляет образ в локальный реестр `192.168.0.222:5050/retrace:latest`.
-4. По SSH обновляет `docker compose` на `192.168.0.225`; приложение — `http://192.168.0.225:8089`, файлы карт — том `/opt/retrace/data`.
+4. Запускает `docker compose` в `/opt/retrace` на том же сервере `192.168.0.230`, где работает Jenkins (без SSH); приложение — `http://192.168.0.230:8089`, файлы карт — том `/opt/retrace/data`.
 
-База — PostgreSQL на `192.168.0.230` (роль `retrace`, базы `retrace` и `retrace_dev` для проверок). Секреты лежат на сервере приложения в `/opt/retrace/secrets.env` (Jenkins создаёт пустой файл, но не перезаписывает его), например:
+База — PostgreSQL там же, на `192.168.0.230` (роль `retrace`, базы `retrace` и `retrace_dev` для проверок). Секреты лежат на сервере в `/opt/retrace/secrets.env` (Jenkins создаёт пустой файл, но не перезаписывает его), например:
 
 ```bash
 DATABASE_URL=postgres://retrace:ПАРОЛЬ@192.168.0.230/retrace
 TELEGRAM_BOT_TOKEN=123456:ABC...
 SMTP_URL=smtps://login:пароль-приложения@smtp.yandex.ru:465
 MAIL_FROM=Retrace <login@yandex.ru>
-PUBLIC_URL=http://192.168.0.225:8089
+PUBLIC_URL=http://192.168.0.230:8089
 ```
 
 Без `DATABASE_URL` сервер не запустится; без `TELEGRAM_BOT_TOKEN` и `SMTP_URL` войти будет нельзя.
