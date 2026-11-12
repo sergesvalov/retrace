@@ -6,10 +6,14 @@ import {
   correctTrackToControls,
   detectControlPassages,
   fitMapToCourse,
+  courseOnGround,
+  courseToGround,
+  groundToCourse,
+  GROUND_MATRIX,
 } from './course.js';
 import { haversineDistanceM, lonLatToPixel, nudgeMapMatrix } from './georef.js';
 import { normalizeSamplesToTrack } from './trackParser.js';
-import type { CourseControl } from './types.js';
+import type { CourseControl, RaceEvent } from './types.js';
 
 const BASE_MS = Date.parse('2026-11-08T08:00:00Z');
 const M_PER_DEG_LAT = 111_320;
@@ -217,5 +221,37 @@ describe('semi-automatic map fit from the course', () => {
   it('returns null without tracks or with fewer than two controls', () => {
     expect(fitMapToCourse([], [control('start', 0, 0), control('finish', 0, 20)], MATRIX)).toBeNull();
     expect(fitMapToCourse([runner('a', 4)], [control('start', 0, 0)], MATRIX)).toBeNull();
+  });
+});
+
+describe('course marked on the ground (no scan)', () => {
+  const ground = COURSE.map((c) => {
+    const [lon, lat] = controlsLonLat([c], MATRIX)[0];
+    return { id: c.id, kind: c.kind, lon, lat };
+  });
+
+  it('round-trips coordinates through the ground frame', () => {
+    const back = courseToGround(groundToCourse(ground));
+    back.forEach((c, i) => {
+      expect(c.kind).toBe(ground[i].kind);
+      expect(c.lon).toBeCloseTo(ground[i].lon, 9);
+      expect(c.lat).toBeCloseTo(ground[i].lat, 9);
+    });
+  });
+
+  it('gives the same splits as the same course drawn on a scan', () => {
+    const runners = [runner('a', 4), runner('b', 3, [8, -5])];
+    const onScan = computeSplits(runners, COURSE, MATRIX);
+    const onGround = computeSplits(runners, groundToCourse(ground), GROUND_MATRIX);
+    expect(onGround.map((s) => s.legTimes)).toEqual(onScan.map((s) => s.legTimes));
+    expect(onGround[0].legTimes.every((t) => t !== null)).toBe(true);
+  });
+
+  it('is the course when there is no scan, or when one was marked anyway', () => {
+    const map = { controls: COURSE } as unknown as RaceEvent['map'];
+    expect(courseOnGround({})).toBe(true);
+    expect(courseOnGround({ map })).toBe(false);
+    expect(courseOnGround({ map, course: [] })).toBe(false);
+    expect(courseOnGround({ map, course: ground })).toBe(true);
   });
 });

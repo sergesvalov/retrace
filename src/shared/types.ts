@@ -74,6 +74,17 @@ export interface CourseControl {
   py: number;
 }
 
+/**
+ * A control placed straight on the base map (an event without a map scan, or a course marked
+ * on the ground): plain coordinates, it never moves with a scan
+ */
+export interface GroundControl {
+  id: string;
+  kind: ControlKind;
+  lon: number;
+  lat: number;
+}
+
 /** Map metadata the client may change together with a placement */
 export type MapOverlayMeta = Partial<
   Pick<MapOverlay, 'imageKind' | 'printScale' | 'scanDpi' | 'declinationDeg'>
@@ -125,5 +136,10 @@ export interface RaceEvent {
   kind?: EventKind;
   timeMode: TimeMode;
   map?: MapOverlay;
+  /**
+   * Course marked on the base map (start → controls → finish). When it is not empty it is
+   * the course, scan or not; otherwise the controls drawn on the scan (`map.controls`) are.
+   */
+  course?: GroundControl[];
   participants: ParticipantTrack[];
 }

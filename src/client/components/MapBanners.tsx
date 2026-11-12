@@ -16,6 +16,8 @@ interface Props {
   courseEdit: boolean;
   courseControls: CourseControl[];
   hasTracks: boolean;
+  /** The course is drawn on a scan, so the scan can be fitted by it */
+  canFitScan: boolean;
   nextIsStart: boolean;
   nextIsFinish: boolean;
   onNextIsStart: (v: boolean | ((prev: boolean) => boolean)) => void;
@@ -32,6 +34,7 @@ export const MapBanners: React.FC<Props> = ({
   courseEdit,
   courseControls,
   hasTracks,
+  canFitScan,
   nextIsStart,
   nextIsFinish,
   onNextIsStart,
@@ -41,49 +44,55 @@ export const MapBanners: React.FC<Props> = ({
   onCourseEditDone,
   snapStage,
   onCancelSnap,
-}) => (
+}) => {
+  // What the next click places (the workspace's addControlAt follows the same rules)
+  const placing: CourseControl['kind'] =
+    courseControls.length === 0 || nextIsStart ? 'start' : nextIsFinish ? 'finish' : 'control';
+  const controlCount = courseControls.filter((c) => c.kind === 'control').length;
+  return (
   <>
     {/* Course editing: click the map to place start → controls → finish */}
     {courseEdit && (
       <div className="relative z-10 px-3 py-1.5 bg-fuchsia-950/80 border-b border-fuchsia-500/40 text-xs text-fuchsia-100 flex flex-wrap items-center justify-between gap-2 shrink-0">
         <span>
-          {courseControls.length === 0 || nextIsStart
-            ? '▲ Кликните СТАРТ (треугольник) на карте'
-            : nextIsFinish
-              ? '◎ Кликните ФИНИШ на карте'
-              : `Кликните КП ${
-                  courseControls.filter((c) => c.kind === 'control').length + 1
-                } по порядку. Маркеры можно перетаскивать, правый клик — удалить`}
+          {placing === 'start'
+            ? courseControls.some((c) => c.kind === 'start')
+              ? '▲ Кликните новое место СТАРТА — старый переедет'
+              : '▲ Кликните СТАРТ (треугольник) на карте'
+            : placing === 'finish'
+              ? courseControls.some((c) => c.kind === 'finish')
+                ? '◎ Кликните новое место ФИНИША — старый переедет'
+                : '◎ Кликните ФИНИШ на карте'
+              : `Кликните КП ${controlCount + 1} — КП встают по порядку, сколько угодно. Маркеры можно перетаскивать, правый клик — удалить`}
         </span>
         <div className="flex items-center gap-1.5">
-          <button
-            onClick={() => {
-              onNextIsStart((v) => !v);
-              onNextIsFinish(false);
-            }}
-            className={`px-2 py-0.5 rounded border transition ${
-              nextIsStart
-                ? 'bg-fuchsia-500 border-fuchsia-300 text-white'
-                : 'bg-slate-900 border-slate-700 text-fuchsia-200 hover:text-white'
-            }`}
-            title="Поставить или передвинуть старт (треугольник): он всегда первый"
-          >
-            {courseControls.some((c) => c.kind === 'start') ? '▲ Переставить старт' : '▲ Следующий клик — старт'}
-          </button>
-          <button
-            onClick={() => {
-              onNextIsFinish((v) => !v);
-              onNextIsStart(false);
-            }}
-            disabled={courseControls.length === 0}
-            className={`px-2 py-0.5 rounded border transition disabled:opacity-40 ${
-              nextIsFinish
-                ? 'bg-fuchsia-500 border-fuchsia-300 text-white'
-                : 'bg-slate-900 border-slate-700 text-fuchsia-200 hover:text-white'
-            }`}
-          >
-            ◎ Следующий клик — финиш
-          </button>
+          {/* What the next click places: start is always first, finish last, controls between */}
+          <div className="flex items-center gap-0.5 p-0.5 rounded bg-slate-950 border border-slate-700">
+            {(
+              [
+                ['start', '▲ Старт', 'Старт (треугольник) — всегда первый; один на трассу'],
+                ['control', '○ КП', 'КП по порядку: 1, 2, 3… — сколько угодно, встают перед финишем'],
+                ['finish', '◎ Финиш', 'Финиш (двойной круг) — всегда последний; один на трассу'],
+              ] as const
+            ).map(([kind, label, title]) => (
+              <button
+                key={kind}
+                title={title}
+                disabled={kind !== 'start' && courseControls.length === 0}
+                onClick={() => {
+                  onNextIsStart(kind === 'start');
+                  onNextIsFinish(kind === 'finish');
+                }}
+                className={`px-2 py-0.5 rounded transition disabled:opacity-40 ${
+                  placing === kind
+                    ? 'bg-fuchsia-500 text-white font-semibold'
+                    : 'text-fuchsia-200 hover:text-white'
+                }`}
+              >
+                {label}
+              </button>
+            ))}
+          </div>
           <button
             onClick={() => onSaveCourse(courseControls.slice(0, -1))}
             disabled={courseControls.length === 0}
@@ -100,7 +109,7 @@ export const MapBanners: React.FC<Props> = ({
           >
             Очистить
           </button>
-          {courseControls.length >= 3 && hasTracks && (
+          {canFitScan && courseControls.length >= 3 && hasTracks && (
             <button
               onClick={onAutoFitCourse}
               className="px-2 py-0.5 rounded bg-fuchsia-600 hover:bg-fuchsia-500 text-white font-semibold"
@@ -149,4 +158,5 @@ export const MapBanners: React.FC<Props> = ({
     )}
 
   </>
-);
+  );
+};

@@ -2,12 +2,45 @@ import {
   fitSimilarityTransform,
   haversineDistanceM,
   lonLatToMercator,
+  mercatorToLonLat,
   pixelToLonLat,
 } from './georef.js';
 import { detectDepartureFromStartSpot } from './trackParser.js';
-import type { CourseControl, GCP, ParticipantTrack, TrackPoint } from './types.js';
+import type {
+  CourseControl,
+  GCP,
+  GroundControl,
+  ParticipantTrack,
+  RaceEvent,
+  TrackPoint,
+} from './types.js';
 
 type Matrix = [number, number, number, number, number, number];
+
+/**
+ * A course marked on the ground goes through the same code as one drawn on a scan: its
+ * "pixels" are Web Mercator metres and its "map placement" is this identity matrix.
+ */
+export const GROUND_MATRIX: Matrix = [1, 0, 0, 0, 1, 0];
+
+/** The course is marked on the ground: no scan, or a ground course was marked anyway */
+export function courseOnGround(evt: Pick<RaceEvent, 'map' | 'course'>): boolean {
+  return !evt.map || (evt.course?.length ?? 0) > 0;
+}
+
+export function groundToCourse(ground: GroundControl[]): CourseControl[] {
+  return ground.map(({ id, kind, lon, lat }) => {
+    const [px, py] = lonLatToMercator(lon, lat);
+    return { id, kind, px, py };
+  });
+}
+
+export function courseToGround(controls: CourseControl[]): GroundControl[] {
+  return controls.map(({ id, kind, px, py }) => {
+    const [lon, lat] = mercatorToLonLat(px, py);
+    return { id, kind, lon, lat };
+  });
+}
 
 /** Overprint labels: S (start triangle), 1, 2, …, F (finish) */
 export function controlLabels(controls: CourseControl[]): string[] {

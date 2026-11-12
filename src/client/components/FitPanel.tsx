@@ -32,6 +32,8 @@ interface Props {
 
   /** Semi-automatic fit: course controls on the scan ↔ runners' punches */
   courseControlCount: number;
+  /** The course is marked on the base map, not on the scan: it cannot place the scan */
+  courseOnGround: boolean;
   onEditCourse: () => void;
   onAutoFitCourse: () => void;
   autoFitInfo: { ok: boolean; text: string } | null;
@@ -207,7 +209,12 @@ export const FitPanel: React.FC<Props> = (p) => {
       {/* Fastest: fit from the course controls and the tracks */}
       <div className="p-2.5 rounded-xl bg-fuchsia-950/40 border border-fuchsia-500/40 space-y-2">
         <div className="font-semibold text-fuchsia-200">🎯 Авто: по КП и трекам</div>
-        {p.courseControlCount >= 3 && p.hasTracks ? (
+        {p.courseOnGround ? (
+          <div className="text-slate-300">
+            Трасса размечена прямо на подложке, а не на скане, — по ней скан не подогнать.
+            Подгоните скан автоматически по кружкам КП или по приметным местам ниже.
+          </div>
+        ) : p.courseControlCount >= 3 && p.hasTracks ? (
           <>
             <div className="text-slate-300">
               Карта сама подстроится (сдвиг, масштаб, поворот), чтобы КП на скане совпали с

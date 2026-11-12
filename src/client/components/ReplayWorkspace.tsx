@@ -59,7 +59,13 @@ import {
   fitMapToCourse,
   controlsLonLat,
   correctTrackToControls,
+  courseOnGround,
+  courseToGround,
+  GROUND_MATRIX,
+  groundToCourse,
 } from '../../shared/course.js';
+
+type Matrix = [number, number, number, number, number, number];
 import { readImageDpi } from '../imageDpi.js';
 import { useCourseOverlay } from './useCourseOverlay.js';
 import { SplitsPanel } from './SplitsPanel.js';
@@ -389,9 +395,6 @@ export const ReplayWorkspace: React.FC<Props> = ({
       setNextIsStart(false);
     }
   }, [courseEdit]);
-  useEffect(() => {
-    if (!event.map) setCourseEdit(false);
-  }, [Boolean(event.map)]);
 
   // Group mean speed (m/s) for the speed normalisation modes
   const groupReferenceSpeedMs = useMemo(() => {
@@ -407,23 +410,31 @@ export const ReplayWorkspace: React.FC<Props> = ({
   }, [event.participants]);
 
   // ---- Course: controls on the map → punches → splits → tracks pulled onto the controls ----
+  // Marked on the base map (no scan needed) or drawn on the scan: see courseOnGround
+  const groundCourse = isOrienteering && courseOnGround(event);
+  const courseMatrix = groundCourse ? GROUND_MATRIX : event.map?.matrix;
   const courseControls = useMemo<CourseControl[]>(
-    () => (isOrienteering ? event.map?.controls ?? [] : []),
-    [isOrienteering, event.map?.controls]
+    () =>
+      !isOrienteering
+        ? []
+        : groundCourse
+          ? groundToCourse(event.course ?? [])
+          : event.map?.controls ?? [],
+    [isOrienteering, groundCourse, event.course, event.map?.controls]
   );
   const courseLL = useMemo<[number, number][]>(
     () =>
-      event.map?.matrix && courseControls.length > 0
-        ? controlsLonLat(courseControls, event.map.matrix)
+      courseMatrix && courseControls.length > 0
+        ? controlsLonLat(courseControls, courseMatrix)
         : [],
-    [courseControls, event.map?.matrix]
+    [courseControls, courseMatrix]
   );
   const splits = useMemo(
     () =>
-      event.map?.matrix && courseControls.length >= 2
-        ? computeSplits(event.participants, courseControls, event.map.matrix)
+      courseMatrix && courseControls.length >= 2
+        ? computeSplits(event.participants, courseControls, courseMatrix)
         : [],
-    [event.participants, courseControls, event.map?.matrix]
+    [event.participants, courseControls, courseMatrix]
   );
   // Tracks as drawn and replayed: with the adjustment to the controls when it is on
   const displayParticipants = useMemo<ParticipantTrack[]>(() => {
@@ -458,13 +469,13 @@ export const ReplayWorkspace: React.FC<Props> = ({
     [videoLegNames, splits]
   );
 
-  const { syncToMatrix: syncCourseToMatrix } = useCourseOverlay({
+  const { syncToMatrix: syncScanCourseToMatrix } = useCourseOverlay({
     mapRef,
     mapReadyRef,
     mapLoadCount,
     controls: courseControls,
-    matrix: event.map?.matrix,
-    visible: isOrienteering && Boolean(event.map),
+    matrix: courseMatrix,
+    visible: isOrienteering && Boolean(courseMatrix),
     editable: courseEdit,
     onMove: (id, px, py) =>
       void saveCourse(
@@ -475,13 +486,22 @@ export const ReplayWorkspace: React.FC<Props> = ({
   });
   const courseControlsRef = useRef(courseControls);
   courseControlsRef.current = courseControls;
+  const groundCourseRef = useRef(groundCourse);
+  groundCourseRef.current = groundCourse;
+  /** Moving the scan moves the controls drawn on it; a course marked on the ground stays put */
+  const syncCourseToMatrix = (m: Matrix) => {
+    if (!groundCourseRef.current) syncScanCourseToMatrix(m);
+  };
 
   async function saveCourse(controls: CourseControl[]) {
     const eventId = eventRef.current.id;
+    const ground = courseOnGround(eventRef.current);
     const res = await fetch(`/api/events/${eventId}/course`, {
       method: 'PUT',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ controls }),
+      body: JSON.stringify(
+        ground ? { ground: true, controls: courseToGround(controls) } : { controls }
+      ),
     });
     const data = await res.json().catch(() => ({}));
     if (!res.ok) {
@@ -493,7 +513,9 @@ export const ReplayWorkspace: React.FC<Props> = ({
 
   /** Map click while editing the course: start first, then controls in order, finish last */
   function addControlAt(lngLat: [number, number]) {
-    const m = liveMatrixRef.current ?? eventRef.current.map?.matrix;
+    const m = courseOnGround(eventRef.current)
+      ? GROUND_MATRIX
+      : liveMatrixRef.current ?? eventRef.current.map?.matrix;
     if (!m) return;
     const px = lonLatToPixel(m, lngLat[0], lngLat[1]);
     if (!px) return;
@@ -1150,6 +1172,8 @@ export const ReplayWorkspace: React.FC<Props> = ({
     const meta = eventRef.current.map;
     const current = liveMatrixRef.current ?? meta?.matrix;
     if (!map || !meta || !current) return;
+    // A course marked on the ground is not drawn on the scan: nothing to fit the scan by
+    if (courseOnGround(eventRef.current)) return;
     // Landmark pins (if any) take part in the fit as fixed pairs
     const fit = fitMapToCourse(
       eventRef.current.participants,
@@ -2004,7 +2028,7 @@ export const ReplayWorkspace: React.FC<Props> = ({
       title: event.title,
       subtitle: label,
       course:
-        isOrienteering && event.map
+        isOrienteering && courseMatrix
           ? courseControls.flatMap((c, i) =>
               courseLL[i] ? [{ lonLat: courseLL[i], kind: c.kind, label: courseLabels[i] }] : []
             )
@@ -2170,6 +2194,30 @@ export const ReplayWorkspace: React.FC<Props> = ({
                 </label>
               )}
 
+              {/* Course: on the scan, or straight on the base map when there is no scan */}
+              {isOrienteering && (
+                <button
+                  onClick={() => setCourseEdit((v) => !v)}
+                  className={`inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg font-medium border transition ${
+                    courseEdit
+                      ? 'bg-fuchsia-600 border-fuchsia-400 text-white shadow'
+                      : 'bg-slate-800 hover:bg-slate-700 border-slate-700 text-fuchsia-300'
+                  }`}
+                  title={
+                    groundCourse
+                      ? 'Разметить трассу прямо на подложке: старт, КП по порядку, финиш — получатся сплиты по перегонам. Скан карты не нужен'
+                      : 'Отметить старт, КП и финиш на скане — получатся сплиты по перегонам'
+                  }
+                >
+                  {groundCourse && courseControls.length === 0 ? '◎ Разметить трассу' : '◎ КП'}
+                  {courseControls.length > 0 && (
+                    <span className="text-[10px] opacity-80">
+                      ({courseControls.filter((c) => c.kind === 'control').length})
+                    </span>
+                  )}
+                </button>
+              )}
+
               {isOrienteering && event.map && (
                 <>
                   <button
@@ -2200,22 +2248,6 @@ export const ReplayWorkspace: React.FC<Props> = ({
                     <Trash2 className="w-3.5 h-3.5" />
                   </button>
 
-                  <button
-                    onClick={() => setCourseEdit((v) => !v)}
-                    className={`inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg font-medium border transition ${
-                      courseEdit
-                        ? 'bg-fuchsia-600 border-fuchsia-400 text-white shadow'
-                        : 'bg-slate-800 hover:bg-slate-700 border-slate-700 text-fuchsia-300'
-                    }`}
-                    title="Отметить старт, КП и финиш на карте — получатся сплиты по перегонам"
-                  >
-                    ◎ КП
-                    {courseControls.length > 0 && (
-                      <span className="text-[10px] opacity-80">
-                        ({courseControls.filter((c) => c.kind === 'control').length})
-                      </span>
-                    )}
-                  </button>
 
                   <div className="flex items-center gap-1.5">
                     <Layers className="w-3.5 h-3.5 text-emerald-400" />
@@ -2297,9 +2329,10 @@ export const ReplayWorkspace: React.FC<Props> = ({
           </div>
 
           <MapBanners
-            courseEdit={courseEdit && isOrienteering && Boolean(event.map)}
+            courseEdit={courseEdit && isOrienteering}
             courseControls={courseControls}
             hasTracks={event.participants.length > 0}
+            canFitScan={Boolean(event.map) && !groundCourse}
             nextIsStart={nextIsStart}
             nextIsFinish={nextIsFinish}
             onNextIsStart={setNextIsStart}
@@ -2379,6 +2412,7 @@ export const ReplayWorkspace: React.FC<Props> = ({
                 onMoveMapHere={moveMapToViewCenter}
                 onResetPlacement={() => void handleResetMapAutoFit()}
                 courseControlCount={courseControls.length}
+                courseOnGround={groundCourse}
                 onEditCourse={() => setCourseEdit(true)}
                 onAutoFitCourse={autoFitMapToCourse}
                 autoFitInfo={autoFitInfo}

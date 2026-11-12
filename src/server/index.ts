@@ -45,6 +45,7 @@ import {
   eventKindOf,
   type EventKind,
   type GCP,
+  type GroundControl,
   type MapOverlay,
   type MapOverlayMeta,
   type ParticipantTrack,
@@ -918,26 +919,52 @@ async function startServer() {
     return { event: toLiteEvent(evt) };
   });
 
-  // Replace the course (controls drawn on the map image, in course order)
-  app.put<{ Params: { id: string }; Body: { controls?: CourseControl[] } }>(
+  // Replace the course, in course order: controls drawn on the map image (pixels), or —
+  // with `ground: true`, or when there is no scan — controls marked on the base map (lon/lat)
+  app.put<{
+    Params: { id: string };
+    Body: { ground?: boolean; controls?: (CourseControl | GroundControl)[] };
+  }>(
     '/api/events/:id/course',
     async (req, reply) => {
       const evt = eventsStore.get(req.params.id);
-      if (!evt || !evt.map) {
-        return reply.code(404).send({ error: 'Сначала загрузите карту' });
-      }
+      if (!evt) return reply.code(404).send({ error: 'Событие не найдено' });
       const controls = req.body?.controls;
       if (!Array.isArray(controls) || controls.length > 99) {
         return reply.code(400).send({ error: 'Некорректный список КП' });
       }
+      const validId = (id: unknown) => typeof id === 'string' && id.length > 0 && id.length <= 40;
+
+      if (req.body?.ground || !evt.map) {
+        const ground: GroundControl[] = [];
+        for (const c of controls as GroundControl[]) {
+          const ok =
+            c &&
+            validId(c.id) &&
+            CONTROL_KINDS.includes(c.kind) &&
+            Number.isFinite(c.lon) &&
+            Number.isFinite(c.lat) &&
+            Math.abs(c.lon) <= 180 &&
+            Math.abs(c.lat) <= 85;
+          if (!ok) return reply.code(400).send({ error: 'Некорректный КП' });
+          // ~1 cm
+          ground.push({
+            id: c.id,
+            kind: c.kind,
+            lon: Math.round(c.lon * 1e7) / 1e7,
+            lat: Math.round(c.lat * 1e7) / 1e7,
+          });
+        }
+        evt.course = ground;
+        await saveEventToDisk(evt);
+        return { event: toLiteEvent(evt) };
+      }
       const { width, height } = evt.map;
       const clean: CourseControl[] = [];
-      for (const c of controls) {
+      for (const c of controls as CourseControl[]) {
         const ok =
           c &&
-          typeof c.id === 'string' &&
-          c.id.length > 0 &&
-          c.id.length <= 40 &&
+          validId(c.id) &&
           CONTROL_KINDS.includes(c.kind) &&
           Number.isFinite(c.px) &&
           Number.isFinite(c.py) &&
