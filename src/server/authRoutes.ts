@@ -3,6 +3,11 @@ import type { Viewer } from '../shared/access.js';
 import { GROUP_ROLES, type GroupKind, type GroupRole } from '../shared/types.js';
 import {
   acceptInvite,
+  changePassword,
+  loginWithPassword,
+  MIN_PASSWORD_LENGTH,
+  registerWithPassword,
+  setPasswordByEmail,
   allClubs,
   checkLoginCode,
   createGroup,
@@ -92,6 +97,7 @@ function limiter(max: number) {
 export async function registerAuth(app: FastifyInstance, opts: AuthOptions) {
   const { db, mailer, telegram, admins, secureCookie } = opts;
   const emailLimit = limiter(5);
+  const passwordLimit = limiter(10);
   const telegramLimit = limiter(10);
 
   app.decorateRequest('user', null);
@@ -123,7 +129,11 @@ export async function registerAuth(app: FastifyInstance, opts: AuthOptions) {
       groups: user ? await myGroups(db, user.id) : [],
       // Site admins pick the organiser of a championship stage from every club
       clubs: user?.isAdmin ? await allClubs(db) : undefined,
-      login: { email: mailer.enabled, telegram: telegram ? { bot: telegram.username } : null },
+      login: {
+        password: true,
+        email: mailer.enabled,
+        telegram: telegram ? { bot: telegram.username } : null,
+      },
     };
   });
 
@@ -134,6 +144,71 @@ export async function registerAuth(app: FastifyInstance, opts: AuthOptions) {
     await renameUser(db, req.user.id, name);
     return { ok: true };
   });
+
+  // ---- Sign-up / sign-in with e-mail and password ----
+
+  app.post<{ Body: { email?: string; name?: string; password?: string } }>(
+    '/api/auth/register',
+    async (req, reply) => {
+      const email = req.body?.email?.trim().toLowerCase() ?? '';
+      const name = req.body?.name?.trim() ?? '';
+      const password = req.body?.password ?? '';
+      if (!EMAIL_RE.test(email) || email.length > 200) {
+        return reply.code(400).send({ error: 'Проверьте адрес почты' });
+      }
+      if (!name) return reply.code(400).send({ error: 'Введите имя' });
+      if (password.length < MIN_PASSWORD_LENGTH || password.length > 200) {
+        return reply.code(400).send({ error: `Пароль — не короче ${MIN_PASSWORD_LENGTH} символов` });
+      }
+      if (!passwordLimit(req.ip)) return reply.code(429).send({ error: 'Слишком часто, подождите минуту' });
+      const user = await registerWithPassword(db, email, name, password, admins);
+      if (!user) return reply.code(409).send({ error: 'Этот адрес уже зарегистрирован — войдите' });
+      await signIn(reply, user.id);
+      return { ok: true };
+    }
+  );
+
+  app.post<{ Body: { email?: string; password?: string } }>('/api/auth/login', async (req, reply) => {
+    const email = req.body?.email?.trim().toLowerCase() ?? '';
+    const password = req.body?.password ?? '';
+    // Per address and per client: slows down password guessing
+    if (!passwordLimit(req.ip) || !passwordLimit(`email:${email}`)) {
+      return reply.code(429).send({ error: 'Слишком много попыток, подождите минуту' });
+    }
+    const user = email && password ? await loginWithPassword(db, email, password, admins) : null;
+    if (!user) return reply.code(400).send({ error: 'Неверная почта или пароль' });
+    await signIn(reply, user.id);
+    return { ok: true };
+  });
+
+  app.post<{ Body: { current?: string; next?: string } }>('/api/me/password', async (req, reply) => {
+    if (!req.user) return reply.code(401).send({ error: 'Войдите' });
+    const next = req.body?.next ?? '';
+    if (next.length < MIN_PASSWORD_LENGTH || next.length > 200) {
+      return reply.code(400).send({ error: `Пароль — не короче ${MIN_PASSWORD_LENGTH} символов` });
+    }
+    if (!passwordLimit(`user:${req.user.id}`)) return reply.code(429).send({ error: 'Подождите минуту' });
+    const ok = await changePassword(db, req.user.id, req.body?.current ?? '', next);
+    if (!ok) return reply.code(400).send({ error: 'Текущий пароль неверный' });
+    return { ok: true };
+  });
+
+  // Forgotten password: there is no e-mail to reset it by, a site admin sets a new one
+  app.post<{ Body: { email?: string; password?: string } }>(
+    '/api/admin/set-password',
+    async (req, reply) => {
+      if (!req.user?.isAdmin) return reply.code(403).send({ error: 'Только администратор сайта' });
+      const password = req.body?.password ?? '';
+      if (password.length < MIN_PASSWORD_LENGTH) {
+        return reply.code(400).send({ error: `Пароль — не короче ${MIN_PASSWORD_LENGTH} символов` });
+      }
+      const ok = await setPasswordByEmail(db, req.body?.email ?? '', password);
+      if (!ok) return reply.code(404).send({ error: 'Нет такого пользователя' });
+      return { ok: true };
+    }
+  );
+
+  // ---- Sign-in by e-mail code / Telegram bot (switched off at startup in index.ts, kept) ----
 
   app.post<{ Body: { email?: string } }>('/api/auth/email/start', async (req, reply) => {
     if (!mailer.enabled) return reply.code(400).send({ error: 'Вход по почте не настроен' });

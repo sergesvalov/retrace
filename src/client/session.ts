@@ -22,7 +22,8 @@ export interface Me {
   groups: MyGroup[];
   /** Every club (site admins only): organisers of championship stages */
   clubs?: { id: string; name: string }[];
-  login: { email: boolean; telegram: { bot: string } | null };
+  /** password: e-mail + password; email: one-time code by e-mail; telegram: through the bot */
+  login: { password?: boolean; email: boolean; telegram: { bot: string } | null };
 }
 
 export async function fetchMe(): Promise<Me> {

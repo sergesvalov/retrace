@@ -48,7 +48,7 @@ import {
 } from './accounts.js';
 import { registerAuth } from './authRoutes.js';
 import { migrate, openDb } from './db.js';
-import { createMailer } from './mail.js';
+import { createMailer, type Mailer } from './mail.js';
 import {
   deleteEvent,
   deleteTrack,
@@ -58,7 +58,7 @@ import {
   saveEvent,
   saveTrack,
 } from './store.js';
-import { startTelegramBot } from './telegram.js';
+import { startTelegramBot, type TelegramBot } from './telegram.js';
 import {
   CONTROL_KINDS,
   EVENT_KINDS,
@@ -327,15 +327,26 @@ async function startServer() {
   const persist = (evt: RaceEvent) => saveEvent(db, evt);
 
   const admins = adminListFromEnv();
-  const mailer = await createMailer();
-  const telegram = process.env.TELEGRAM_BOT_TOKEN
-    ? await startTelegramBot(db, process.env.TELEGRAM_BOT_TOKEN, admins, process.env.PUBLIC_URL).catch(
-        (err) => {
-          console.error('Telegram login is off:', err);
-          return null;
-        }
-      )
-    : null;
+  // Sign-in is by e-mail and password. Sign-in by an e-mail code (SMTP_URL) and through a
+  // Telegram bot (TELEGRAM_BOT_TOKEN) is kept but switched off: uncomment to bring it back.
+  // const mailer = await createMailer();
+  // const telegram = process.env.TELEGRAM_BOT_TOKEN
+  //   ? await startTelegramBot(db, process.env.TELEGRAM_BOT_TOKEN, admins, process.env.PUBLIC_URL).catch(
+  //       (err) => {
+  //         console.error('Telegram login is off:', err);
+  //         return null;
+  //       }
+  //     )
+  //   : null;
+  const mailer: Mailer = {
+    enabled: false,
+    sendLoginCode: async () => {
+      throw new Error('E-mail codes are switched off');
+    },
+  };
+  const telegram: TelegramBot | null = null;
+  void createMailer;
+  void startTelegramBot;
   setInterval(() => void cleanupExpired(db).catch((err) => console.error(err)), 6 * 3600_000).unref();
 
   const app = Fastify({

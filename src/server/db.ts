@@ -158,6 +158,10 @@ const MIGRATIONS: string[] = [
     PRIMARY KEY (event_id, participant_id)
   );
   `,
+  // 2: sign-up with e-mail and password
+  `
+  ALTER TABLE users ADD COLUMN password_hash text;
+  `,
 ];
 
 export async function migrate(db: Db): Promise<void> {

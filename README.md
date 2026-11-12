@@ -84,7 +84,9 @@
 
 ### Вход, клубы и кто что видит
 
-Вход без паролей: **через Telegram** (бот присылает подтверждение — нажмите «Start» и вернитесь на сайт) или **кодом из письма** (6 цифр на почту). Первый вошедший становится администратором сайта; ещё администраторов задают переменные `ADMIN_EMAILS` / `ADMIN_TELEGRAM_IDS`.
+**Регистрация** — почта, имя и пароль (от 8 символов); дальше вход по почте и паролю. Первый зарегистрированный становится администратором сайта; ещё администраторов задаёт переменная `ADMIN_EMAILS`. Писем сайт не шлёт: забытый пароль задаёт заново администратор («Профиль, клубы и семья» → «Задать пароль пользователю»), свой пароль меняют там же → «Сменить пароль». Пароли хранятся только в виде хэша (scrypt).
+
+Вход через Telegram-бота и кодом из письма в коде есть, но выключен (закомментирован запуск в `src/server/index.ts`).
 
 Каждое событие — для кого-то (выбирается при создании, ✎ — поменять):
 
@@ -127,16 +129,16 @@ DATABASE_URL=pglite://data/pglite npm run dev:server   # API: http://localhost:3
 npm run dev:web      # фронтенд (Vite): http://localhost:5173
 ```
 
-Открывайте `http://localhost:5173` — Vite проксирует `/api` и `/uploads` на порт 3001. Без `SMTP_URL` в разработке код входа по почте печатается в лог сервера.
+Открывайте `http://localhost:5173` — Vite проксирует `/api` и `/uploads` на порт 3001 — и зарегистрируйтесь: первый пользователь станет администратором.
 
 ### Настройки (переменные окружения)
 
 | Переменная | Что это |
 |---|---|
 | `DATABASE_URL` | **обязательна**: `postgres://user:pass@host/db` (или `pglite://папка` для разработки) |
-| `TELEGRAM_BOT_TOKEN` | токен бота от @BotFather — включает вход через Telegram. Бот сам опрашивает Telegram, публичный адрес и HTTPS не нужны |
-| `SMTP_URL`, `MAIL_FROM` | почта для кодов входа, например `smtps://login:пароль-приложения@smtp.yandex.ru:465` и `Retrace <login@yandex.ru>` |
-| `ADMIN_EMAILS`, `ADMIN_TELEGRAM_IDS` | администраторы сайта через запятую (плюс первый вошедший) |
+| `TELEGRAM_BOT_TOKEN` | *(сейчас не используется)* токен бота от @BotFather для входа через Telegram — работает, если раскомментировать запуск в `index.ts` |
+| `SMTP_URL`, `MAIL_FROM` | *(сейчас не используется)* почта для кодов входа, например `smtps://login:пароль-приложения@smtp.yandex.ru:465` |
+| `ADMIN_EMAILS`, `ADMIN_TELEGRAM_IDS` | администраторы сайта через запятую (плюс первый зарегистрированный) |
 | `PUBLIC_URL` | адрес сайта — бот подсказывает его в ответ на /start |
 | `COOKIE_SECURE=1` | сайт открывается по HTTPS: cookie сессии только по HTTPS |
 | `TRUST_PROXY=1` | сервер за обратным прокси (адрес клиента для ограничения частоты запросов кода) |
@@ -173,7 +175,7 @@ src/
       SplitsPanel.tsx         таблица сплитов по КП
       VideoMenu.tsx           кнопка «Видео»: что записать (перегон / всё), стоп
       EventDialog.tsx         окно создания/настроек события: название, вид, для кого, ссылка
-      LoginScreen.tsx         вход: Telegram или код на почту
+      LoginScreen.tsx         вход и регистрация: почта + пароль (Telegram и код на почту — когда включены)
       GroupsDialog.tsx        профиль, клубы и семья: участники, роли, ссылки-приглашения
       useCourseOverlay.ts     отрисовка и редактирование КП на карте
       CourseTabs.tsx          вкладки трасс A | B | C (+ добавить, переименовать, удалить)
@@ -189,7 +191,7 @@ src/
     imageDpi.ts               чтение DPI из заголовка скана (JPEG JFIF/EXIF, PNG pHYs)
   server/
     index.ts                  Fastify: REST API событий, права на каждом запросе, загрузка файлов, gzip, кэш
-    authRoutes.ts             вход (Telegram, код на почту), сессии, клубы и семьи, приглашения
+    authRoutes.ts             регистрация и вход по паролю (и выключенные Telegram / код на почту), сессии, клубы и семьи, приглашения
     accounts.ts               пользователи, сессии, роли, клубы/семьи, коды входа — запросы к Postgres
     telegram.ts               бот входа (long polling, без вебхука)
     mail.ts                   письма с кодом входа (nodemailer)
@@ -224,8 +226,12 @@ src/
 | GET | `/api/health` | проверка живости |
 | GET | `/api/me` | кто вошёл, его клубы и семьи, какие способы входа включены |
 | PATCH | `/api/me` | имя |
-| POST | `/api/auth/email/start` · `/verify` | код на почту · вход по коду |
-| POST / GET | `/api/auth/telegram/start` · `/poll?token=` | ссылка на бота · ждать подтверждения |
+| POST | `/api/auth/register` | регистрация: `{ email, name, password }` → сразу вход |
+| POST | `/api/auth/login` | вход: `{ email, password }` |
+| POST | `/api/me/password` | сменить пароль: `{ current, next }` |
+| POST | `/api/admin/set-password` | админ сайта задаёт пароль: `{ email, password }` |
+| POST | `/api/auth/email/start` · `/verify` | *(выключено)* код на почту · вход по коду |
+| POST / GET | `/api/auth/telegram/start` · `/poll?token=` | *(выключено)* ссылка на бота · ждать подтверждения |
 | POST | `/api/auth/logout` | выйти |
 | POST | `/api/groups` | клуб (админ сайта) или семья: `{ kind, name }` |
 | PATCH / DELETE | `/api/groups/:id` | переименовать / удалить (админ группы) |
@@ -257,19 +263,17 @@ src/
 1. Jenkins (`Jenkinsfile`) раз в 5 минут проверяет репозиторий.
 2. Собирает Docker-образ (`Dockerfile`): `npm ci` → typecheck → тесты → сборка.
 3. Отправляет образ в локальный реестр `192.168.0.222:5050/retrace:latest`.
-4. Запускает `docker compose` в `/opt/retrace` на том же сервере `192.168.0.230`, где работает Jenkins (без SSH); приложение — `http://192.168.0.230:8089`, файлы карт — том `/opt/retrace/data`.
+4. По SSH обновляет `docker compose` на `192.168.0.225`; приложение — `http://192.168.0.225:8089`, файлы карт — том `/opt/retrace/data`.
 
-База — PostgreSQL там же, на `192.168.0.230` (роль `retrace`, базы `retrace` и `retrace_dev` для проверок). Секреты лежат на сервере в `/opt/retrace/secrets.env` (Jenkins создаёт пустой файл, но не перезаписывает его), например:
+База — PostgreSQL на `192.168.0.230` (там же Jenkins): роль `retrace`, базы `retrace` (рабочая) и `retrace_dev` (для проверок). Секреты в git не хранятся: они лежат на сервере Jenkins в `/etc/retrace/secrets.env` (читает только пользователь `jenkins`), и при каждом деплое Jenkins копирует их на сервер приложения в `/opt/retrace/secrets.env`, откуда их берёт `docker-compose.yml`:
 
 ```bash
 DATABASE_URL=postgres://retrace:ПАРОЛЬ@192.168.0.230/retrace
-TELEGRAM_BOT_TOKEN=123456:ABC...
-SMTP_URL=smtps://login:пароль-приложения@smtp.yandex.ru:465
-MAIL_FROM=Retrace <login@yandex.ru>
-PUBLIC_URL=http://192.168.0.230:8089
+PUBLIC_URL=http://192.168.0.225:8089
+# ADMIN_EMAILS=… — дополнительные администраторы сайта
 ```
 
-Без `DATABASE_URL` сервер не запустится; без `TELEGRAM_BOT_TOKEN` и `SMTP_URL` войти будет нельзя.
+Без `DATABASE_URL` сервер не запустится. При первом запуске с пустой базой события из `/opt/retrace/data/events` прежней версии переносятся в базу; их видит только администратор, пока не выберет в ✎, для кого они.
 
 Запустить образ вручную: `docker compose up -d` (порт задаёт `APP_PORT`, по умолчанию 8089).
 

@@ -17,8 +17,8 @@ pipeline {
 
     parameters {
         // The first choice is the default, also for builds started by a push.
-        choice(name: 'DEPLOY_METHOD', choices: ['LOCAL', 'NONE'], description: 'LOCAL: deploy on this server, 192.168.0.230, where Jenkins runs (default); NONE: build only')
-        string(name: 'APP_PORT', defaultValue: '8089', description: 'Порт публикации Retrace на сервере 192.168.0.230')
+        choice(name: 'DEPLOY_METHOD', choices: ['DIRECT_SSH', 'NONE'], description: 'DIRECT_SSH: deploy to 192.168.0.225 over SSH (default); NONE: build only')
+        string(name: 'APP_PORT', defaultValue: '8089', description: 'Порт публикации Retrace на сервере 192.168.0.225')
     }
 
     environment {
@@ -28,12 +28,15 @@ pipeline {
 
         DOCKER_IMAGE   = "${REGISTRY_IP}:${REGISTRY_PORT}/retrace"
 
-        // Retrace работает на том же сервере, что и Jenkins (192.168.0.230): публикация локальная, без SSH.
-        // Там же PostgreSQL (база retrace).
-        PROD_SERVER_IP = "192.168.0.230"
+        // Сервер для публикации в Docker (192.168.0.225)
+        PROD_SERVER_IP = "192.168.0.225"
+        // Имя пользователя (credentials ID), которое используется в sshagent
+        DEPLOY_USER    = "${env.SERVER_USER ?: 'jenkins'}"
 
         DEPLOY_DIR     = "/opt/retrace"
         CONTAINER_NAME = "retrace_app"
+        // Секреты приложения на сервере Jenkins (192.168.0.230): DATABASE_URL, PUBLIC_URL…
+        SECRETS_SOURCE = "/etc/retrace/secrets.env"
     }
 
     stages {
@@ -67,24 +70,31 @@ pipeline {
             }
         }
 
-        stage('Deploy (local)') {
-            when { expression { params.DEPLOY_METHOD == 'LOCAL' } }
+        stage('Deploy to Prod (Direct SSH)') {
+            when { expression { params.DEPLOY_METHOD == 'DIRECT_SSH' } }
             steps {
                 script {
                     def appPort = params.APP_PORT?.trim() ?: '8089'
-                    echo "Публикация в Docker на этом сервере (${PROD_SERVER_IP}:${appPort})..."
-                    sh """
-                    sudo mkdir -p ${DEPLOY_DIR}/data/uploads
-                    sudo chown -R \$(id -un):\$(id -gn) ${DEPLOY_DIR}
+                    echo "Публикация в Docker на сервер ${PROD_SERVER_IP}:${appPort} (напрямую через SSH)..."
+                    sshagent(credentials: [env.DEPLOY_USER]) {
+                        sh """
+                        # Создаем папку на целевом сервере 192.168.0.225
+                        ssh -o StrictHostKeyChecking=no ${env.DEPLOY_USER}@${PROD_SERVER_IP} "sudo mkdir -p ${DEPLOY_DIR}/data/events ${DEPLOY_DIR}/data/uploads && sudo chown -R ${env.DEPLOY_USER}:${env.DEPLOY_USER} ${DEPLOY_DIR}"
 
-                    # Секреты (DATABASE_URL, токен бота, почта) живут только на сервере:
-                    # создаём пустой файл, если его нет, и никогда не перезаписываем
-                    touch ${DEPLOY_DIR}/secrets.env && chmod 600 ${DEPLOY_DIR}/secrets.env
+                        # Секреты (DATABASE_URL и др.) — не в git: лежат на сервере Jenkins в ${SECRETS_SOURCE}
+                        # и при каждом деплое копируются на сервер приложения
+                        if [ -r ${SECRETS_SOURCE} ]; then
+                            scp -o StrictHostKeyChecking=no ${SECRETS_SOURCE} ${env.DEPLOY_USER}@${PROD_SERVER_IP}:${DEPLOY_DIR}/secrets.env
+                        fi
+                        ssh -o StrictHostKeyChecking=no ${env.DEPLOY_USER}@${PROD_SERVER_IP} "touch ${DEPLOY_DIR}/secrets.env && chmod 600 ${DEPLOY_DIR}/secrets.env"
 
-                    cp docker-compose.yml ${DEPLOY_DIR}/
-                    printf 'DOCKER_IMAGE=%s\\nCONTAINER_NAME=%s\\nAPP_PORT=%s\\n' '${DOCKER_IMAGE}:latest' '${CONTAINER_NAME}' '${appPort}' > ${DEPLOY_DIR}/.env
-                    cd ${DEPLOY_DIR} && docker compose pull && docker compose up -d --remove-orphans
-                    """
+                        # Копируем docker-compose.yml
+                        scp -o StrictHostKeyChecking=no docker-compose.yml ${env.DEPLOY_USER}@${PROD_SERVER_IP}:${DEPLOY_DIR}/
+
+                        # Записываем .env и перезапускаем контейнер
+                        ssh -o StrictHostKeyChecking=no ${env.DEPLOY_USER}@${PROD_SERVER_IP} "printf 'DOCKER_IMAGE=%s\\nCONTAINER_NAME=%s\\nAPP_PORT=%s\\n' '${DOCKER_IMAGE}:latest' '${CONTAINER_NAME}' '${appPort}' > ${DEPLOY_DIR}/.env && cd ${DEPLOY_DIR} && docker compose pull && docker compose up -d --remove-orphans"
+                        """
+                    }
                 }
             }
         }

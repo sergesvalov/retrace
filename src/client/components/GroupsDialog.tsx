@@ -150,6 +150,59 @@ export const GroupsDialog: React.FC<Props> = ({ me, onChanged, onClose }) => {
               </div>
             </form>
 
+            <details className="text-xs">
+              <summary className="cursor-pointer text-slate-400 hover:text-slate-200">Сменить пароль</summary>
+              <form
+                className="mt-1.5 space-y-1"
+                onSubmit={(e) => {
+                  e.preventDefault();
+                  const f = e.currentTarget;
+                  const current = (f.elements.namedItem('current') as HTMLInputElement).value;
+                  const next = (f.elements.namedItem('next') as HTMLInputElement).value;
+                  void run(async () => {
+                    await api('POST', '/api/me/password', { current, next });
+                    f.reset();
+                    window.alert('Пароль изменён');
+                  });
+                }}
+              >
+                <input name="current" type="password" placeholder="Текущий пароль" autoComplete="current-password"
+                  className="w-full px-2 py-1 rounded-lg bg-slate-950 border border-slate-700" />
+                <input name="next" type="password" placeholder="Новый (от 8 символов)" minLength={8} required
+                  autoComplete="new-password" className="w-full px-2 py-1 rounded-lg bg-slate-950 border border-slate-700" />
+                <button className="px-2.5 py-1 rounded-lg bg-emerald-600 text-white">Сохранить</button>
+              </form>
+            </details>
+
+            {user.isAdmin && (
+              <details className="text-xs">
+                <summary className="cursor-pointer text-slate-400 hover:text-slate-200">
+                  Задать пароль пользователю
+                </summary>
+                <form
+                  className="mt-1.5 space-y-1"
+                  onSubmit={(e) => {
+                    e.preventDefault();
+                    const f = e.currentTarget;
+                    const email = (f.elements.namedItem('email') as HTMLInputElement).value;
+                    const password = (f.elements.namedItem('password') as HTMLInputElement).value;
+                    void run(async () => {
+                      await api('POST', '/api/admin/set-password', { email, password });
+                      f.reset();
+                      window.alert(`Новый пароль для ${email} задан — передайте его пользователю`);
+                    });
+                  }}
+                >
+                  <input name="email" type="email" required placeholder="Почта пользователя"
+                    className="w-full px-2 py-1 rounded-lg bg-slate-950 border border-slate-700" />
+                  <input name="password" type="text" required minLength={8} placeholder="Новый пароль"
+                    className="w-full px-2 py-1 rounded-lg bg-slate-950 border border-slate-700" />
+                  <button className="px-2.5 py-1 rounded-lg bg-slate-700 text-white">Задать</button>
+                  <div className="text-[11px] text-slate-500">Для тех, кто забыл пароль: писем сайт не шлёт.</div>
+                </form>
+              </details>
+            )}
+
             {(['club', 'family'] as GroupKind[]).map((kind) => (
               <div key={kind} className="space-y-1">
                 <div className="flex items-center justify-between">

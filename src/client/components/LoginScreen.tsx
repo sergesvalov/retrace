@@ -10,10 +10,14 @@ interface Props {
 }
 
 /**
- * Sign in: through the Telegram bot (press Start in the bot, the page signs in by itself)
- * or with a 6-digit code sent by e-mail. There are no passwords.
+ * Sign in or sign up with e-mail and password. Sign-in through the Telegram bot and by a
+ * 6-digit e-mail code is kept below; it shows only when the server switches it on.
  */
 export const LoginScreen: React.FC<Props> = ({ login, inviteNote, onSignedIn }) => {
+  const [mode, setMode] = useState<'login' | 'register'>('login');
+  const [name, setName] = useState('');
+  const [password, setPassword] = useState('');
+  const [password2, setPassword2] = useState('');
   const [email, setEmail] = useState('');
   const [code, setCode] = useState('');
   const [codeSent, setCodeSent] = useState(false);
@@ -49,6 +53,28 @@ export const LoginScreen: React.FC<Props> = ({ login, inviteNote, onSignedIn }) 
       }, 2000);
     } catch (err) {
       setError((err as Error).message);
+    }
+  }
+
+  async function submitPassword(e: React.FormEvent) {
+    e.preventDefault();
+    setError(null);
+    if (mode === 'register' && password !== password2) {
+      setError('Пароли не совпадают');
+      return;
+    }
+    setBusy(true);
+    try {
+      if (mode === 'register') {
+        await api('POST', '/api/auth/register', { email, name, password });
+      } else {
+        await api('POST', '/api/auth/login', { email, password });
+      }
+      onSignedIn();
+    } catch (err) {
+      setError((err as Error).message);
+    } finally {
+      setBusy(false);
     }
   }
 
@@ -102,6 +128,89 @@ export const LoginScreen: React.FC<Props> = ({ login, inviteNote, onSignedIn }) 
         )}
 
         <div className="p-5 rounded-2xl bg-slate-900 border border-slate-700 space-y-4">
+          {login.password && (
+            <form onSubmit={(e) => void submitPassword(e)} className="space-y-2.5">
+              <div className="grid grid-cols-2 gap-1 p-1 rounded-xl bg-slate-950 border border-slate-800 text-sm">
+                {(['login', 'register'] as const).map((m) => (
+                  <button
+                    key={m}
+                    type="button"
+                    onClick={() => {
+                      setMode(m);
+                      setError(null);
+                    }}
+                    className={`py-1.5 rounded-lg transition ${
+                      mode === m ? 'bg-slate-800 text-white font-semibold' : 'text-slate-400 hover:text-slate-200'
+                    }`}
+                  >
+                    {m === 'login' ? 'Вход' : 'Регистрация'}
+                  </button>
+                ))}
+              </div>
+              {mode === 'register' && (
+                <input
+                  required
+                  value={name}
+                  onChange={(e) => setName(e.target.value)}
+                  placeholder="Имя (видно в клубе и в треках)"
+                  maxLength={40}
+                  autoComplete="name"
+                  className={input}
+                />
+              )}
+              <input
+                type="email"
+                required
+                value={email}
+                onChange={(e) => setEmail(e.target.value)}
+                placeholder="Почта"
+                autoComplete="email"
+                className={input}
+              />
+              <input
+                type="password"
+                required
+                minLength={8}
+                value={password}
+                onChange={(e) => setPassword(e.target.value)}
+                placeholder={mode === 'register' ? 'Пароль (от 8 символов)' : 'Пароль'}
+                autoComplete={mode === 'register' ? 'new-password' : 'current-password'}
+                className={input}
+              />
+              {mode === 'register' && (
+                <input
+                  type="password"
+                  required
+                  minLength={8}
+                  value={password2}
+                  onChange={(e) => setPassword2(e.target.value)}
+                  placeholder="Пароль ещё раз"
+                  autoComplete="new-password"
+                  className={input}
+                />
+              )}
+              <button
+                disabled={busy}
+                className="w-full px-4 py-2.5 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-white text-sm font-semibold disabled:opacity-50"
+              >
+                {mode === 'register' ? 'Зарегистрироваться' : 'Войти'}
+              </button>
+              {mode === 'login' && (
+                <div className="text-[11px] text-slate-500 text-center">
+                  Забыли пароль? Администратор сайта может задать новый.
+                </div>
+              )}
+            </form>
+          )}
+
+          {login.password && (login.telegram || login.email) && (
+            <div className="flex items-center gap-2 text-xs text-slate-500">
+              <div className="h-px flex-1 bg-slate-800" />
+              или
+              <div className="h-px flex-1 bg-slate-800" />
+            </div>
+          )}
+
           {login.telegram && (
             <div className="space-y-2">
               <button
@@ -183,7 +292,7 @@ export const LoginScreen: React.FC<Props> = ({ login, inviteNote, onSignedIn }) 
               </form>
             ))}
 
-          {!login.email && !login.telegram && (
+          {!login.password && !login.email && !login.telegram && (
             <div className="text-sm text-amber-300">
               Вход ещё не настроен: администратору нужно указать TELEGRAM_BOT_TOKEN или SMTP_URL.
             </div>

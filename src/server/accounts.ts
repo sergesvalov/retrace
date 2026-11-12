@@ -155,6 +155,102 @@ export async function findOrCreateTelegramUser(
   return grantAdminIfListed(db, user, admins);
 }
 
+// ---- Sign-up and sign-in with e-mail and password ----
+
+export const MIN_PASSWORD_LENGTH = 8;
+const SCRYPT = { N: 16384, r: 8, p: 1, keylen: 32 };
+
+function scrypt(password: string, salt: Buffer, opts = SCRYPT): Promise<Buffer> {
+  return new Promise((resolve, reject) =>
+    crypto.scrypt(password, salt, opts.keylen, { N: opts.N, r: opts.r, p: opts.p }, (err, key) =>
+      err ? reject(err) : resolve(key)
+    )
+  );
+}
+
+/** "scrypt$N$r$p$salt$hash" (base64url): parameters travel with the hash */
+export async function hashPassword(password: string): Promise<string> {
+  const salt = crypto.randomBytes(16);
+  const key = await scrypt(password, salt);
+  const { N, r, p } = SCRYPT;
+  return ['scrypt', N, r, p, salt.toString('base64url'), key.toString('base64url')].join('$');
+}
+
+export async function verifyPassword(password: string, stored: string): Promise<boolean> {
+  const [algo, n, r, p, salt, hash] = stored.split('$');
+  if (algo !== 'scrypt' || !salt || !hash) return false;
+  const expected = Buffer.from(hash, 'base64url');
+  const key = await scrypt(password, Buffer.from(salt, 'base64url'), {
+    N: Number(n),
+    r: Number(r),
+    p: Number(p),
+    keylen: expected.length,
+  });
+  return crypto.timingSafeEqual(key, expected);
+}
+
+/** New account; null if the address is already registered */
+export async function registerWithPassword(
+  db: Db,
+  email: string,
+  name: string,
+  password: string,
+  admins: AdminList
+): Promise<User | null> {
+  const normalized = email.trim().toLowerCase();
+  const taken = await db.query('SELECT 1 FROM users WHERE email = $1', [normalized]);
+  if (taken.rows.length > 0) return null;
+  const ins = await db.query<UserRow>(
+    `INSERT INTO users (id, name, email, password_hash) VALUES ($1, $2, $3, $4)
+     ON CONFLICT (email) DO NOTHING RETURNING ${USER_COLS}`,
+    [newId(), name.trim().slice(0, 40), normalized, await hashPassword(password)]
+  );
+  if (!ins.rows[0]) return null;
+  return grantAdminIfListed(db, toUser(ins.rows[0]), admins);
+}
+
+/** The user with this address and password, or null */
+export async function loginWithPassword(
+  db: Db,
+  email: string,
+  password: string,
+  admins: AdminList
+): Promise<User | null> {
+  const { rows } = await db.query<UserRow & { password_hash: string | null }>(
+    `SELECT ${USER_COLS}, password_hash FROM users WHERE email = $1`,
+    [email.trim().toLowerCase()]
+  );
+  const r = rows[0];
+  if (!r?.password_hash || !(await verifyPassword(password, r.password_hash))) return null;
+  return grantAdminIfListed(db, toUser(r), admins);
+}
+
+/** Change the password: the current one must match (if there is one) */
+export async function changePassword(
+  db: Db,
+  userId: string,
+  current: string,
+  next: string
+): Promise<boolean> {
+  const { rows } = await db.query<{ password_hash: string | null }>(
+    'SELECT password_hash FROM users WHERE id = $1',
+    [userId]
+  );
+  const stored = rows[0]?.password_hash;
+  if (stored && !(await verifyPassword(current, stored))) return false;
+  await db.query('UPDATE users SET password_hash = $2 WHERE id = $1', [userId, await hashPassword(next)]);
+  return true;
+}
+
+/** Site admin sets a new password for someone who forgot theirs (no e-mail to reset by) */
+export async function setPasswordByEmail(db: Db, email: string, password: string): Promise<boolean> {
+  const { rows } = await db.query<{ id: string }>(
+    'UPDATE users SET password_hash = $2 WHERE email = $1 RETURNING id',
+    [email.trim().toLowerCase(), await hashPassword(password)]
+  );
+  return rows.length > 0;
+}
+
 export async function renameUser(db: Db, userId: string, name: string): Promise<void> {
   await db.query('UPDATE users SET name = $2 WHERE id = $1', [userId, name]);
 }

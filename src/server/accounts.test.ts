@@ -1,7 +1,11 @@
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import {
   acceptInvite,
+  changePassword,
   checkLoginCode,
+  loginWithPassword,
+  registerWithPassword,
+  setPasswordByEmail,
   confirmTelegramLogin,
   createGroup,
   createInvite,
@@ -43,6 +47,27 @@ describe('accounts', () => {
     expect(listed.isAdmin).toBe(true);
     // the same address is the same user
     expect((await findOrCreateEmailUser(db, 'second@MAIL.ru', admins)).id).toBe(second.id);
+  });
+
+  it('sign-up and sign-in with a password; the address is unique; passwords are hashed', async () => {
+    const u = await registerWithPassword(db, 'Pass@Mail.ru', 'Аня', 'correct horse', admins);
+    expect(u?.name).toBe('Аня');
+    expect(await registerWithPassword(db, 'pass@mail.ru', 'Другая', 'whatever1', admins)).toBeNull();
+    expect((await loginWithPassword(db, 'PASS@mail.ru', 'correct horse', admins))?.id).toBe(u!.id);
+    expect(await loginWithPassword(db, 'pass@mail.ru', 'wrong pass', admins)).toBeNull();
+    expect(await loginWithPassword(db, 'nobody@mail.ru', 'correct horse', admins)).toBeNull();
+    const { rows } = await db.query<{ password_hash: string }>(
+      "SELECT password_hash FROM users WHERE email = 'pass@mail.ru'"
+    );
+    expect(rows[0].password_hash).toMatch(/^scrypt\$16384\$8\$1\$/);
+    expect(rows[0].password_hash).not.toContain('correct horse');
+
+    expect(await changePassword(db, u!.id, 'wrong', 'new password')).toBe(false);
+    expect(await changePassword(db, u!.id, 'correct horse', 'new password')).toBe(true);
+    expect(await loginWithPassword(db, 'pass@mail.ru', 'new password', admins)).not.toBeNull();
+    expect(await setPasswordByEmail(db, 'pass@mail.ru', 'from admin 1')).toBe(true);
+    expect(await loginWithPassword(db, 'pass@mail.ru', 'from admin 1', admins)).not.toBeNull();
+    expect(await setPasswordByEmail(db, 'nobody@mail.ru', 'x'.repeat(8))).toBe(false);
   });
 
   it('e-mail codes: one per minute, right once, burnt by wrong tries', async () => {
