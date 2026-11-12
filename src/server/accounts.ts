@@ -9,6 +9,8 @@ export interface User {
   id: string;
   name: string;
   email: string | null;
+  /** nickname to sign in with, for those who signed up without an e-mail */
+  login: string | null;
   telegramId: string | null;
   telegramUsername: string | null;
   isAdmin: boolean;
@@ -28,10 +30,27 @@ export interface GroupMember {
   name: string;
   role: GroupRole;
   email: string | null;
+  login: string | null;
   telegramUsername: string | null;
 }
 
 const SESSION_DAYS = 90;
+
+const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+/** Nickname: 3–30 letters (any alphabet), digits, `_ . -`; never an `@`, so never an e-mail */
+const NICK_RE = /^[\p{L}\p{N}_.-]{3,30}$/u;
+
+/** What a person signs up and signs in with: an e-mail or a nickname */
+export type LoginId = { email: string } | { nick: string };
+
+/** `a@b.ru` → e-mail (lower case), `Anya_run` → nickname (as typed); null if it is neither */
+export function parseLoginId(raw: string): LoginId | null {
+  const s = raw.trim();
+  if (s.includes('@')) {
+    return EMAIL_RE.test(s) && s.length <= 200 ? { email: s.toLowerCase() } : null;
+  }
+  return NICK_RE.test(s) ? { nick: s } : null;
+}
 
 export function newId(bytes = 6): string {
   return crypto.randomBytes(bytes).toString('hex');
@@ -49,18 +68,21 @@ interface UserRow {
   id: string;
   name: string;
   email: string | null;
+  login: string | null;
   telegram_id: string | null;
   telegram_username: string | null;
   is_admin: boolean;
 }
 
-const USER_COLS = 'id, name, email, telegram_id::text AS telegram_id, telegram_username, is_admin';
+const USER_COLS =
+  'id, name, email, login, telegram_id::text AS telegram_id, telegram_username, is_admin';
 
 function toUser(r: UserRow): User {
   return {
     id: r.id,
     name: r.name,
     email: r.email,
+    login: r.login,
     telegramId: r.telegram_id,
     telegramUsername: r.telegram_username,
     isAdmin: r.is_admin,
@@ -189,36 +211,46 @@ export async function verifyPassword(password: string, stored: string): Promise<
   return crypto.timingSafeEqual(key, expected);
 }
 
-/** New account; null if the address is already registered */
+/** E-mail or nickname, whichever the text is: `$1` matches either (an e-mail always has an `@`) */
+const BY_LOGIN = 'email = lower($1) OR lower(login) = lower($1)';
+
+/** New account by e-mail or nickname; null if it is already taken */
 export async function registerWithPassword(
   db: Db,
-  email: string,
+  id: LoginId,
   name: string,
   password: string,
   admins: AdminList
 ): Promise<User | null> {
-  const normalized = email.trim().toLowerCase();
-  const taken = await db.query('SELECT 1 FROM users WHERE email = $1', [normalized]);
+  const key = 'email' in id ? id.email : id.nick;
+  const taken = await db.query(`SELECT 1 FROM users WHERE ${BY_LOGIN}`, [key]);
   if (taken.rows.length > 0) return null;
+  // No conflict target: a race on either unique key (e-mail, nickname) gives no row
   const ins = await db.query<UserRow>(
-    `INSERT INTO users (id, name, email, password_hash) VALUES ($1, $2, $3, $4)
-     ON CONFLICT (email) DO NOTHING RETURNING ${USER_COLS}`,
-    [newId(), name.trim().slice(0, 40), normalized, await hashPassword(password)]
+    `INSERT INTO users (id, name, email, login, password_hash) VALUES ($1, $2, $3, $4, $5)
+     ON CONFLICT DO NOTHING RETURNING ${USER_COLS}`,
+    [
+      newId(),
+      name.trim().slice(0, 40),
+      'email' in id ? id.email : null,
+      'nick' in id ? id.nick : null,
+      await hashPassword(password),
+    ]
   );
   if (!ins.rows[0]) return null;
   return grantAdminIfListed(db, toUser(ins.rows[0]), admins);
 }
 
-/** The user with this address and password, or null */
+/** The user with this e-mail or nickname and password, or null */
 export async function loginWithPassword(
   db: Db,
-  email: string,
+  login: string,
   password: string,
   admins: AdminList
 ): Promise<User | null> {
   const { rows } = await db.query<UserRow & { password_hash: string | null }>(
-    `SELECT ${USER_COLS}, password_hash FROM users WHERE email = $1`,
-    [email.trim().toLowerCase()]
+    `SELECT ${USER_COLS}, password_hash FROM users WHERE ${BY_LOGIN}`,
+    [login.trim()]
   );
   const r = rows[0];
   if (!r?.password_hash || !(await verifyPassword(password, r.password_hash))) return null;
@@ -243,11 +275,13 @@ export async function changePassword(
 }
 
 /** Site admin sets a new password for someone who forgot theirs (no e-mail to reset by) */
-export async function setPasswordByEmail(db: Db, email: string, password: string): Promise<boolean> {
+export async function setPasswordByLogin(db: Db, login: string, password: string): Promise<boolean> {
   const { rows } = await db.query<{ id: string }>(
-    'UPDATE users SET password_hash = $2 WHERE email = $1 RETURNING id',
-    [email.trim().toLowerCase(), await hashPassword(password)]
+    `UPDATE users SET password_hash = $2 WHERE ${BY_LOGIN} RETURNING id`,
+    [login.trim(), await hashPassword(password)]
   );
+  // The old password may be known to someone else: every earlier sign-in ends
+  if (rows[0]) await db.query('DELETE FROM sessions WHERE user_id = $1', [rows[0].id]);
   return rows.length > 0;
 }
 
@@ -271,7 +305,7 @@ export const SESSION_MAX_AGE_SEC = SESSION_DAYS * 24 * 3600;
 
 export async function sessionUser(db: Db, token: string): Promise<User | null> {
   const { rows } = await db.query<UserRow>(
-    `SELECT u.id, u.name, u.email, u.telegram_id::text AS telegram_id, u.telegram_username,
+    `SELECT u.id, u.name, u.email, u.login, u.telegram_id::text AS telegram_id, u.telegram_username,
             u.is_admin
      FROM sessions s JOIN users u ON u.id = s.user_id
      WHERE s.token_hash = $1 AND s.expires_at > now()`,
@@ -377,9 +411,10 @@ export async function groupMembers(db: Db, groupId: string): Promise<GroupMember
     name: string;
     role: GroupRole;
     email: string | null;
+    login: string | null;
     telegram_username: string | null;
   }>(
-    `SELECT m.user_id, u.name, m.role, u.email, u.telegram_username
+    `SELECT m.user_id, u.name, m.role, u.email, u.login, u.telegram_username
      FROM group_members m JOIN users u ON u.id = m.user_id
      WHERE m.group_id = $1
      ORDER BY CASE m.role WHEN 'admin' THEN 0 WHEN 'judge' THEN 1 ELSE 2 END, u.name`,
@@ -390,6 +425,7 @@ export async function groupMembers(db: Db, groupId: string): Promise<GroupMember
     name: r.name,
     role: r.role,
     email: r.email,
+    login: r.login,
     telegramUsername: r.telegram_username,
   }));
 }

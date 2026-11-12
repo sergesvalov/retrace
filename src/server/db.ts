@@ -162,6 +162,11 @@ const MIGRATIONS: string[] = [
   `
   ALTER TABLE users ADD COLUMN password_hash text;
   `,
+  // 3: sign-up by a nickname instead of an e-mail; unique regardless of case
+  `
+  ALTER TABLE users ADD COLUMN login text;
+  CREATE UNIQUE INDEX users_login_lower ON users (lower(login));
+  `,
 ];
 
 export async function migrate(db: Db): Promise<void> {

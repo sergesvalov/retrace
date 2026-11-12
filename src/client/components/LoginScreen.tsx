@@ -10,7 +10,7 @@ interface Props {
 }
 
 /**
- * Sign in or sign up with e-mail and password. Sign-in through the Telegram bot and by a
+ * Sign in or sign up with an e-mail or a nickname and a password. Sign-in through the Telegram bot and by a
  * 6-digit e-mail code is kept below; it shows only when the server switches it on.
  */
 export const LoginScreen: React.FC<Props> = ({ login, inviteNote, onSignedIn }) => {
@@ -18,6 +18,8 @@ export const LoginScreen: React.FC<Props> = ({ login, inviteNote, onSignedIn }) 
   const [name, setName] = useState('');
   const [password, setPassword] = useState('');
   const [password2, setPassword2] = useState('');
+  /** e-mail or nickname for the password form */
+  const [account, setAccount] = useState('');
   const [email, setEmail] = useState('');
   const [code, setCode] = useState('');
   const [codeSent, setCodeSent] = useState(false);
@@ -66,9 +68,9 @@ export const LoginScreen: React.FC<Props> = ({ login, inviteNote, onSignedIn }) 
     setBusy(true);
     try {
       if (mode === 'register') {
-        await api('POST', 'api/auth/register', { email, name, password });
+        await api('POST', 'api/auth/register', { login: account, name, password });
       } else {
-        await api('POST', 'api/auth/login', { email, password });
+        await api('POST', 'api/auth/login', { login: account, password });
       }
       onSignedIn();
     } catch (err) {
@@ -159,14 +161,22 @@ export const LoginScreen: React.FC<Props> = ({ login, inviteNote, onSignedIn }) 
                 />
               )}
               <input
-                type="email"
                 required
-                value={email}
-                onChange={(e) => setEmail(e.target.value)}
-                placeholder="Почта"
-                autoComplete="email"
+                value={account}
+                onChange={(e) => setAccount(e.target.value)}
+                placeholder="Почта или ник"
+                autoComplete="username"
+                autoCapitalize="none"
+                spellCheck={false}
+                maxLength={200}
                 className={input}
               />
+              {mode === 'register' && (
+                <div className="text-[11px] text-slate-500">
+                  Ник — 3–30 букв или цифр, можно «_», «.» и «-». Писем сайт не шлёт: забытый пароль задаёт
+                  администратор.
+                </div>
+              )}
               <input
                 type="password"
                 required

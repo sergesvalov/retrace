@@ -2,9 +2,12 @@ import { describe, expect, it } from 'vitest';
 import {
   formatPaceMinKm,
   interpolateTrackAt,
+  MAX_TRACK_POINTS,
   normalizeSamplesToTrack,
   parseGpxText,
+  parseTcxText,
   raceTimeOfTrackPoint,
+  xmlElements,
 } from './trackParser.js';
 
 const BASE_MS = Date.parse('2026-10-18T08:00:00Z');
@@ -81,5 +84,45 @@ describe('GPX parsing', () => {
     </trkseg></trk></gpx>`;
     const res = parseGpxText(gpx);
     expect(res.samples.map((s) => s.lat)).toEqual([55.2, 55.3]);
+  });
+});
+
+describe('track files from the internet', () => {
+  const pt = (i: number, attrs = `lat="55.${i}" lon="37.${i}"`) =>
+    `<trkpt ${attrs}><time>2026-10-18T08:00:${String(i).padStart(2, '0')}Z</time></trkpt>`;
+
+  it('reads points with lat/lon in either order, skips self-closing ones', () => {
+    const xml = `<gpx><trk><trkseg>${pt(1)}<trkpt lat="1" lon="2"/>${pt(2, "lon='37.2' lat='55.2'")}</trkseg></trk></gpx>`;
+    const { samples } = parseGpxText(xml);
+    expect(samples.map((s) => [s.lat, s.lon])).toEqual([
+      [55.1, 37.1],
+      [55.2, 37.2],
+    ]);
+  });
+
+  it('elements: bodies in order, a missing closing tag ends the scan', () => {
+    const items = [...xmlElements('<a x="1">one</a><A>two</A ><a/><a>three', 'a')];
+    expect(items.map((e) => e.body)).toEqual(['one', 'two']);
+    expect(items[0].attrs.trim()).toBe('x="1"');
+  });
+
+  // Unclosed tags made the old regex rescan the rest of the file from each of them:
+  // 200 KB took seconds, 40 MB — hours, with the whole server frozen
+  it('unclosed tags take linear time, not quadratic', () => {
+    const size = 4 * 1024 * 1024;
+    const gpx = '<gpx><trk><trkseg>' + '<trkpt lat="1" lon="1">'.repeat(size / 23);
+    const tcx = '<TrainingCenterDatabase>' + '<Trackpoint>'.repeat(size / 12);
+    const noGt = '<gpx>' + '<trkpt lat="1"'.repeat(size / 14);
+    const t = Date.now();
+    expect(parseGpxText(gpx).samples).toEqual([]);
+    expect(parseTcxText(tcx).samples).toEqual([]);
+    expect(parseGpxText(noGt).samples).toEqual([]);
+    expect(Date.now() - t).toBeLessThan(3000);
+  });
+
+  it('a track longer than the limit is refused', () => {
+    const one = pt(1);
+    const xml = '<gpx>' + one.repeat(MAX_TRACK_POINTS + 1) + '</gpx>';
+    expect(() => parseGpxText(xml)).toThrow(/точек/);
   });
 });

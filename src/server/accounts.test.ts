@@ -4,8 +4,9 @@ import {
   changePassword,
   checkLoginCode,
   loginWithPassword,
+  parseLoginId,
   registerWithPassword,
-  setPasswordByEmail,
+  setPasswordByLogin,
   confirmTelegramLogin,
   createGroup,
   createInvite,
@@ -50,9 +51,11 @@ describe('accounts', () => {
   });
 
   it('sign-up and sign-in with a password; the address is unique; passwords are hashed', async () => {
-    const u = await registerWithPassword(db, 'Pass@Mail.ru', 'Аня', 'correct horse', admins);
+    const u = await registerWithPassword(db, parseLoginId('Pass@Mail.ru')!, 'Аня', 'correct horse', admins);
     expect(u?.name).toBe('Аня');
-    expect(await registerWithPassword(db, 'pass@mail.ru', 'Другая', 'whatever1', admins)).toBeNull();
+    expect(
+      await registerWithPassword(db, parseLoginId('pass@mail.ru')!, 'Другая', 'whatever1', admins)
+    ).toBeNull();
     expect((await loginWithPassword(db, 'PASS@mail.ru', 'correct horse', admins))?.id).toBe(u!.id);
     expect(await loginWithPassword(db, 'pass@mail.ru', 'wrong pass', admins)).toBeNull();
     expect(await loginWithPassword(db, 'nobody@mail.ru', 'correct horse', admins)).toBeNull();
@@ -65,10 +68,35 @@ describe('accounts', () => {
     expect(await changePassword(db, u!.id, 'wrong', 'new password')).toBe(false);
     expect(await changePassword(db, u!.id, 'correct horse', 'new password')).toBe(true);
     expect(await loginWithPassword(db, 'pass@mail.ru', 'new password', admins)).not.toBeNull();
-    expect(await setPasswordByEmail(db, 'pass@mail.ru', 'from admin 1')).toBe(true);
+    const session = await createSession(db, u!.id);
+    expect(await setPasswordByLogin(db, 'pass@mail.ru', 'from admin 1')).toBe(true);
     expect(await loginWithPassword(db, 'pass@mail.ru', 'from admin 1', admins)).not.toBeNull();
-    expect(await setPasswordByEmail(db, 'nobody@mail.ru', 'x'.repeat(8))).toBe(false);
+    // a password set by the admin ends every earlier sign-in
+    expect(await sessionUser(db, session)).toBeNull();
+    expect(await setPasswordByLogin(db, 'nobody@mail.ru', 'x'.repeat(8))).toBe(false);
     // ~10 scrypt hashes: on a busy build server well over the default 5 s
+  }, 30_000);
+
+  it('e-mail or nickname: what the text is; a nickname is unique regardless of case', async () => {
+    expect(parseLoginId(' A@B.ru ')).toEqual({ email: 'a@b.ru' });
+    expect(parseLoginId('Аня_run.2')).toEqual({ nick: 'Аня_run.2' });
+    for (const bad of ['ab', 'a'.repeat(31), 'with space', 'a@b', 'x;drop', '<b>', '']) {
+      expect(parseLoginId(bad), bad).toBeNull();
+    }
+
+    const nick = await registerWithPassword(db, { nick: 'Runner_1' }, 'Бегун', 'nick password', admins);
+    expect(nick?.login).toBe('Runner_1');
+    expect(nick?.email).toBeNull();
+    expect(nick?.isAdmin).toBe(false);
+    expect(await registerWithPassword(db, { nick: 'runner_1' }, 'Другой', 'nick password', admins)).toBeNull();
+    // two accounts without an e-mail do not clash on it
+    expect(await registerWithPassword(db, { nick: 'Runner_2' }, 'Второй', 'nick password', admins)).not.toBeNull();
+
+    expect((await loginWithPassword(db, 'RUNNER_1', 'nick password', admins))?.id).toBe(nick!.id);
+    expect(await loginWithPassword(db, 'Runner_1', 'wrong pass', admins)).toBeNull();
+    expect(await setPasswordByLogin(db, 'runner_1', 'reset by admin')).toBe(true);
+    expect((await loginWithPassword(db, 'Runner_1', 'reset by admin', admins))?.id).toBe(nick!.id);
+    expect((await sessionUser(db, await createSession(db, nick!.id)))?.login).toBe('Runner_1');
   }, 30_000);
 
   it('e-mail codes: one per minute, right once, burnt by wrong tries', async () => {

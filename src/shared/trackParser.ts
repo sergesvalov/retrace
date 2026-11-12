@@ -26,6 +26,47 @@ export function pickTrackColor(index: number): string {
   return PALETTE[index % PALETTE.length];
 }
 
+/** A track longer than this (≈ 55 h at one point per second) is refused */
+export const MAX_TRACK_POINTS = 200_000;
+
+function tooManyPoints(): Error {
+  return new Error(`В треке больше ${MAX_TRACK_POINTS.toLocaleString('ru')} точек — слишком длинный`);
+}
+
+/**
+ * Every `<tag …>body</tag>` in the text, in one pass. Files come from the internet: a lazy
+ * regex like `<tag>([\s\S]*?)</tag>` rescans the rest of the file from every opening tag that
+ * is never closed — quadratic, a few MB froze the server for minutes. Here every search moves
+ * forward only, and a missing `>` or closing tag ends the scan.
+ * Self-closing `<tag …/>` has no body and is skipped.
+ */
+export function* xmlElements(
+  xml: string,
+  tag: string
+): Generator<{ attrs: string; body: string }> {
+  const open = new RegExp(`<${tag}\\b`, 'gi');
+  const close = new RegExp(`</${tag}\\s*>`, 'gi');
+  let m: RegExpExecArray | null;
+  while ((m = open.exec(xml)) !== null) {
+    const gt = xml.indexOf('>', m.index);
+    if (gt < 0) return;
+    const attrs = xml.slice(m.index + 1 + tag.length, gt);
+    if (attrs.endsWith('/')) {
+      open.lastIndex = gt + 1;
+      continue;
+    }
+    close.lastIndex = gt + 1;
+    const c = close.exec(xml);
+    if (!c) return;
+    yield { attrs, body: xml.slice(gt + 1, c.index) };
+    open.lastIndex = c.index + c[0].length;
+  }
+}
+
+function xmlAttr(attrs: string, name: string): string | undefined {
+  return new RegExp(`\\b${name}\\s*=\\s*["']([^"']*)["']`, 'i').exec(attrs)?.[1];
+}
+
 /** Parse GPX XML text into raw samples */
 export function parseGpxText(xml: string): {
   name?: string;
@@ -36,16 +77,10 @@ export function parseGpxText(xml: string): {
     xml.match(/<name>([^<]+)<\/name>/i);
   const name = nameMatch ? nameMatch[1].trim() : undefined;
 
-  // `(?<!\/)>` skips self-closing <trkpt .../> (no <time>), which would otherwise swallow the next point's body
-  const ptRegex =
-    /<trkpt\b[^>]*?\blat=["']([^"']+)["'][^>]*?\blon=["']([^"']+)["'][^>]*(?<!\/)>([\s\S]*?)<\/trkpt>|<trkpt\b[^>]*?\blon=["']([^"']+)["'][^>]*?\blat=["']([^"']+)["'][^>]*(?<!\/)>([\s\S]*?)<\/trkpt>/gi;
-
   const samples: RawTrackSample[] = [];
-  let match: RegExpExecArray | null;
-  while ((match = ptRegex.exec(xml)) !== null) {
-    const lat = parseFloat(match[1] ?? match[5]);
-    const lon = parseFloat(match[2] ?? match[4]);
-    const body = match[3] ?? match[6] ?? '';
+  for (const { attrs, body } of xmlElements(xml, 'trkpt')) {
+    const lat = parseFloat(xmlAttr(attrs, 'lat') ?? '');
+    const lon = parseFloat(xmlAttr(attrs, 'lon') ?? '');
     if (!Number.isFinite(lat) || !Number.isFinite(lon)) continue;
 
     const timeMatch = body.match(/<time>([^<]+)<\/time>/i);
@@ -60,6 +95,7 @@ export function parseGpxText(xml: string): {
       /<(?:gpxtpx:cad|ns3:cad|cad)>([^<]+)<\/(?:gpxtpx:cad|ns3:cad|cad)>/i
     );
 
+    if (samples.length >= MAX_TRACK_POINTS) throw tooManyPoints();
     samples.push({
       timeMs,
       lat,
@@ -81,11 +117,8 @@ export function parseTcxText(xml: string): {
   const idMatch = xml.match(/<Id>([^<]+)<\/Id>/i);
   const name = idMatch ? idMatch[1].trim() : undefined;
 
-  const tpRegex = /<Trackpoint>([\s\S]*?)<\/Trackpoint>/gi;
   const samples: RawTrackSample[] = [];
-  let match: RegExpExecArray | null;
-  while ((match = tpRegex.exec(xml)) !== null) {
-    const body = match[1];
+  for (const { body } of xmlElements(xml, 'Trackpoint')) {
     const latMatch = body.match(/<LatitudeDegrees>([^<]+)<\/LatitudeDegrees>/i);
     const lonMatch = body.match(
       /<LongitudeDegrees>([^<]+)<\/LongitudeDegrees>/i
@@ -109,6 +142,7 @@ export function parseTcxText(xml: string): {
     );
     const cadMatch = body.match(/<Cadence>([^<]+)<\/Cadence>/i);
 
+    if (samples.length >= MAX_TRACK_POINTS) throw tooManyPoints();
     samples.push({
       timeMs,
       lat,
@@ -153,6 +187,10 @@ export function parseFitBuffer(buffer: ArrayBuffer | Buffer): Promise<{
           Number.isFinite(lon) &&
           Number.isFinite(ts)
         ) {
+          if (samples.length >= MAX_TRACK_POINTS) {
+            reject(tooManyPoints());
+            return;
+          }
           samples.push({
             timeMs: ts,
             lat,

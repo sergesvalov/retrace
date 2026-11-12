@@ -8,7 +8,8 @@ import {
   loginWithPassword,
   MIN_PASSWORD_LENGTH,
   registerWithPassword,
-  setPasswordByEmail,
+  parseLoginId,
+  setPasswordByLogin,
   allClubs,
   checkLoginCode,
   createGroup,
@@ -82,12 +83,12 @@ function setSessionCookie(reply: FastifyReply, token: string | null, secure: boo
   reply.header('Set-Cookie', attrs.join('; '));
 }
 
-/** Small in-memory limiter: at most `max` hits per key per minute */
-function limiter(max: number) {
+/** Small in-memory limiter: at most `max` hits per key per `windowMs` (a minute) */
+function limiter(max: number, windowMs = 60_000) {
   const hits = new Map<string, number[]>();
   return (key: string) => {
     const now = Date.now();
-    const recent = (hits.get(key) ?? []).filter((t) => now - t < 60_000);
+    const recent = (hits.get(key) ?? []).filter((t) => now - t < windowMs);
     recent.push(now);
     hits.set(key, recent);
     if (hits.size > 10_000) hits.clear();
@@ -100,6 +101,9 @@ export async function registerAuth(app: FastifyInstance, opts: AuthOptions) {
   const emailLimit = limiter(5);
   const passwordLimit = limiter(10);
   const telegramLimit = limiter(10);
+  // New accounts from one address: a script cannot mint them by the thousand (a club at a
+  // training on one Wi-Fi still fits)
+  const registerLimit = limiter(20, 3600_000);
 
   app.decorateRequest('user', null);
   app.decorateRequest('viewer', null as unknown as Viewer);
@@ -124,6 +128,7 @@ export async function registerAuth(app: FastifyInstance, opts: AuthOptions) {
         id: user.id,
         name: user.name,
         email: user.email,
+        login: user.login,
         telegramUsername: user.telegramUsername,
         isAdmin: user.isAdmin,
       },
@@ -146,41 +151,61 @@ export async function registerAuth(app: FastifyInstance, opts: AuthOptions) {
     return { ok: true };
   });
 
-  // ---- Sign-up / sign-in with e-mail and password ----
+  // ---- Sign-up / sign-in with an e-mail or a nickname and a password ----
 
-  app.post<{ Body: { email?: string; name?: string; password?: string } }>(
+  /** `login` from the form; older clients send `email` */
+  const loginOf = (body: { login?: unknown; email?: unknown } | undefined) => {
+    const v = body?.login ?? body?.email;
+    return typeof v === 'string' ? v.trim() : '';
+  };
+
+  app.post<{ Body: { login?: string; email?: string; name?: string; password?: string } }>(
     '/api/auth/register',
     async (req, reply) => {
-      const email = req.body?.email?.trim().toLowerCase() ?? '';
+      const id = parseLoginId(loginOf(req.body));
       const name = req.body?.name?.trim() ?? '';
       const password = req.body?.password ?? '';
-      if (!EMAIL_RE.test(email) || email.length > 200) {
-        return reply.code(400).send({ error: 'Проверьте адрес почты' });
+      if (!id) {
+        return reply
+          .code(400)
+          .send({ error: 'Введите почту или ник: 3–30 букв или цифр, можно «_», «.» и «-»' });
       }
       if (!name) return reply.code(400).send({ error: 'Введите имя' });
       if (password.length < MIN_PASSWORD_LENGTH || password.length > 200) {
         return reply.code(400).send({ error: `Пароль — не короче ${MIN_PASSWORD_LENGTH} символов` });
       }
-      if (!passwordLimit(req.ip)) return reply.code(429).send({ error: 'Слишком часто, подождите минуту' });
-      const user = await registerWithPassword(db, email, name, password, admins);
-      if (!user) return reply.code(409).send({ error: 'Этот адрес уже зарегистрирован — войдите' });
+      if (!passwordLimit(req.ip) || !registerLimit(req.ip)) {
+        return reply.code(429).send({ error: 'Слишком много регистраций, попробуйте позже' });
+      }
+      const user = await registerWithPassword(db, id, name, password, admins);
+      if (!user) {
+        return reply.code(409).send({
+          error: 'email' in id ? 'Этот адрес уже зарегистрирован — войдите' : 'Этот ник уже занят',
+        });
+      }
       await signIn(reply, user.id);
       return { ok: true };
     }
   );
 
-  app.post<{ Body: { email?: string; password?: string } }>('/api/auth/login', async (req, reply) => {
-    const email = req.body?.email?.trim().toLowerCase() ?? '';
-    const password = req.body?.password ?? '';
-    // Per address and per client: slows down password guessing
-    if (!passwordLimit(req.ip) || !passwordLimit(`email:${email}`)) {
-      return reply.code(429).send({ error: 'Слишком много попыток, подождите минуту' });
+  app.post<{ Body: { login?: string; email?: string; password?: string } }>(
+    '/api/auth/login',
+    async (req, reply) => {
+      const login = loginOf(req.body);
+      const password = req.body?.password ?? '';
+      // Per address and per account: slows down password guessing
+      if (!passwordLimit(req.ip) || !passwordLimit(`login:${login.toLowerCase()}`)) {
+        return reply.code(429).send({ error: 'Слишком много попыток, подождите минуту' });
+      }
+      const user =
+        login && password && login.length <= 200
+          ? await loginWithPassword(db, login, password, admins)
+          : null;
+      if (!user) return reply.code(400).send({ error: 'Неверная почта/ник или пароль' });
+      await signIn(reply, user.id);
+      return { ok: true };
     }
-    const user = email && password ? await loginWithPassword(db, email, password, admins) : null;
-    if (!user) return reply.code(400).send({ error: 'Неверная почта или пароль' });
-    await signIn(reply, user.id);
-    return { ok: true };
-  });
+  );
 
   app.post<{ Body: { current?: string; next?: string } }>('/api/me/password', async (req, reply) => {
     if (!req.user) return reply.code(401).send({ error: 'Войдите' });
@@ -195,7 +220,7 @@ export async function registerAuth(app: FastifyInstance, opts: AuthOptions) {
   });
 
   // Forgotten password: there is no e-mail to reset it by, a site admin sets a new one
-  app.post<{ Body: { email?: string; password?: string } }>(
+  app.post<{ Body: { login?: string; email?: string; password?: string } }>(
     '/api/admin/set-password',
     async (req, reply) => {
       if (!req.user?.isAdmin) return reply.code(403).send({ error: 'Только администратор сайта' });
@@ -203,7 +228,7 @@ export async function registerAuth(app: FastifyInstance, opts: AuthOptions) {
       if (password.length < MIN_PASSWORD_LENGTH) {
         return reply.code(400).send({ error: `Пароль — не короче ${MIN_PASSWORD_LENGTH} символов` });
       }
-      const ok = await setPasswordByEmail(db, req.body?.email ?? '', password);
+      const ok = await setPasswordByLogin(db, loginOf(req.body), password);
       if (!ok) return reply.code(404).send({ error: 'Нет такого пользователя' });
       return { ok: true };
     }

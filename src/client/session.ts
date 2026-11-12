@@ -5,8 +5,19 @@ export interface MeUser {
   id: string;
   name: string;
   email: string | null;
+  /** nickname, for those who signed up without an e-mail */
+  login: string | null;
   telegramUsername: string | null;
   isAdmin: boolean;
+}
+
+/** How an account is shown under a name: its e-mail, nickname or Telegram */
+export function accountLabel(u: {
+  email: string | null;
+  login?: string | null;
+  telegramUsername: string | null;
+}): string {
+  return u.email ?? (u.login ? `ник ${u.login}` : u.telegramUsername ? `@${u.telegramUsername}` : 'Telegram');
 }
 
 export interface MyGroup {

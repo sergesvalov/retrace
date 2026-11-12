@@ -1,13 +1,14 @@
 import React, { useEffect, useState } from 'react';
 import { Check, Copy, LogOut, Plus, Trash2, UserMinus, X } from 'lucide-react';
 import { GROUP_ROLES, type GroupKind, type GroupRole } from '../../shared/types.js';
-import { api, appUrl, ROLE_LABELS, type Me, type MyGroup } from '../session.js';
+import { accountLabel, api, appUrl, ROLE_LABELS, type Me, type MyGroup } from '../session.js';
 
 interface Member {
   userId: string;
   name: string;
   role: GroupRole;
   email: string | null;
+  login: string | null;
   telegramUsername: string | null;
 }
 
@@ -145,7 +146,7 @@ export const GroupsDialog: React.FC<Props> = ({ me, onChanged, onClose }) => {
                 </button>
               </div>
               <div className="text-[11px] text-slate-500">
-                {user.email ?? (user.telegramUsername ? `@${user.telegramUsername}` : 'Telegram')}
+                {accountLabel(user)}
                 {user.isAdmin && ' · администратор сайта'}
               </div>
             </form>
@@ -184,16 +185,18 @@ export const GroupsDialog: React.FC<Props> = ({ me, onChanged, onClose }) => {
                   onSubmit={(e) => {
                     e.preventDefault();
                     const f = e.currentTarget;
-                    const email = (f.elements.namedItem('email') as HTMLInputElement).value;
+                    const login = (f.elements.namedItem('login') as HTMLInputElement).value;
                     const password = (f.elements.namedItem('password') as HTMLInputElement).value;
                     void run(async () => {
-                      await api('POST', 'api/admin/set-password', { email, password });
+                      await api('POST', 'api/admin/set-password', { login, password });
                       f.reset();
-                      window.alert(`Новый пароль для ${email} задан — передайте его пользователю`);
+                      window.alert(
+                        `Новый пароль для ${login} задан, прежние входы закрыты — передайте пароль пользователю`
+                      );
                     });
                   }}
                 >
-                  <input name="email" type="email" required placeholder="Почта пользователя"
+                  <input name="login" type="text" required placeholder="Почта или ник пользователя"
                     className="w-full px-2 py-1 rounded-lg bg-slate-950 border border-slate-700" />
                   <input name="password" type="text" required minLength={8} placeholder="Новый пароль"
                     className="w-full px-2 py-1 rounded-lg bg-slate-950 border border-slate-700" />
@@ -364,7 +367,7 @@ export const GroupsDialog: React.FC<Props> = ({ me, onChanged, onClose }) => {
                           {m.userId === user.id && <span className="text-slate-500"> (вы)</span>}
                         </div>
                         <div className="text-[11px] text-slate-500 truncate">
-                          {m.email ?? (m.telegramUsername ? `@${m.telegramUsername}` : 'Telegram')}
+                          {accountLabel(m)}
                         </div>
                       </div>
                       <div className="flex items-center gap-1 shrink-0">

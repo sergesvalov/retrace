@@ -3,7 +3,7 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import { promisify } from 'node:util';
 import zlib from 'node:zlib';
-import Fastify, { type FastifyReply, type FastifyRequest } from 'fastify';
+import Fastify, { type FastifyError, type FastifyReply, type FastifyRequest } from 'fastify';
 import multipart from '@fastify/multipart';
 import {
   autoPlaceScreenshotOnBounds,
@@ -48,6 +48,18 @@ import {
 } from './accounts.js';
 import { registerAuth } from './authRoutes.js';
 import { trustProxyFromEnv } from './proxy.js';
+import {
+  hasFreeSpace,
+  imageExtOf,
+  JSON_BODY_LIMIT,
+  MAX_MAP_FILE,
+  MAX_OWN_EVENTS,
+  MAX_PARTICIPANTS,
+  MAX_TRACK_FILE,
+  MAX_UPLOADS_PER_WINDOW,
+  PAGE_CSP,
+  UPLOAD_WINDOW_MS,
+} from './limits.js';
 import { migrate, openDb } from './db.js';
 import { createMailer, type Mailer } from './mail.js';
 import {
@@ -90,6 +102,7 @@ const EVENTS_DIR = path.join(DATA_DIR, 'events');
 /** data/tracks/<eventId>/<participantId>.json — packed points, written once per upload */
 const TRACKS_DIR = path.join(DATA_DIR, 'tracks');
 const UPLOADS_DIR = path.join(DATA_DIR, 'uploads');
+const diskHasRoom = () => hasFreeSpace(UPLOADS_DIR);
 
 function makeId(len = 8): string {
   return crypto
@@ -214,7 +227,6 @@ async function loadTrackFromDisk(eventId: string, participantId: string): Promis
   }
 }
 
-const MAP_IMAGE_EXTS = new Set(['.png', '.jpg', '.jpeg', '.webp', '.gif']);
 const HEX_COLOR_RE = /^#[0-9a-fA-F]{6}$/;
 
 /** Finite and invertible (a zero scale would collapse the map into a point) */
@@ -352,9 +364,41 @@ async function startServer() {
 
   const app = Fastify({
     logger: true,
-    bodyLimit: 50 * 1024 * 1024, // 50 MB
+    // JSON bodies (settings, course, pins) are a few KB. The body is read before any sign-in
+    // check, so a large limit let anyone make the server parse 50 MB per request.
+    // Files go through multipart with their own limits below.
+    bodyLimit: JSON_BODY_LIMIT,
     // Behind haproxy: the client's real address for rate limits (see proxy.ts)
     trustProxy: trustProxyFromEnv(process.env.TRUST_PROXY),
+  });
+
+  // Before any route: Fastify binds hooks and the error handler to a route when it is added
+
+  // Errors: a clear message for the limits; the text of an unexpected error stays in the log
+  app.setErrorHandler((err: FastifyError, req, reply) => {
+    const status = err.statusCode && err.statusCode >= 400 ? err.statusCode : 500;
+    if (err.code === 'FST_REQ_FILE_TOO_LARGE') {
+      return reply.code(413).send({ error: 'Файл слишком большой' });
+    }
+    if (err.code === 'FST_ERR_CTP_BODY_TOO_LARGE') {
+      return reply.code(413).send({ error: 'Слишком большой запрос' });
+    }
+    if (status >= 500) {
+      req.log.error(err);
+      return reply.code(status).send({ error: 'Ошибка сервера' });
+    }
+    return reply.code(status).send({ error: err.message });
+  });
+
+  // Security headers on every response
+  app.addHook('onSend', async (req, reply, payload) => {
+    reply.header('X-Content-Type-Options', 'nosniff');
+    reply.header('X-Frame-Options', 'DENY');
+    reply.header('Referrer-Policy', 'strict-origin-when-cross-origin');
+    if (!reply.hasHeader('content-security-policy')) {
+      reply.header('Content-Security-Policy', PAGE_CSP);
+    }
+    return payload;
   });
 
   await registerAuth(app, {
@@ -407,9 +451,33 @@ async function startServer() {
 
   await app.register(multipart, {
     limits: {
-      fileSize: 40 * 1024 * 1024,
+      fileSize: MAX_MAP_FILE,
+      // One file and a few small fields (width, height, dpi, view) per request
+      files: 1,
+      fields: 10,
+      fieldSize: 64 * 1024,
+      parts: 12,
     },
   });
+
+  /** Uploads per signed-in user: maps and tracks */
+  const uploadLimit = (() => {
+    const hits = new Map<string, number[]>();
+    return (userId: string) => {
+      const now = Date.now();
+      const recent = (hits.get(userId) ?? []).filter((t) => now - t < UPLOAD_WINDOW_MS);
+      recent.push(now);
+      hits.set(userId, recent);
+      if (hits.size > 10_000) hits.clear();
+      return recent.length <= MAX_UPLOADS_PER_WINDOW;
+    };
+  })();
+  /** Refuses (and answers 429) when this user uploads too often */
+  function uploadAllowed(req: FastifyRequest, reply: FastifyReply): boolean {
+    if (req.viewer.isAdmin || uploadLimit(req.user?.id ?? req.ip)) return true;
+    void reply.code(429).send({ error: 'Слишком много загрузок подряд, подождите несколько минут' });
+    return false;
+  }
 
   // Serve uploaded map images from /uploads/:file
   app.get<{ Params: { file: string } }>(
@@ -426,6 +494,8 @@ async function startServer() {
         );
         // Every upload gets a new random name (a replaced map is a new file): cache forever
         reply.header('Cache-Control', IMMUTABLE_CACHE);
+        // Someone's file: never active content, even opened directly
+        reply.header('Content-Security-Policy', "default-src 'none'; sandbox");
         return reply.send(buf);
       } catch {
         return reply.code(404).send({ error: 'File not found' });
@@ -532,6 +602,14 @@ async function startServer() {
     '/api/events',
     async (req, reply) => {
       if (!req.user) return reply.code(401).send({ error: 'Войдите' });
+      if (!req.user.isAdmin) {
+        const own = [...eventsStore.values()].filter((e) => e.ownerId === req.user!.id).length;
+        if (own >= MAX_OWN_EVENTS) {
+          return reply
+            .code(403)
+            .send({ error: `У вас уже ${MAX_OWN_EVENTS} событий — удалите ненужные` });
+        }
+      }
       const kind = req.body?.kind ?? 'orienteering';
       if (!EVENT_KINDS.includes(kind)) {
         return reply.code(400).send({ error: 'Неизвестный вид события' });
@@ -613,23 +691,27 @@ async function startServer() {
     async (req, reply) => {
       const evt = requireEvent(req, reply, 'edit');
       if (!evt) return reply;
+      if (!uploadAllowed(req, reply)) return reply;
+      if (!(await diskHasRoom())) {
+        return reply.code(507).send({ error: 'На сервере кончается место — загрузка карт временно закрыта' });
+      }
 
       const data = await req.file();
       if (!data) {
         return reply.code(400).send({ error: 'Файл карты не передан' });
       }
 
-      // Only image extensions: anything else (e.g. .html) would be served back as active content
-      const ext = path.extname(data.filename || '.png').toLowerCase() || '.png';
-      if (!MAP_IMAGE_EXTS.has(ext)) {
-        data.file.resume();
+      // Only images, judged by the content, not the name: anything else (e.g. HTML named
+      // .png) would be served back as active content. The extension follows the content.
+      const buffer = await data.toBuffer();
+      const ext = imageExtOf(buffer);
+      if (!ext) {
         return reply
           .code(400)
           .send({ error: 'Карта должна быть изображением (PNG, JPG, WEBP, GIF)' });
       }
       const fileId = `${evt.id}-map-${makeId(6)}${ext}`;
       const filePath = path.join(UPLOADS_DIR, fileId);
-      const buffer = await data.toBuffer();
       await fs.writeFile(filePath, buffer);
 
       const widthField = (data.fields?.width as { value?: string } | undefined)
@@ -887,8 +969,12 @@ async function startServer() {
     async (req, reply) => {
       const evt = requireEvent(req, reply, 'upload');
       if (!evt) return reply;
+      if (evt.participants.length >= MAX_PARTICIPANTS) {
+        return reply.code(400).send({ error: `В событии уже ${MAX_PARTICIPANTS} треков` });
+      }
+      if (!uploadAllowed(req, reply)) return reply;
 
-      const data = await req.file();
+      const data = await req.file({ limits: { fileSize: MAX_TRACK_FILE } });
       if (!data) {
         return reply.code(400).send({ error: 'Файл трека не найден' });
       }
@@ -1249,7 +1335,8 @@ async function startServer() {
     const cleanUrl = req.url.split('?')[0] || '/';
     const relPath = cleanUrl === '/' ? 'index.html' : cleanUrl.replace(/^\/+/, '');
     const resolved = path.resolve(clientDistDir, relPath);
-    if (!resolved.startsWith(clientDistDir)) {
+    // With the separator: `../client-other/…` must not pass as inside `client`
+    if (!resolved.startsWith(clientDistDir + path.sep)) {
       return reply.code(403).send({ error: 'Forbidden' });
     }
     try {
