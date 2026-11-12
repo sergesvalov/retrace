@@ -1,6 +1,7 @@
 import type { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify';
 import type { Viewer } from '../shared/access.js';
 import { GROUP_ROLES, type GroupKind, type GroupRole } from '../shared/types.js';
+import { cookiePath } from './proxy.js';
 import {
   acceptInvite,
   changePassword,
@@ -72,7 +73,7 @@ function readCookie(req: FastifyRequest, name: string): string | null {
 function setSessionCookie(reply: FastifyReply, token: string | null, secure: boolean) {
   const attrs = [
     `${COOKIE}=${token ? encodeURIComponent(token) : ''}`,
-    'Path=/',
+    `Path=${cookiePath(reply.request.headers['x-forwarded-prefix'])}`,
     'HttpOnly',
     'SameSite=Lax',
     `Max-Age=${token ? SESSION_MAX_AGE_SEC : 0}`,

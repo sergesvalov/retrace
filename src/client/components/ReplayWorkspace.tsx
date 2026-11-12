@@ -118,6 +118,7 @@ import {
   legRunnerIds,
   replayPoints,
 } from '../map/videoCamera.js';
+import { appUrl } from '../session.js';
 // Map fitting UI is only needed for orienteering maps: loaded on first use
 const FitPanel = React.lazy(() =>
   import('./FitPanel.js').then((m) => ({ default: m.FitPanel }))
@@ -649,7 +650,7 @@ export const ReplayWorkspace: React.FC<Props> = ({
 
   async function putCourse(body: object) {
     const eventId = eventRef.current.id;
-    const res = await fetch(`/api/events/${eventId}/course`, {
+    const res = await fetch(`api/events/${eventId}/course`, {
       method: 'PUT',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(body),
@@ -803,7 +804,7 @@ export const ReplayWorkspace: React.FC<Props> = ({
       setIsPlaying(false);
       return;
     }
-    const res = await fetch(`/api/events/${event.id}/trims`, {
+    const res = await fetch(`api/events/${event.id}/trims`, {
       method: 'PUT',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ trims }),
@@ -1004,7 +1005,7 @@ export const ReplayWorkspace: React.FC<Props> = ({
       if (event.map?.cornersLonLat) {
         map.addSource('custom-map', {
           type: 'image',
-          url: event.map.imageUrl,
+          url: appUrl(event.map.imageUrl),
           coordinates: event.map.cornersLonLat,
         });
         customMapUrlRef.current = event.map.imageUrl;
@@ -1102,14 +1103,14 @@ export const ReplayWorkspace: React.FC<Props> = ({
       if (customMapUrlRef.current === mapObj.imageUrl) {
         src.setCoordinates(corners);
       } else {
-        src.updateImage({ url: mapObj.imageUrl, coordinates: corners });
+        src.updateImage({ url: appUrl(mapObj.imageUrl), coordinates: corners });
       }
       customMapUrlRef.current = mapObj.imageUrl;
     } else {
       customMapUrlRef.current = mapObj.imageUrl;
       map.addSource('custom-map', {
         type: 'image',
-        url: mapObj.imageUrl,
+        url: appUrl(mapObj.imageUrl),
         coordinates: corners,
       });
       map.addLayer(
@@ -1325,7 +1326,7 @@ export const ReplayWorkspace: React.FC<Props> = ({
     // Saves run one after another so the server always ends up with the last placement
     matrixSaveChainRef.current = matrixSaveChainRef.current.then(async () => {
       try {
-        const res = await fetch(`/api/events/${eventId}/map-nudge`, {
+        const res = await fetch(`api/events/${eventId}/map-nudge`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ matrix, meta }),
@@ -1493,7 +1494,7 @@ export const ReplayWorkspace: React.FC<Props> = ({
           : null;
       const { circles, result: res } = await runAutoGeorefTask(
         {
-          url: meta.imageUrl,
+          url: appUrl(meta.imageUrl),
           fullWidth: meta.width,
           scanDpi: meta.scanDpi,
           participants: eventRef.current.participants,
@@ -1580,7 +1581,7 @@ export const ReplayWorkspace: React.FC<Props> = ({
     clearPins?: boolean;
   }) {
     const eventId = eventRef.current.id;
-    const res = await fetch(`/api/events/${eventId}/map-nudge`, {
+    const res = await fetch(`api/events/${eventId}/map-nudge`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(body),
@@ -1641,7 +1642,7 @@ export const ReplayWorkspace: React.FC<Props> = ({
   }
 
   async function handleResetMapAutoFit() {
-    const res = await fetch(`/api/events/${event.id}/map-nudge`, {
+    const res = await fetch(`api/events/${event.id}/map-nudge`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ resetAutoFit: true, view: currentViewBounds() }),
@@ -1838,7 +1839,7 @@ export const ReplayWorkspace: React.FC<Props> = ({
     if (!window.confirm('Удалить загруженную карту из этого мероприятия?')) {
       return;
     }
-    const res = await fetch(`/api/events/${event.id}/map`, {
+    const res = await fetch(`api/events/${event.id}/map`, {
       method: 'DELETE',
     });
     if (res.ok) {
@@ -1864,7 +1865,7 @@ export const ReplayWorkspace: React.FC<Props> = ({
       for (const file of files) {
         const form = new FormData();
         form.append('file', file);
-        const res = await fetch(`/api/events/${event.id}/tracks`, {
+        const res = await fetch(`api/events/${event.id}/tracks`, {
           method: 'POST',
           body: form,
         });
@@ -1959,7 +1960,7 @@ export const ReplayWorkspace: React.FC<Props> = ({
       if (view) form.append('view', JSON.stringify(view));
       form.append('file', file);
 
-      const res = await fetch(`/api/events/${event.id}/map`, {
+      const res = await fetch(`api/events/${event.id}/map`, {
         method: 'POST',
         body: form,
       });
@@ -2002,7 +2003,7 @@ export const ReplayWorkspace: React.FC<Props> = ({
       return;
     }
     const res = await fetch(
-      `/api/events/${event.id}/participants/${participantId}`,
+      `api/events/${event.id}/participants/${participantId}`,
       {
         method: 'PATCH',
         headers: { 'Content-Type': 'application/json' },
@@ -2017,7 +2018,7 @@ export const ReplayWorkspace: React.FC<Props> = ({
 
   async function deleteParticipant(participantId: string) {
     const res = await fetch(
-      `/api/events/${event.id}/participants/${participantId}`,
+      `api/events/${event.id}/participants/${participantId}`,
       {
         method: 'DELETE',
       }
@@ -2036,7 +2037,7 @@ export const ReplayWorkspace: React.FC<Props> = ({
       seekTo(0);
       return;
     }
-    const res = await fetch(`/api/events/${event.id}`, {
+    const res = await fetch(`api/events/${event.id}`, {
       method: 'PATCH',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ timeMode: mode }),
@@ -2148,7 +2149,7 @@ export const ReplayWorkspace: React.FC<Props> = ({
       seekTo(0);
       return;
     }
-    const res = await fetch(`/api/events/${event.id}/sync-start`, {
+    const res = await fetch(`api/events/${event.id}/sync-start`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(

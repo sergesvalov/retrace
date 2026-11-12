@@ -15,6 +15,9 @@ services:
       - NODE_ENV=production
       - PORT=3001
       - TZ=Europe/Athens
+      # Open to the internet through haproxy on 192.168.0.230 (homeservices): http://31.216.75.169:8252/retrace/
+      # Its X-Forwarded-For is trusted, so rate limits count the real client address
+      - TRUST_PROXY=192.168.0.230
     volumes:
       - /opt/retrace/data:/app/data
     labels:

@@ -1,7 +1,7 @@
 import React, { useEffect, useState } from 'react';
 import { Check, Copy, LogOut, Plus, Trash2, UserMinus, X } from 'lucide-react';
 import { GROUP_ROLES, type GroupKind, type GroupRole } from '../../shared/types.js';
-import { api, ROLE_LABELS, type Me, type MyGroup } from '../session.js';
+import { api, appUrl, ROLE_LABELS, type Me, type MyGroup } from '../session.js';
 
 interface Member {
   userId: string;
@@ -45,7 +45,7 @@ export const GroupsDialog: React.FC<Props> = ({ me, onChanged, onClose }) => {
     setInviteUrl(null);
     setMembers([]);
     if (!selectedId) return;
-    api<{ members: Member[] }>('GET', `/api/groups/${selectedId}/members`)
+    api<{ members: Member[] }>('GET', `api/groups/${selectedId}/members`)
       .then((r) => setMembers(r.members))
       .catch((err) => setError(err.message));
   }, [selectedId]);
@@ -66,23 +66,23 @@ export const GroupsDialog: React.FC<Props> = ({ me, onChanged, onClose }) => {
         kind === 'family' ? `Семья ${user.name}` : ''
       );
       if (!title?.trim()) return;
-      const res = await api<{ id: string }>('POST', '/api/groups', { kind, name: title.trim() });
+      const res = await api<{ id: string }>('POST', 'api/groups', { kind, name: title.trim() });
       setSelectedId(res.id);
       onChanged();
     });
 
   const makeInvite = () =>
     run(async () => {
-      const { token } = await api<{ token: string }>('POST', `/api/groups/${selectedId}/invites`, {
+      const { token } = await api<{ token: string }>('POST', `api/groups/${selectedId}/invites`, {
         role: inviteRole,
       });
-      setInviteUrl(`${window.location.origin}/?invite=${token}`);
+      setInviteUrl(appUrl(`?invite=${token}`));
       setCopied(false);
     });
 
   const roleChange = (userId: string, role: GroupRole) =>
     run(async () => {
-      const r = await api<{ members: Member[] }>('PATCH', `/api/groups/${selectedId}/members/${userId}`, {
+      const r = await api<{ members: Member[] }>('PATCH', `api/groups/${selectedId}/members/${userId}`, {
         role,
       });
       setMembers(r.members);
@@ -94,7 +94,7 @@ export const GroupsDialog: React.FC<Props> = ({ me, onChanged, onClose }) => {
       const self = m.userId === user.id;
       if (!window.confirm(self ? `Выйти из «${selected?.name}»?` : `Убрать ${m.name} из «${selected?.name}»?`))
         return;
-      await api('DELETE', `/api/groups/${selectedId}/members/${m.userId}`);
+      await api('DELETE', `api/groups/${selectedId}/members/${m.userId}`);
       if (self) setSelectedId(null);
       else setMembers((list) => list.filter((x) => x.userId !== m.userId));
       onChanged();
@@ -123,7 +123,7 @@ export const GroupsDialog: React.FC<Props> = ({ me, onChanged, onClose }) => {
               onSubmit={(e) => {
                 e.preventDefault();
                 void run(async () => {
-                  await api('PATCH', '/api/me', { name });
+                  await api('PATCH', 'api/me', { name });
                   onChanged();
                 });
               }}
@@ -160,7 +160,7 @@ export const GroupsDialog: React.FC<Props> = ({ me, onChanged, onClose }) => {
                   const current = (f.elements.namedItem('current') as HTMLInputElement).value;
                   const next = (f.elements.namedItem('next') as HTMLInputElement).value;
                   void run(async () => {
-                    await api('POST', '/api/me/password', { current, next });
+                    await api('POST', 'api/me/password', { current, next });
                     f.reset();
                     window.alert('Пароль изменён');
                   });
@@ -187,7 +187,7 @@ export const GroupsDialog: React.FC<Props> = ({ me, onChanged, onClose }) => {
                     const email = (f.elements.namedItem('email') as HTMLInputElement).value;
                     const password = (f.elements.namedItem('password') as HTMLInputElement).value;
                     void run(async () => {
-                      await api('POST', '/api/admin/set-password', { email, password });
+                      await api('POST', 'api/admin/set-password', { email, password });
                       f.reset();
                       window.alert(`Новый пароль для ${email} задан — передайте его пользователю`);
                     });
@@ -267,7 +267,7 @@ export const GroupsDialog: React.FC<Props> = ({ me, onChanged, onClose }) => {
                           void run(async () => {
                             const n = window.prompt('Название', selected.name)?.trim();
                             if (!n) return;
-                            await api('PATCH', `/api/groups/${selected.id}`, { name: n });
+                            await api('PATCH', `api/groups/${selected.id}`, { name: n });
                             onChanged();
                           })
                         }
@@ -284,7 +284,7 @@ export const GroupsDialog: React.FC<Props> = ({ me, onChanged, onClose }) => {
                               )
                             )
                               return;
-                            await api('DELETE', `/api/groups/${selected.id}`);
+                            await api('DELETE', `api/groups/${selected.id}`);
                             setSelectedId(null);
                             onChanged();
                           })

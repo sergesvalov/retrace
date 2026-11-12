@@ -17,7 +17,7 @@ import {
 } from './components/EventDialog.js';
 import { LoginScreen } from './components/LoginScreen.js';
 import { GroupsDialog } from './components/GroupsDialog.js';
-import { api, fetchMe, type Me } from './session.js';
+import { api, appUrl, fetchMe, type Me } from './session.js';
 
 interface EventSummary {
   id: string;
@@ -102,7 +102,7 @@ export const App: React.FC = () => {
     const invite = urlParam('invite');
     if (!current.user) {
       if (invite) {
-        const info = await api<{ groupName: string; kind: string }>('GET', `/api/invites/${invite}`).catch(
+        const info = await api<{ groupName: string; kind: string }>('GET', `api/invites/${invite}`).catch(
           () => null
         );
         setInviteNote(
@@ -123,7 +123,7 @@ export const App: React.FC = () => {
     const invite = urlParam('invite');
     if (invite && current.user) {
       try {
-        await api('POST', `/api/invites/${invite}/accept`);
+        await api('POST', `api/invites/${invite}/accept`);
         const next = await refreshMe();
         const joined = next?.groups.find((g) => !current.groups.some((c) => c.id === g.id));
         setNotice(joined ? `Вы вступили в «${joined.name}»` : 'Приглашение принято');
@@ -145,7 +145,7 @@ export const App: React.FC = () => {
   async function loadEvent(idOrSlug: string) {
     const share = urlParam('share');
     const res = await fetch(
-      `/api/events/${idOrSlug}${share ? `?share=${encodeURIComponent(share)}` : ''}`
+      `api/events/${idOrSlug}${share ? `?share=${encodeURIComponent(share)}` : ''}`
     );
     const data = await res.json().catch(() => ({}));
     if (!res.ok) {
@@ -161,7 +161,7 @@ export const App: React.FC = () => {
   }
 
   async function refreshEventsList(): Promise<EventSummary[]> {
-    const res = await fetch('/api/events');
+    const res = await fetch('api/events');
     if (!res.ok) return [];
     const list: EventSummary[] = (await res.json()).events ?? [];
     setEventsList(list);
@@ -171,7 +171,7 @@ export const App: React.FC = () => {
   async function handleCreateNewEvent(value: EventDialogValue) {
     setCreatingEvent(true);
     try {
-      const data = await api<{ event: RaceEvent; access: EventAccess }>('POST', '/api/events', value);
+      const data = await api<{ event: RaceEvent; access: EventAccess }>('POST', 'api/events', value);
       const evt: RaceEvent = mergeLiteEvent(null, data.event as never);
       setCurrentEvent(evt);
       setAccess(data.access);
@@ -194,7 +194,7 @@ export const App: React.FC = () => {
       access: EventAccess;
       groupName?: string;
       ownerName?: string;
-    }>('PATCH', `/api/events/${currentEvent.id}`, body);
+    }>('PATCH', `api/events/${currentEvent.id}`, body);
     setCurrentEvent((prev) => mergeLiteEvent(prev, data.event));
     setAccess(data.access);
     setAudience({ groupName: data.groupName, ownerName: data.ownerName });
@@ -217,7 +217,7 @@ export const App: React.FC = () => {
       `Удалить мероприятие «${currentEvent.title}» со всеми его картами и треками?`
     );
     if (!ok) return;
-    const res = await fetch(`/api/events/${currentEvent.id}`, { method: 'DELETE' });
+    const res = await fetch(`api/events/${currentEvent.id}`, { method: 'DELETE' });
     if (res.ok) {
       setUrlParam('event', null);
       setFitMapMode(false);
@@ -232,16 +232,14 @@ export const App: React.FC = () => {
     // A personal event shared by link: the link with its token; otherwise the plain address
     // (it opens for those who may see the event)
     const token = currentEvent.shareToken ?? shareToken;
-    const shareUrl = `${window.location.origin}/?event=${currentEvent.slug}${
-      token ? `&share=${token}` : ''
-    }`;
+    const shareUrl = appUrl(`?event=${currentEvent.slug}${token ? `&share=${token}` : ''}`);
     void navigator.clipboard.writeText(shareUrl);
     setCopiedSlug(true);
     setTimeout(() => setCopiedSlug(false), 2000);
   }
 
   async function handleLogout() {
-    await api('POST', '/api/auth/logout').catch(() => {});
+    await api('POST', 'api/auth/logout').catch(() => {});
     setCurrentEvent(null);
     setEventsList([]);
     setUrlParam('event', null);

@@ -47,6 +47,7 @@ import {
   userNames,
 } from './accounts.js';
 import { registerAuth } from './authRoutes.js';
+import { trustProxyFromEnv } from './proxy.js';
 import { migrate, openDb } from './db.js';
 import { createMailer, type Mailer } from './mail.js';
 import {
@@ -352,8 +353,8 @@ async function startServer() {
   const app = Fastify({
     logger: true,
     bodyLimit: 50 * 1024 * 1024, // 50 MB
-    // Behind a reverse proxy: the client's address for rate limits
-    trustProxy: process.env.TRUST_PROXY === '1',
+    // Behind haproxy: the client's real address for rate limits (see proxy.ts)
+    trustProxy: trustProxyFromEnv(process.env.TRUST_PROXY),
   });
 
   await registerAuth(app, {

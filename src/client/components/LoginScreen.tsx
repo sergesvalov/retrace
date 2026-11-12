@@ -33,14 +33,14 @@ export const LoginScreen: React.FC<Props> = ({ login, inviteNote, onSignedIn }) 
   async function startTelegram() {
     setError(null);
     try {
-      const { token, url } = await api<{ token: string; url: string }>('POST', '/api/auth/telegram/start');
+      const { token, url } = await api<{ token: string; url: string }>('POST', 'api/auth/telegram/start');
       window.open(url, '_blank', 'noopener');
       setTgWaiting(url);
       if (pollRef.current) window.clearInterval(pollRef.current);
       pollRef.current = window.setInterval(async () => {
         const res = await api<{ status: string }>(
           'GET',
-          `/api/auth/telegram/poll?token=${encodeURIComponent(token)}`
+          `api/auth/telegram/poll?token=${encodeURIComponent(token)}`
         ).catch(() => ({ status: 'pending' }));
         if (res.status === 'done') {
           window.clearInterval(pollRef.current!);
@@ -66,9 +66,9 @@ export const LoginScreen: React.FC<Props> = ({ login, inviteNote, onSignedIn }) 
     setBusy(true);
     try {
       if (mode === 'register') {
-        await api('POST', '/api/auth/register', { email, name, password });
+        await api('POST', 'api/auth/register', { email, name, password });
       } else {
-        await api('POST', '/api/auth/login', { email, password });
+        await api('POST', 'api/auth/login', { email, password });
       }
       onSignedIn();
     } catch (err) {
@@ -83,7 +83,7 @@ export const LoginScreen: React.FC<Props> = ({ login, inviteNote, onSignedIn }) 
     setBusy(true);
     setError(null);
     try {
-      await api('POST', '/api/auth/email/start', { email });
+      await api('POST', 'api/auth/email/start', { email });
       setCodeSent(true);
     } catch (err) {
       setError((err as Error).message);
@@ -97,7 +97,7 @@ export const LoginScreen: React.FC<Props> = ({ login, inviteNote, onSignedIn }) 
     setBusy(true);
     setError(null);
     try {
-      await api('POST', '/api/auth/email/verify', { email, code });
+      await api('POST', 'api/auth/email/verify', { email, code });
       onSignedIn();
     } catch (err) {
       setError((err as Error).message);

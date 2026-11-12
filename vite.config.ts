@@ -3,6 +3,8 @@ import react from '@vitejs/plugin-react';
 
 export default defineConfig({
   plugins: [react()],
+  // Assets relative to the page: the site is at / at home and at /retrace/ behind haproxy
+  base: './',
   server: {
     port: 5173,
     proxy: {

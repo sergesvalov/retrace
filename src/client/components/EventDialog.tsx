@@ -1,6 +1,6 @@
 import React, { useEffect, useRef, useState } from 'react';
 import type { EventKind, EventScope } from '../../shared/types.js';
-import type { Me } from '../session.js';
+import { appUrl, type Me } from '../session.js';
 
 /** Who an event is for */
 export const EVENT_SCOPE_INFO: Record<EventScope, { icon: string; label: string; hint: string }> = {
@@ -132,7 +132,7 @@ export const EventDialog: React.FC<Props> = ({
         : !groupId || families.some((f) => f.id === groupId);
   const shareUrl =
     shareToken && eventSlug
-      ? `${window.location.origin}/?event=${eventSlug}&share=${shareToken}`
+      ? appUrl(`?event=${eventSlug}&share=${shareToken}`)
       : null;
 
   function pickScope(next: EventScope) {

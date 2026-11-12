@@ -26,8 +26,18 @@ export interface Me {
   login: { password?: boolean; email: boolean; telegram: { bot: string } | null };
 }
 
+/**
+ * Full address of a path inside the app. The site lives at `/` at home and at `/retrace/` behind
+ * haproxy, so app paths are relative to the page (`api/…`, `?event=…`); a server-stored
+ * `/uploads/…` also counts from the app, not the host. For places that need an absolute
+ * address: links to copy, MapLibre and the worker.
+ */
+export function appUrl(path: string): string {
+  return new URL(path.replace(/^\/+/, ''), document.baseURI).href;
+}
+
 export async function fetchMe(): Promise<Me> {
-  const res = await fetch('/api/me');
+  const res = await fetch('api/me');
   if (!res.ok) throw new Error('Сервер недоступен');
   return res.json();
 }
