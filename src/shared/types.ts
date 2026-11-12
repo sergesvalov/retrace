@@ -10,6 +10,30 @@ export type BaseLayer = 'topo' | 'osm' | 'satellite';
 export type MapImageKind = 'orienteering' | 'screenshot';
 
 export const EVENT_KINDS: readonly EventKind[] = ['orienteering', 'run'];
+
+/**
+ * Who an event is for:
+ * championship — a championship stage, every signed-in user sees it and may add their track;
+ * club — a club training, for the club's members;
+ * personal — the owner and their family group (and whoever has its share link).
+ */
+export type EventScope = 'championship' | 'club' | 'personal';
+export const EVENT_SCOPES: readonly EventScope[] = ['championship', 'club', 'personal'];
+
+/** A club, or a family (personal events are shared with it) */
+export type GroupKind = 'club' | 'family';
+/** admin: runs the group; judge: coach/judge (edits the group's events); member */
+export type GroupRole = 'admin' | 'judge' | 'member';
+export const GROUP_ROLES: readonly GroupRole[] = ['admin', 'judge', 'member'];
+
+/** What the signed-in user may do with an event (sent with it by the server) */
+export interface EventAccess {
+  canView: boolean;
+  /** add their own track */
+  canUpload: boolean;
+  /** course, map, settings, everyone's tracks */
+  canEdit: boolean;
+}
 export const MAP_IMAGE_KINDS: readonly MapImageKind[] = [
   'orienteering',
   'screenshot',
@@ -132,6 +156,8 @@ export interface ParticipantTrack {
   trimEndSec: number;
   /** Course (GroundCourseDef id) set by hand; without it the runner's course is detected */
   courseId?: string;
+  /** User who uploaded the track: they may change and delete it */
+  uploadedBy?: string;
   totalDistanceM: number;
   durationSec: number;
   avgSpeedMs: number;
@@ -147,6 +173,13 @@ export interface RaceEvent {
   createdAt: string;
   /** Missing on events created before kinds existed — read it via `eventKindOf` */
   kind?: EventKind;
+  /** Audience; events from before accounts have none: site admins only, until they set it */
+  scope?: EventScope;
+  /** Club (club training, organiser of a championship stage) or family (personal event) */
+  groupId?: string;
+  ownerId?: string;
+  /** Personal event opened by link: anyone with ?share=<token> may view (editors only see it) */
+  shareToken?: string;
   timeMode: TimeMode;
   map?: MapOverlay;
   /**

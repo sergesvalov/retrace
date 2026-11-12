@@ -79,6 +79,9 @@ pipeline {
                         # Создаем папку на целевом сервере 192.168.0.225
                         ssh -o StrictHostKeyChecking=no ${env.DEPLOY_USER}@${PROD_SERVER_IP} "sudo mkdir -p ${DEPLOY_DIR}/data/events ${DEPLOY_DIR}/data/uploads && sudo chown -R ${env.DEPLOY_USER}:${env.DEPLOY_USER} ${DEPLOY_DIR}"
 
+                        # Секреты (DATABASE_URL, токен бота, почта) живут на сервере: создаём пустой файл, если его нет, и никогда не перезаписываем
+                        ssh -o StrictHostKeyChecking=no ${env.DEPLOY_USER}@${PROD_SERVER_IP} "touch ${DEPLOY_DIR}/secrets.env && chmod 600 ${DEPLOY_DIR}/secrets.env"
+
                         # Копируем docker-compose.yml
                         scp -o StrictHostKeyChecking=no docker-compose.yml ${env.DEPLOY_USER}@${PROD_SERVER_IP}:${DEPLOY_DIR}/
 

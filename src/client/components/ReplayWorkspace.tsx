@@ -41,6 +41,7 @@ import {
   eventKindOf,
   type BaseLayer,
   type CourseControl,
+  type EventAccess,
   type GroundControl,
   type GroundCourseDef,
   type MapImageKind,
@@ -67,6 +68,8 @@ import {
   groundToCourse,
   type ParticipantSplits,
 } from '../../shared/course.js';
+import { canEditParticipant } from '../../shared/access.js';
+import { applySyncStart, applyTrims } from '../../shared/replayOps.js';
 import {
   addCourse,
   applyCourseEdit,
@@ -122,6 +125,10 @@ const FitPanel = React.lazy(() =>
 
 interface Props {
   event: RaceEvent;
+  /** What the signed-in user may do (from the server); viewers' replay set-ups stay local */
+  access: EventAccess;
+  /** Signed-in user (null: opened by a share link) */
+  userId: string | null;
   onEventUpdated: (evt: RaceEvent) => void;
   fitMapMode?: boolean;
   onToggleFitMap?: (open: boolean) => void;
@@ -137,6 +144,8 @@ const TAIL_OPTIONS = [
 
 export const ReplayWorkspace: React.FC<Props> = ({
   event,
+  access,
+  userId,
   onEventUpdated,
   fitMapMode = false,
   onToggleFitMap,
@@ -263,6 +272,29 @@ export const ReplayWorkspace: React.FC<Props> = ({
    * Change responses carry the event without track points (they never change after upload):
    * merge them into the event we hold, so nothing re-downloads megabytes per click.
    */
+  const canEdit = access.canEdit;
+  const canUpload = access.canUpload;
+  const accessRef = useRef(access);
+  accessRef.current = access;
+  const viewer = { id: userId, isAdmin: false, roles: {} };
+  /** May the user change this runner's track (their own, or as an editor of the event)? */
+  const mayEditRunner = (p: ParticipantTrack) => canEditParticipant(viewer, accessRef.current, p);
+
+  /**
+   * Viewers without edit rights: a replay set-up (a leg, a start spot, the time mode) changes
+   * only their own copy of the event — never what others see
+   */
+  function applyLocal(mutate: (evt: RaceEvent) => void): RaceEvent {
+    const copy: RaceEvent = {
+      ...eventRef.current,
+      participants: eventRef.current.participants.map((p) => ({ ...p })),
+    };
+    mutate(copy);
+    eventRef.current = copy;
+    onEventUpdated(copy);
+    return copy;
+  }
+
   function applyServerEvent(lite: LiteEvent): RaceEvent {
     const merged = mergeLiteEvent(eventRef.current, lite);
     eventRef.current = merged;
@@ -762,6 +794,15 @@ export const ReplayWorkspace: React.FC<Props> = ({
     trims: { participantId: string; trimStartSec: number; trimEndSec: number }[]
   ) {
     if (trims.length === 0) return;
+    if (!accessRef.current.canEdit) {
+      applyLocal((e) => {
+        applyTrims(e.participants, trims);
+        e.timeMode = 'from_start';
+      });
+      seekTo(0);
+      setIsPlaying(false);
+      return;
+    }
     const res = await fetch(`/api/events/${event.id}/trims`, {
       method: 'PUT',
       headers: { 'Content-Type': 'application/json' },
@@ -1431,6 +1472,7 @@ export const ReplayWorkspace: React.FC<Props> = ({
    * result is applied and a failure is reported without fuss.
    */
   async function runAutoGeoref(quiet = false) {
+    if (!accessRef.current.canEdit) return;
     const evt = eventRef.current;
     const meta = evt.map;
     if (!meta || autoGeorefRunningRef.current) return;
@@ -1871,9 +1913,13 @@ export const ReplayWorkspace: React.FC<Props> = ({
     const tracks = files.filter((f) => /\.(gpx|fit|tcx)$/i.test(f.name));
     const image = files.find((f) => f.type.startsWith('image/'));
     const ignored = files.length - tracks.length - (image ? 1 : 0);
-    if (tracks.length > 0) await uploadTrackFiles(tracks);
+    if (tracks.length > 0) {
+      if (accessRef.current.canUpload) await uploadTrackFiles(tracks);
+      else setUploadError('Добавлять треки в это событие нельзя');
+    }
     if (image) {
-      if (isOrienteering) await uploadMapFile(image);
+      if (!accessRef.current.canEdit) setUploadError('Карту меняют судьи / тренеры события');
+      else if (isOrienteering) await uploadMapFile(image);
       else setUploadError('Карту можно добавить только в событие «Ориентирование»');
     }
     if (ignored > 0 && tracks.length === 0 && !image) {
@@ -1943,6 +1989,18 @@ export const ReplayWorkspace: React.FC<Props> = ({
     participantId: string,
     patch: Partial<ParticipantTrack>
   ) {
+    const runner = eventRef.current.participants.find((p) => p.id === participantId);
+    if (runner && !mayEditRunner(runner)) {
+      const { visible, color, offsetSec } = patch;
+      applyLocal((e) => {
+        const p = e.participants.find((x) => x.id === participantId);
+        if (!p) return;
+        if (visible !== undefined) p.visible = visible;
+        if (color !== undefined) p.color = color;
+        if (offsetSec !== undefined) p.offsetSec = offsetSec;
+      });
+      return;
+    }
     const res = await fetch(
       `/api/events/${event.id}/participants/${participantId}`,
       {
@@ -1971,6 +2029,13 @@ export const ReplayWorkspace: React.FC<Props> = ({
   }
 
   async function toggleTimeMode(mode: TimeMode) {
+    if (!accessRef.current.canEdit) {
+      applyLocal((e) => {
+        e.timeMode = mode;
+      });
+      seekTo(0);
+      return;
+    }
     const res = await fetch(`/api/events/${event.id}`, {
       method: 'PATCH',
       headers: { 'Content-Type': 'application/json' },
@@ -2075,6 +2140,14 @@ export const ReplayWorkspace: React.FC<Props> = ({
     spot?: [number, number],
     endSpot?: [number, number]
   ) {
+    if (!accessRef.current.canEdit) {
+      applyLocal((e) => {
+        applySyncStart(e.participants, spot, endSpot);
+        e.timeMode = 'from_start';
+      });
+      seekTo(0);
+      return;
+    }
     const res = await fetch(`/api/events/${event.id}/sync-start`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -2388,7 +2461,7 @@ export const ReplayWorkspace: React.FC<Props> = ({
           {/* Docked Top Map Toolbar */}
           <div className="relative z-10 px-2 py-1.5 bg-slate-900 border-b border-slate-800 flex flex-wrap items-center justify-between gap-x-2 gap-y-1 text-xs shrink-0">
             <div className="flex flex-wrap items-center gap-1.5">
-              {isOrienteering && (
+              {isOrienteering && canEdit && (
                 <label
                   className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white font-medium cursor-pointer transition"
                   title="Скан карты ориентирования или скриншот Google Maps"
@@ -2409,7 +2482,7 @@ export const ReplayWorkspace: React.FC<Props> = ({
               )}
 
               {/* Course: on the scan, or straight on the base map when there is no scan */}
-              {isOrienteering && (
+              {isOrienteering && canEdit && (
                 <button
                   onClick={() => setCourseEdit((v) => !v)}
                   className={`inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg font-medium border transition ${
@@ -2434,6 +2507,7 @@ export const ReplayWorkspace: React.FC<Props> = ({
 
               {isOrienteering && event.map && (
                 <>
+                  {canEdit && (
                   <button
                     onClick={() => onToggleFitMap?.(!fitMapMode)}
                     className={`inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg font-medium border transition ${
@@ -2445,6 +2519,7 @@ export const ReplayWorkspace: React.FC<Props> = ({
                     <Move className="w-3.5 h-3.5" />
                     {fitMapMode ? 'Подгонка…' : 'Подогнать'}
                   </button>
+                  )}
 
                   <button
                     onClick={showUploadedMap}
@@ -2454,6 +2529,7 @@ export const ReplayWorkspace: React.FC<Props> = ({
                     <LocateFixed className="w-3.5 h-3.5" />
                   </button>
 
+                  {canEdit && (
                   <button
                     onClick={handleDeleteCurrentMap}
                     className="p-1 rounded-lg bg-slate-800 hover:bg-rose-900/60 border border-slate-700 hover:border-rose-500/50 text-slate-400 hover:text-rose-300 transition"
@@ -2461,6 +2537,7 @@ export const ReplayWorkspace: React.FC<Props> = ({
                   >
                     <Trash2 className="w-3.5 h-3.5" />
                   </button>
+                  )}
 
 
                   <div className="flex items-center gap-1.5">
@@ -2705,17 +2782,22 @@ export const ReplayWorkspace: React.FC<Props> = ({
               <span className="text-xs font-semibold uppercase tracking-wider text-slate-400">
                 Участники ({event.participants.length})
               </span>
-              <label className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-medium cursor-pointer transition">
+              {canUpload && (
+              <label
+                className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-medium cursor-pointer transition"
+                title={canEdit ? 'Треки участников' : 'Добавить свой трек'}
+              >
                 <Plus className="w-3.5 h-3.5" />
-                {uploadingTrack ? 'Загрузка…' : 'Треки'}
+                {uploadingTrack ? 'Загрузка…' : canEdit ? 'Треки' : 'Мой трек'}
                 <input
                   type="file"
-                  multiple
+                  multiple={canEdit}
                   accept=".gpx,.fit,.tcx"
                   className="hidden"
                   onChange={handleTrackUpload}
                 />
               </label>
+              )}
             </div>
 
             {uploadError && (
@@ -2972,7 +3054,10 @@ export const ReplayWorkspace: React.FC<Props> = ({
 
           {/* Live leaderboard cards */}
           <div className="flex-1 overflow-y-auto p-3 space-y-2.5">
-            {event.participants.length === 0 && (
+            {event.participants.length === 0 && !canUpload && (
+              <div className="p-4 text-center text-sm text-slate-400">Треков пока нет</div>
+            )}
+            {event.participants.length === 0 && canUpload && (
               <label className="flex flex-col items-center justify-center gap-2 h-full min-h-[160px] p-4 rounded-xl border-2 border-dashed border-slate-700 hover:border-emerald-500 text-center text-slate-400 cursor-pointer transition">
                 <Plus className="w-6 h-6 text-emerald-400" />
                 <span className="text-sm text-slate-200 font-medium">
@@ -3001,6 +3086,7 @@ export const ReplayWorkspace: React.FC<Props> = ({
                   gapMeters={gapMeters}
                   courses={multiCourse ? event.courses : undefined}
                   courseId={runnerCourse?.get(p.id) ?? null}
+                  editable={mayEditRunner(p)}
                   onUpdate={(patch) => void updateParticipant(p.id, patch)}
                   onDelete={() => void deleteParticipant(p.id)}
                 />

@@ -8,6 +8,9 @@ services:
     restart: always
     ports:
       - "${APP_PORT:-8089}:3001"
+    # DATABASE_URL, TELEGRAM_BOT_TOKEN, SMTP_URL… — kept on the server, never in git
+    env_file:
+      - secrets.env
     environment:
       - NODE_ENV=production
       - PORT=3001

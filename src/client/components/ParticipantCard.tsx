@@ -16,6 +16,8 @@ interface Props {
   courses?: { id: string; name: string }[];
   /** The runner's course: set by hand or detected from the punches (null = none fits) */
   courseId?: string | null;
+  /** The user may rename / re-course / delete this track (their own, or as an editor) */
+  editable?: boolean;
   onUpdate: (patch: Partial<ParticipantTrack>) => void;
   onDelete: () => void;
 }
@@ -84,6 +86,7 @@ export const ParticipantCard: React.FC<Props> = ({
   gapMeters,
   courses,
   courseId,
+  editable = true,
   onUpdate,
   onDelete,
 }) => (
@@ -108,8 +111,17 @@ export const ParticipantCard: React.FC<Props> = ({
             className="w-4 h-4 shrink-0 rounded cursor-pointer bg-transparent border-0"
             title="Изменить цвет трека"
           />
-          <RunnerName name={p.name} onRename={(name) => onUpdate({ name })} />
-          {courses && courses.length > 0 && (
+          {editable ? (
+            <RunnerName name={p.name} onRename={(name) => onUpdate({ name })} />
+          ) : (
+            <span className="text-sm font-semibold text-slate-100 truncate">{p.name}</span>
+          )}
+          {!editable && courses && courses.length > 0 && courseId && (
+            <span className="shrink-0 text-[11px] text-fuchsia-200">
+              Трасса {courses.find((c) => c.id === courseId)?.name}
+            </span>
+          )}
+          {editable && courses && courses.length > 0 && (
             // Course: detected from the punches ("авто") or set by hand
             <select
               value={p.courseId ?? ''}
@@ -145,13 +157,15 @@ export const ParticipantCard: React.FC<Props> = ({
               <EyeOff className="w-3.5 h-3.5" />
             )}
           </button>
-          <button
-            onClick={onDelete}
-            className="p-1 text-slate-500 hover:text-rose-400"
-            title="Удалить участника"
-          >
-            <Trash2 className="w-3.5 h-3.5" />
-          </button>
+          {editable && (
+            <button
+              onClick={onDelete}
+              className="p-1 text-slate-500 hover:text-rose-400"
+              title="Удалить участника"
+            >
+              <Trash2 className="w-3.5 h-3.5" />
+            </button>
+          )}
         </div>
       </div>
 
