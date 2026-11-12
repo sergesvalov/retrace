@@ -68,7 +68,8 @@ describe('accounts', () => {
     expect(await setPasswordByEmail(db, 'pass@mail.ru', 'from admin 1')).toBe(true);
     expect(await loginWithPassword(db, 'pass@mail.ru', 'from admin 1', admins)).not.toBeNull();
     expect(await setPasswordByEmail(db, 'nobody@mail.ru', 'x'.repeat(8))).toBe(false);
-  });
+    // ~10 scrypt hashes: on a busy build server well over the default 5 s
+  }, 30_000);
 
   it('e-mail codes: one per minute, right once, burnt by wrong tries', async () => {
     const code = await issueLoginCode(db, 'a@b.ru');
